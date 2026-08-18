@@ -1,0 +1,14 @@
+{
+  "name": "hello-gpuflow",
+  "image": "alpine:3.21",
+  "command": ["sh", "-c", "echo hello from gpuflow"],
+  "requirements": {
+    "gpu_count": 0,
+    "min_vram_gb": 0,
+    "pools": ["development"]
+  },
+  "strategy": "lowest_cost",
+  "timeout_seconds": 120,
+  "max_retries": 1
+}
+

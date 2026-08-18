@@ -1,0 +1,8 @@
+.git
+.tmp
+bin
+data
+web/node_modules
+web/*.tsbuildinfo
+.github
+.vscode

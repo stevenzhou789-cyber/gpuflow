@@ -1,0 +1,36 @@
+services:
+  control-plane:
+    build: .
+    command: ["server", "-addr", ":8080", "-data", "/data/state.json"]
+    environment:
+      GPUFLOW_TOKEN: ${GPUFLOW_TOKEN:-development-token}
+      GPUFLOW_AGENT_IMAGE: ${GPUFLOW_AGENT_IMAGE:-gpuflow:latest}
+    ports:
+      - "8080:8080"
+    volumes:
+      - gpuflow-data:/data
+    restart: unless-stopped
+
+  agent:
+    profiles: ["demo"]
+    build: .
+    command: ["agent"]
+    environment:
+      GPUFLOW_SERVER: http://control-plane:8080
+      GPUFLOW_TOKEN: ${GPUFLOW_TOKEN:-development-token}
+      GPUFLOW_NODE_ID: local-docker-agent
+      GPUFLOW_NODE_NAME: local-docker-agent
+      GPUFLOW_PROVIDER: local
+      GPUFLOW_POOL: development
+      GPUFLOW_GPU_MODEL: generic
+      GPUFLOW_GPU_COUNT: 0
+      GPUFLOW_VRAM_GB: 0
+      GPUFLOW_HOURLY_PRICE: 0
+    volumes:
+      - //var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - control-plane
+    restart: unless-stopped
+
+volumes:
+  gpuflow-data:
