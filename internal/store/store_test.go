@@ -84,3 +84,36 @@ func TestDeleteNodeRejectsActiveJob(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCancelRerunDeleteAndQueryJobs(t *testing.T) {
+	s, _ := Open("")
+	node, _ := s.RegisterNode(model.Node{ID: "cancel-node", Pool: "default", GPUCount: 1, VRAMGB: 8})
+	job, _ := s.CreateJob(model.JobCreate{Name: "searchable training", Image: "alpine", Requirements: model.Requirements{GPUCount: 1, Pools: []string{"default"}}})
+	_ = s.Schedule(time.Minute)
+	_, _ = s.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobRunning})
+	canceling, err := s.CancelJob(job.ID)
+	if err != nil || canceling.Status != model.JobCanceling {
+		t.Fatalf("cancel: %+v %v", canceling, err)
+	}
+	canceled, err := s.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobCanceled})
+	if err != nil || canceled.Status != model.JobCanceled {
+		t.Fatalf("ack cancel: %+v %v", canceled, err)
+	}
+	rerun, err := s.RerunJob(job.ID)
+	if err != nil || rerun.RerunOf != job.ID {
+		t.Fatalf("rerun: %+v %v", rerun, err)
+	}
+	page := s.QueryJobs(JobQuery{Search: "training", Status: "canceled", Page: 1, PageSize: 1})
+	if page.Total != 1 || page.Items[0].ID != job.ID {
+		t.Fatalf("query: %+v", page)
+	}
+	if err := s.DeleteJob(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetJob(job.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected deleted job, got %v", err)
+	}
+	if err := s.DeleteJob(rerun.ID); !errors.Is(err, ErrJobActive) {
+		t.Fatalf("expected active conflict, got %v", err)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,8 @@ type Agent struct {
 	cfg    Config
 	client *client.Client
 }
+
+var errJobCanceled = errors.New("job canceled")
 
 func New(cfg Config) *Agent {
 	if cfg.PollInterval == 0 {
@@ -68,6 +71,10 @@ func (a *Agent) tick(ctx context.Context) error {
 	if status == http.StatusNoContent {
 		return nil
 	}
+	if job.Status == model.JobCanceling {
+		_, err = a.client.Do(http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+a.cfg.ID, model.JobUpdate{Status: model.JobCanceled}, nil)
+		return err
+	}
 	_, err = a.client.Do(http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+a.cfg.ID, model.JobUpdate{Status: model.JobRunning}, nil)
 	if err != nil {
 		return err
@@ -83,6 +90,15 @@ func (a *Agent) tick(ctx context.Context) error {
 	}
 	defer os.RemoveAll(artifactDir)
 	output, runErr := a.execute(ctx, &job, artifactDir)
+	if errors.Is(runErr, errJobCanceled) {
+		_, err = a.client.Do(http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+a.cfg.ID, model.JobUpdate{Status: model.JobCanceled, Output: output}, nil)
+		return err
+	}
+	var latest model.Job
+	if _, statusErr := a.client.Do(http.MethodGet, "/v1/jobs/"+job.ID, nil, &latest); statusErr == nil && latest.Status == model.JobCanceling {
+		_, err = a.client.Do(http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+a.cfg.ID, model.JobUpdate{Status: model.JobCanceled, Output: output}, nil)
+		return err
+	}
 	if bundle, bundleErr := archiveArtifacts(artifactDir); bundleErr != nil {
 		output = appendOutput(output, "artifact packaging warning: "+bundleErr.Error())
 	} else if bundle != "" {
@@ -119,11 +135,40 @@ func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir stri
 	}
 	args = append(args, job.Image)
 	args = append(args, job.Command...)
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	containerName := "gpuflow-job-" + job.ID
+	args = append([]string{"run", "--name", containerName}, args[1:]...)
+	cmd := exec.Command("docker", args...)
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("docker run failed: %w", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var err error
+	for {
+		select {
+		case err = <-done:
+			goto finished
+		case <-ctx.Done():
+			_ = exec.Command("docker", "stop", "--time", "10", containerName).Run()
+			err = <-done
+			goto finished
+		case <-ticker.C:
+			var latest model.Job
+			if _, pollErr := a.client.Do(http.MethodGet, "/v1/jobs/"+job.ID, nil, &latest); pollErr == nil && (latest.Status == model.JobCanceling || latest.Status == model.JobCanceled) {
+				_ = exec.Command("docker", "stop", "--time", "10", containerName).Run()
+				_ = <-done
+				text := strings.TrimSpace(output.String())
+				return text, errJobCanceled
+			}
+		}
+	}
+
+finished:
 	text := output.String()
 	if len(text) > 65536 {
 		text = text[len(text)-65536:]

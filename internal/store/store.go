@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrNodeBusy = errors.New("node has an assigned or running job")
+	ErrNotFound  = errors.New("not found")
+	ErrNodeBusy  = errors.New("node has an assigned or running job")
+	ErrJobActive = errors.New("active job must be canceled before deletion")
 )
 
 type snapshot struct {
@@ -111,6 +112,10 @@ func newID(prefix string) string {
 func (s *Store) CreateJob(in model.JobCreate) (*model.Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.createJobLocked(in, "")
+}
+
+func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job, error) {
 	now := time.Now().UTC()
 	strategy := in.Strategy
 	if strategy == "" {
@@ -122,13 +127,160 @@ func (s *Store) CreateJob(in model.JobCreate) (*model.Job, error) {
 	j := &model.Job{ID: newID("job"), Name: in.Name, Image: in.Image, Command: in.Command,
 		Environment: in.Environment, Requirements: in.Requirements, Strategy: strategy,
 		TimeoutSeconds: in.TimeoutSeconds, MaxRetries: in.MaxRetries, Status: model.JobQueued,
-		CreatedAt: now, UpdatedAt: now}
+		CreatedAt: now, UpdatedAt: now, RerunOf: rerunOf}
 	s.state.Jobs[j.ID] = j
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}
 	copy := *j
 	return &copy, nil
+}
+
+func (s *Store) RerunJob(id string) (*model.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	original, ok := s.state.Jobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	in := model.JobCreate{Name: original.Name, Image: original.Image, Command: original.Command, Environment: original.Environment, Requirements: original.Requirements, Strategy: original.Strategy, TimeoutSeconds: original.TimeoutSeconds, MaxRetries: original.MaxRetries}
+	return s.createJobLocked(in, original.ID)
+}
+
+func terminal(status model.JobStatus) bool {
+	return status == model.JobSucceeded || status == model.JobFailed || status == model.JobCanceled
+}
+
+func (s *Store) CancelJob(id string) (*model.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.state.Jobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	now := time.Now().UTC()
+	switch j.Status {
+	case model.JobQueued:
+		j.Status, j.FinishedAt = model.JobCanceled, &now
+	case model.JobAssigned, model.JobRunning:
+		j.Status = model.JobCanceling
+	case model.JobCanceling, model.JobCanceled:
+		// Idempotent.
+	default:
+		return nil, errors.New("completed job cannot be canceled")
+	}
+	j.UpdatedAt = now
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	copy := *j
+	return &copy, nil
+}
+
+func (s *Store) DeleteJob(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.state.Jobs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if !terminal(j.Status) {
+		return ErrJobActive
+	}
+	delete(s.state.Jobs, id)
+	return s.saveLocked()
+}
+
+type JobQuery struct {
+	Search, Status, Pool, Node, Sort, Order string
+	Page, PageSize                          int
+}
+
+type JobPage struct {
+	Items      []*model.Job `json:"items"`
+	Total      int          `json:"total"`
+	Page       int          `json:"page"`
+	PageSize   int          `json:"page_size"`
+	TotalPages int          `json:"total_pages"`
+}
+
+func (s *Store) QueryJobs(q JobQuery) JobPage {
+	jobs := s.ListJobs()
+	filtered := make([]*model.Job, 0, len(jobs))
+	for _, j := range jobs {
+		search := strings.ToLower(q.Search)
+		if search != "" && !strings.Contains(strings.ToLower(j.ID+" "+j.Name+" "+j.Image+" "+j.AssignedNode), search) {
+			continue
+		}
+		if q.Status != "" && string(j.Status) != q.Status {
+			continue
+		}
+		if q.Node != "" && j.AssignedNode != q.Node {
+			continue
+		}
+		if q.Pool != "" && !containsFold(j.Requirements.Pools, q.Pool) {
+			continue
+		}
+		filtered = append(filtered, j)
+	}
+	sort.SliceStable(filtered, func(i, k int) bool {
+		a, b := filtered[i], filtered[k]
+		var av, bv int64
+		switch q.Sort {
+		case "started_at":
+			av, bv = timeValue(a.StartedAt).UnixNano(), timeValue(b.StartedAt).UnixNano()
+		case "finished_at":
+			av, bv = timeValue(a.FinishedAt).UnixNano(), timeValue(b.FinishedAt).UnixNano()
+		case "duration":
+			av, bv = int64(jobDuration(a)), int64(jobDuration(b))
+		default:
+			av, bv = a.CreatedAt.UnixNano(), b.CreatedAt.UnixNano()
+		}
+		if av == bv {
+			return a.ID < b.ID
+		}
+		if strings.EqualFold(q.Order, "asc") {
+			return av < bv
+		}
+		return av > bv
+	})
+	if q.Page < 1 {
+		q.Page = 1
+	}
+	if q.PageSize < 1 {
+		q.PageSize = 20
+	}
+	if q.PageSize > 100 {
+		q.PageSize = 100
+	}
+	total := len(filtered)
+	start := (q.Page - 1) * q.PageSize
+	if start > total {
+		start = total
+	}
+	end := start + q.PageSize
+	if end > total {
+		end = total
+	}
+	pages := (total + q.PageSize - 1) / q.PageSize
+	return JobPage{Items: filtered[start:end], Total: total, Page: q.Page, PageSize: q.PageSize, TotalPages: pages}
+}
+
+func timeValue(value *time.Time) time.Time {
+	if value == nil {
+		return time.Time{}
+	}
+	return *value
+}
+func jobDuration(j *model.Job) time.Duration {
+	if j.StartedAt == nil {
+		return 0
+	}
+	end := time.Now()
+	if j.FinishedAt != nil {
+		end = *j.FinishedAt
+	}
+	return end.Sub(*j.StartedAt)
 }
 
 func (s *Store) GetJob(id string) (*model.Job, error) {
@@ -365,6 +517,14 @@ func (s *Store) UpdateJob(id, nodeID string, in model.JobUpdate) (*model.Job, er
 			j.StartedAt, j.FinishedAt = nil, nil
 		} else {
 			j.Status = model.JobFailed
+		}
+	case model.JobCanceled:
+		if j.Status != model.JobCanceling {
+			return nil, errors.New("job is not canceling")
+		}
+		j.Status, j.FinishedAt = model.JobCanceled, &now
+		if n := s.state.Nodes[nodeID]; n != nil {
+			n.Busy, n.CurrentJob = false, ""
 		}
 	default:
 		return nil, errors.New("unsupported status transition")

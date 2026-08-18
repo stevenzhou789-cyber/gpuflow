@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +57,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/jobs", s.createJob)
 	s.mux.HandleFunc("GET /v1/jobs", s.listJobs)
 	s.mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
+	s.mux.HandleFunc("POST /v1/jobs/{id}/rerun", s.rerunJob)
+	s.mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancelJob)
+	s.mux.HandleFunc("DELETE /v1/jobs/{id}", s.deleteJob)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/status", s.updateJob)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/artifacts", s.uploadArtifact)
 	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts", s.listArtifacts)
@@ -186,8 +190,14 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	_ = s.store.Schedule(30 * time.Second)
 	writeJSON(w, 201, j)
 }
-func (s *Server) listJobs(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, s.store.ListJobs())
+func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery == "" {
+		writeJSON(w, 200, s.store.ListJobs())
+		return
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	writeJSON(w, 200, s.store.QueryJobs(store.JobQuery{Search: r.URL.Query().Get("q"), Status: r.URL.Query().Get("status"), Pool: r.URL.Query().Get("pool"), Node: r.URL.Query().Get("node"), Sort: r.URL.Query().Get("sort"), Order: r.URL.Query().Get("order"), Page: page, PageSize: pageSize}))
 }
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	j, err := s.store.GetJob(r.PathValue("id"))
@@ -196,6 +206,40 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, j)
+}
+func (s *Server) rerunJob(w http.ResponseWriter, r *http.Request) {
+	j, err := s.store.RerunJob(r.PathValue("id"))
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	_ = s.store.Schedule(30 * time.Second)
+	writeJSON(w, http.StatusCreated, j)
+}
+func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
+	j, err := s.store.CancelJob(r.PathValue("id"))
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, j)
+}
+func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.store.GetJob(r.PathValue("id")); err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	if r.URL.Query().Get("delete_artifacts") != "false" {
+		if err := s.artifacts.Delete(r.Context(), r.PathValue("id")); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+	}
+	if err := s.store.DeleteJob(r.PathValue("id")); err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 	var n model.Node
@@ -268,6 +312,10 @@ func handleStoreError(w http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, store.ErrNodeBusy) {
 		writeError(w, http.StatusConflict, "node has an assigned or running job")
+		return
+	}
+	if errors.Is(err, store.ErrJobActive) {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	writeError(w, 409, err.Error())

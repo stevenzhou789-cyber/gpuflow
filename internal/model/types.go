@@ -8,6 +8,8 @@ const (
 	JobQueued    JobStatus = "queued"
 	JobAssigned  JobStatus = "assigned"
 	JobRunning   JobStatus = "running"
+	JobCanceling JobStatus = "canceling"
+	JobCanceled  JobStatus = "canceled"
 	JobSucceeded JobStatus = "succeeded"
 	JobFailed    JobStatus = "failed"
 )
@@ -41,6 +43,7 @@ type Job struct {
 	UpdatedAt      time.Time         `json:"updated_at"`
 	StartedAt      *time.Time        `json:"started_at,omitempty"`
 	FinishedAt     *time.Time        `json:"finished_at,omitempty"`
+	RerunOf        string            `json:"rerun_of,omitempty"`
 }
 
 type JobCreate struct {

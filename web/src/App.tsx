@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-type JobStatus = "queued" | "assigned" | "running" | "succeeded" | "failed";
+type JobStatus = "queued" | "assigned" | "running" | "canceling" | "canceled" | "succeeded" | "failed";
 
 type Job = {
   id: string;
@@ -19,8 +19,10 @@ type Job = {
   finished_at?: string;
   updated_at: string;
   created_at: string;
+  rerun_of?: string;
   requirements: { gpu_count: number; min_vram_gb: number; pools?: string[] };
 };
+type JobPage = { items: Job[]; total: number; page: number; page_size: number; total_pages: number };
 
 type Node = {
   id: string;
@@ -77,6 +79,8 @@ const statusLabel: Record<JobStatus, string> = {
   queued: "排队中",
   assigned: "已分配",
   running: "运行中",
+  canceling: "停止中",
+  canceled: "已取消",
   succeeded: "已完成",
   failed: "失败",
 };
@@ -302,7 +306,7 @@ function App() {
             onNavigate={setPage}
           />
         )}
-        {page === "jobs" && <Jobs jobs={jobs} onSelect={setSelectedJob} />}
+        {page === "jobs" && <Jobs nodes={nodes} onSelect={setSelectedJob} onChanged={refresh} />}
         {page === "images" && (
           <TaskImages
             images={taskImages}
@@ -554,12 +558,14 @@ function Empty({ title, text }: { title: string; text: string }) {
   );
 }
 
-function JobRow({ job, onSelect }: { job: Job; onSelect?: (job: Job) => void }) {
+function JobRow({ job, onSelect, onAction }: { job: Job; onSelect?: (job: Job) => void; onAction?: (action: "rerun" | "cancel" | "delete", job: Job) => void }) {
+  const active = ["queued", "assigned", "running", "canceling"].includes(job.status);
   return (
-    <button
-      type="button"
+    <div
+      role="button" tabIndex={0}
       className={`job-row ${onSelect ? "clickable" : ""}`}
       onClick={() => onSelect?.(job)}
+      onKeyDown={(event) => { if (event.key === "Enter") onSelect?.(job); }}
     >
       <div className="job-icon">{job.requirements.gpu_count || "CPU"}</div>
       <div className="job-main">
@@ -571,28 +577,78 @@ function JobRow({ job, onSelect }: { job: Job; onSelect?: (job: Job) => void }) 
         <small>{timeAgo(job.created_at)}</small>
       </div>
       <span className={`status ${job.status}`}>{statusLabel[job.status]}</span>
-    </button>
+      {onAction && <div className="job-actions" onClick={(event) => event.stopPropagation()}>
+        <button type="button" onClick={() => onAction("rerun", job)}>重跑</button>
+        {active && <button type="button" disabled={job.status === "canceling"} onClick={() => onAction("cancel", job)}>{job.status === "canceling" ? "停止中" : "停止"}</button>}
+        {!active && <button className="danger" type="button" onClick={() => onAction("delete", job)}>删除</button>}
+      </div>}
+    </div>
   );
 }
 
-function Jobs({ jobs, onSelect }: { jobs: Job[]; onSelect: (job: Job) => void }) {
+function Jobs({ nodes, onSelect, onChanged }: { nodes: Node[]; onSelect: (job: Job) => void; onChanged: () => void }) {
+  const [result, setResult] = useState<JobPage>({ items: [], total: 0, page: 1, page_size: 20, total_pages: 0 });
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState("");
+  const [node, setNode] = useState("");
+  const [pool, setPool] = useState("");
+  const [sort, setSort] = useState("created_at");
+  const [order, setOrder] = useState("desc");
+  const [page, setPage] = useState(1);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    const params = new URLSearchParams({ page: String(page), page_size: "20", sort, order });
+    if (query.trim()) params.set("q", query.trim());
+    if (status) params.set("status", status);
+    if (node) params.set("node", node);
+    if (pool) params.set("pool", pool);
+    try { setResult(await api<JobPage>(`/v1/jobs?${params}`)); setError(""); }
+    catch (err) { setError((err as Error).message); }
+  }, [page, query, status, node, pool, sort, order]);
+
+  useEffect(() => { const timer = window.setTimeout(load, 250); return () => window.clearTimeout(timer); }, [load]);
+  useEffect(() => { const timer = window.setInterval(load, 5000); return () => window.clearInterval(timer); }, [load]);
+
+  async function action(kind: "rerun" | "cancel" | "delete", job: Job) {
+    if (kind === "delete" && !window.confirm(`删除任务“${job.name}”及其产物？`)) return;
+    if (kind === "cancel" && !window.confirm(`停止任务“${job.name}”？`)) return;
+    try {
+      if (kind === "rerun") await api(`/v1/jobs/${job.id}/rerun`, { method: "POST" });
+      if (kind === "cancel") await api(`/v1/jobs/${job.id}/cancel`, { method: "POST" });
+      if (kind === "delete") await api(`/v1/jobs/${job.id}?delete_artifacts=true`, { method: "DELETE" });
+      await load(); onChanged();
+    } catch (err) { setError((err as Error).message); }
+  }
+
   return (
     <section className="panel table-panel">
       <div className="panel-title">
         <div>
           <h2>全部任务</h2>
-          <p>{jobs.length} 个任务记录</p>
+          <p>{result.total} 个任务记录</p>
         </div>
       </div>
-      {jobs.length ? (
+      <div className="job-filters">
+        <input value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder="搜索名称、ID、镜像或节点" />
+        <select value={status} onChange={(e) => { setStatus(e.target.value); setPage(1); }}><option value="">全部状态</option>{Object.entries(statusLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
+        <select value={node} onChange={(e) => { setNode(e.target.value); setPage(1); }}><option value="">全部节点</option>{nodes.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+        <select value={pool} onChange={(e) => { setPool(e.target.value); setPage(1); }}><option value="">全部资源池</option>{[...new Set(nodes.map((item) => item.pool))].map((item) => <option key={item} value={item}>{item}</option>)}</select>
+        <select value={`${sort}:${order}`} onChange={(e) => { const [nextSort, nextOrder] = e.target.value.split(":"); setSort(nextSort); setOrder(nextOrder); setPage(1); }}>
+          <option value="created_at:desc">最新创建</option><option value="created_at:asc">最早创建</option><option value="started_at:desc">最近开始</option><option value="finished_at:desc">最近完成</option><option value="duration:desc">运行最长</option>
+        </select>
+      </div>
+      {error && <div className="notice error">{error}</div>}
+      {result.items.length ? (
         <div className="job-list">
-          {jobs.map((job) => (
-            <JobRow key={job.id} job={job} onSelect={onSelect} />
+          {result.items.map((job) => (
+            <JobRow key={job.id} job={job} onSelect={onSelect} onAction={action} />
           ))}
         </div>
       ) : (
         <Empty title="任务队列为空" text="点击右上角提交第一个任务。" />
       )}
+      {result.total_pages > 1 && <div className="job-pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button><span>第 {page} / {result.total_pages} 页</span><button disabled={page >= result.total_pages} onClick={() => setPage(page + 1)}>下一页</button></div>}
     </section>
   );
 }
@@ -668,6 +724,7 @@ function JobDetails({ job, onClose }: { job: Job; onClose: () => void }) {
             <DetailItem label="运行时长" value={duration === null ? "尚未开始" : `${duration.toFixed(2)} 秒`} />
             <DetailItem label="创建时间" value={new Date(job.created_at).toLocaleString()} />
             <DetailItem label="完成时间" value={finished ? finished.toLocaleString() : "—"} />
+            {job.rerun_of ? <DetailItem label="重跑来源" value={job.rerun_of} wide /> : null}
             {job.command?.length ? <DetailItem label="覆盖命令" value={job.command.join(" ")} wide /> : null}
           </div>
         </section>
@@ -915,8 +972,8 @@ function ConnectNode({
   const server = (serverURL.trim() || window.location.origin).replace(/\/+$/, "");
   const localOnlyServer = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(server);
   const token = sessionStorage.getItem("gpuflow_token") || "";
-  const windowsCommand = `${token ? `$env:GPUFLOW_TOKEN = "${token}"\n` : ""}.\\gpuflow.exe agent -server "${server}" -id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price} -executor docker`;
-  const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  ${agentImage.trim() || "gpuflow:latest"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price}`;
+  const windowsCommand = `.\\gpuflow.exe agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price} -executor docker`;
+  const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  ${agentImage.trim() || "gpuflow:latest"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price}`;
   const command = (mode === "windows" ? windowsCommand : dockerCommand).replace(
     /\n\+\s*/g,
     "\n  ",

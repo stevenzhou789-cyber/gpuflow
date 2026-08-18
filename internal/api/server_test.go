@@ -143,6 +143,17 @@ func TestJobLifecycleOverHTTP(t *testing.T) {
 	if artifacts.Enabled || len(artifacts.Items) != 0 {
 		t.Fatalf("unexpected disabled artifact response: %+v", artifacts)
 	}
+	var rerun model.Job
+	if status := request(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/rerun", nil, &rerun); status != http.StatusCreated || rerun.RerunOf != job.ID {
+		t.Fatalf("rerun returned %d: %+v", status, rerun)
+	}
+	var page store.JobPage
+	if status := request(t, server, http.MethodGet, "/v1/jobs?page=1&page_size=1&q=smoke", nil, &page); status != http.StatusOK || page.Total != 2 || len(page.Items) != 1 {
+		t.Fatalf("paged list returned %d: %+v", status, page)
+	}
+	if status := request(t, server, http.MethodDelete, "/v1/jobs/"+job.ID, nil, nil); status != http.StatusNoContent {
+		t.Fatalf("delete returned %d", status)
+	}
 }
 
 func TestDeleteBusyNodeReturnsConflict(t *testing.T) {

@@ -31,6 +31,7 @@ flowchart LR
 - GPU 数量、最低显存和资源池约束
 - Docker 容器执行、超时控制和失败重试
 - 任务状态、输出与日志查看
+- 任务停止、重跑、删除、搜索、过滤与分页
 - 任务产物自动归档与下载
 - Bearer Token API 鉴权
 - 任务和节点使用 JSON 文件持久化；任务镜像记录可选 MySQL
@@ -195,6 +196,8 @@ CLI 命令也支持通过环境变量设置控制面地址和 Token：
 GPUFLOW_SERVER=http://localhost:8080
 GPUFLOW_TOKEN=replace-with-a-long-random-token
 ```
+
+任务队列支持按名称、ID、镜像或节点搜索，并可按状态、节点和资源池过滤。点击“重跑”会复制原任务配置并生成新的任务 ID；停止运行任务时，Agent 会执行 `docker stop` 并将状态更新为“已取消”。为避免丢失执行现场，只有已完成、失败或取消的任务可以删除，删除时会同时清理对象存储中的任务产物。
 
 ## 从脚本构建任务镜像
 

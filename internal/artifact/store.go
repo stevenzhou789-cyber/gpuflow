@@ -31,6 +31,7 @@ type Store interface {
 	Put(context.Context, string, string, io.Reader, int64) error
 	List(context.Context, string) ([]Item, error)
 	Open(context.Context, string, string) (io.ReadCloser, Item, error)
+	Delete(context.Context, string) error
 }
 
 type disabledStore struct{}
@@ -42,6 +43,7 @@ func (disabledStore) List(context.Context, string) ([]Item, error)              
 func (disabledStore) Open(context.Context, string, string) (io.ReadCloser, Item, error) {
 	return nil, Item{}, ErrDisabled
 }
+func (disabledStore) Delete(context.Context, string) error { return nil }
 
 type minioStore struct {
 	client *minio.Client
@@ -124,4 +126,16 @@ func (s *minioStore) Open(ctx context.Context, jobID, name string) (io.ReadClose
 		return nil, Item{}, err
 	}
 	return obj, Item{Name: name, Size: stat.Size, LastModified: stat.LastModified}, nil
+}
+
+func (s *minioStore) Delete(ctx context.Context, jobID string) error {
+	for obj := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: jobID + "/", Recursive: true}) {
+		if obj.Err != nil {
+			return obj.Err
+		}
+		if err := s.client.RemoveObject(ctx, s.bucket, obj.Key, minio.RemoveObjectOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
