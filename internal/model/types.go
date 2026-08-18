@@ -74,3 +74,17 @@ type JobUpdate struct {
 	Output string    `json:"output,omitempty"`
 	Error  string    `json:"error,omitempty"`
 }
+
+type TaskImage struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Runtime   string    `json:"runtime"`
+	BaseImage string    `json:"base_image"`
+	Filename  string    `json:"filename"`
+	Command   string    `json:"command"`
+	Status    string    `json:"status"`
+	Log       string    `json:"log,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}

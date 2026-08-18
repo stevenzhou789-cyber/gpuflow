@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 FROM --platform=$BUILDPLATFORM node:22-alpine AS web-build
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
@@ -7,11 +5,12 @@ RUN npm ci
 COPY web/ ./
 RUN mkdir -p ../internal/webui && npm run build
 
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS go-build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS go-build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 COPY pkg ./pkg

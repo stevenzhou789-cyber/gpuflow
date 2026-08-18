@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -132,6 +133,16 @@ func TestJobLifecycleOverHTTP(t *testing.T) {
 	if job.Status != model.JobSucceeded || job.Output != "done" {
 		t.Fatalf("unexpected completed job: %+v", job)
 	}
+	var artifacts struct {
+		Enabled bool  `json:"enabled"`
+		Items   []any `json:"items"`
+	}
+	if status := request(t, server, http.MethodGet, "/v1/jobs/"+job.ID+"/artifacts", nil, &artifacts); status != http.StatusOK {
+		t.Fatalf("artifact list returned %d", status)
+	}
+	if artifacts.Enabled || len(artifacts.Items) != 0 {
+		t.Fatalf("unexpected disabled artifact response: %+v", artifacts)
+	}
 }
 
 func TestDeleteBusyNodeReturnsConflict(t *testing.T) {
@@ -144,5 +155,17 @@ func TestDeleteBusyNodeReturnsConflict(t *testing.T) {
 	request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "active", Image: "alpine", Requirements: model.Requirements{GPUCount: 1}}, &job)
 	if status := request(t, server, http.MethodDelete, "/v1/nodes/busy-node", nil, nil); status != http.StatusConflict {
 		t.Fatalf("expected conflict, got %d", status)
+	}
+}
+
+func TestReadableBuildError(t *testing.T) {
+	err := errors.New("exit status 1")
+	message := readableBuildError([]byte("failed to fetch anonymous token: connection attempt failed"), err)
+	if !strings.Contains(message, "镜像加速") {
+		t.Fatalf("unexpected network error: %s", message)
+	}
+	message = readableBuildError([]byte("manifest unknown"), err)
+	if !strings.Contains(message, "标签无效") {
+		t.Fatalf("unexpected manifest error: %s", message)
 	}
 }

@@ -5,10 +5,12 @@ services:
     environment:
       GPUFLOW_TOKEN: ${GPUFLOW_TOKEN:-development-token}
       GPUFLOW_AGENT_IMAGE: ${GPUFLOW_AGENT_IMAGE:-gpuflow:latest}
+      GPUFLOW_PUBLIC_URL: ${GPUFLOW_PUBLIC_URL:-}
     ports:
       - "8080:8080"
     volumes:
       - gpuflow-data:/data
+      - //var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
 
   agent:
@@ -26,8 +28,10 @@ services:
       GPUFLOW_GPU_COUNT: 0
       GPUFLOW_VRAM_GB: 0
       GPUFLOW_HOURLY_PRICE: 0
+      GPUFLOW_ARTIFACT_WORKDIR: /var/lib/gpuflow/artifacts
     volumes:
       - //var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts
     depends_on:
       - control-plane
     restart: unless-stopped

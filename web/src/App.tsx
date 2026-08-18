@@ -13,6 +13,11 @@ type Job = {
   assigned_node?: string;
   error?: string;
   output?: string;
+  command?: string[];
+  timeout_seconds: number;
+  started_at?: string;
+  finished_at?: string;
+  updated_at: string;
   created_at: string;
   requirements: { gpu_count: number; min_vram_gb: number; pools?: string[] };
 };
@@ -36,6 +41,7 @@ type Edition = {
   licensed_to?: string;
   expires_at?: string;
   agent_image?: string;
+  public_url?: string;
   features: Record<string, boolean>;
 };
 
@@ -61,6 +67,9 @@ type TaskImage = {
   created_at: string;
   updated_at: string;
 };
+
+type ArtifactItem = { name: string; size: number; last_modified: string };
+type ArtifactResponse = { enabled: boolean; items: ArtifactItem[] };
 
 type Page = "overview" | "jobs" | "images" | "nodes";
 
@@ -135,10 +144,8 @@ function App() {
   const [showSubmit, setShowSubmit] = useState(false);
   const [showBuild, setShowBuild] = useState(false);
   const [showConnect, setShowConnect] = useState(false);
-  const [submitPreset, setSubmitPreset] = useState<{
-    image: string;
-    command: string;
-  } | null>(null);
+  const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [submitPreset, setSubmitPreset] = useState<{ image: string } | null>(null);
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
@@ -295,13 +302,13 @@ function App() {
             onNavigate={setPage}
           />
         )}
-        {page === "jobs" && <Jobs jobs={jobs} />}
+        {page === "jobs" && <Jobs jobs={jobs} onSelect={setSelectedJob} />}
         {page === "images" && (
           <TaskImages
             images={taskImages}
             onBuild={() => setShowBuild(true)}
             onSubmit={(image) => {
-              setSubmitPreset({ image: image.name, command: image.command });
+              setSubmitPreset({ image: image.name });
               setShowSubmit(true);
             }}
           />
@@ -339,8 +346,8 @@ function App() {
       {showSubmit && (
         <SubmitJob
           nodes={nodes}
+          taskImages={taskImages}
           initialImage={submitPreset?.image}
-          initialCommand={submitPreset?.command}
           onClose={() => setShowSubmit(false)}
           onCreated={() => {
             setShowSubmit(false);
@@ -363,8 +370,12 @@ function App() {
         <ConnectNode
           nodes={nodes}
           defaultAgentImage={edition.agent_image || "gpuflow:latest"}
+          defaultPublicURL={edition.public_url || window.location.origin}
           onClose={() => setShowConnect(false)}
         />
+      )}
+      {selectedJob && (
+        <JobDetails job={selectedJob} onClose={() => setSelectedJob(null)} />
       )}
     </div>
   );
@@ -543,9 +554,13 @@ function Empty({ title, text }: { title: string; text: string }) {
   );
 }
 
-function JobRow({ job }: { job: Job }) {
+function JobRow({ job, onSelect }: { job: Job; onSelect?: (job: Job) => void }) {
   return (
-    <div className="job-row">
+    <button
+      type="button"
+      className={`job-row ${onSelect ? "clickable" : ""}`}
+      onClick={() => onSelect?.(job)}
+    >
       <div className="job-icon">{job.requirements.gpu_count || "CPU"}</div>
       <div className="job-main">
         <strong>{job.name}</strong>
@@ -556,11 +571,11 @@ function JobRow({ job }: { job: Job }) {
         <small>{timeAgo(job.created_at)}</small>
       </div>
       <span className={`status ${job.status}`}>{statusLabel[job.status]}</span>
-    </div>
+    </button>
   );
 }
 
-function Jobs({ jobs }: { jobs: Job[] }) {
+function Jobs({ jobs, onSelect }: { jobs: Job[]; onSelect: (job: Job) => void }) {
   return (
     <section className="panel table-panel">
       <div className="panel-title">
@@ -572,13 +587,145 @@ function Jobs({ jobs }: { jobs: Job[] }) {
       {jobs.length ? (
         <div className="job-list">
           {jobs.map((job) => (
-            <JobRow key={job.id} job={job} />
+            <JobRow key={job.id} job={job} onSelect={onSelect} />
           ))}
         </div>
       ) : (
         <Empty title="任务队列为空" text="点击右上角提交第一个任务。" />
       )}
     </section>
+  );
+}
+
+function JobDetails({ job, onClose }: { job: Job; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const [artifacts, setArtifacts] = useState<ArtifactResponse | null>(null);
+  const [artifactError, setArtifactError] = useState("");
+  const [downloading, setDownloading] = useState("");
+  const started = job.started_at ? new Date(job.started_at) : null;
+  const finished = job.finished_at ? new Date(job.finished_at) : null;
+  const duration = started
+    ? Math.max(0, ((finished || new Date()).getTime() - started.getTime()) / 1000)
+    : null;
+
+  useEffect(() => {
+    let active = true;
+    api<ArtifactResponse>(`/v1/jobs/${job.id}/artifacts`)
+      .then((result) => active && setArtifacts(result))
+      .catch((error: Error) => active && setArtifactError(error.message));
+    return () => { active = false; };
+  }, [job.id, job.status]);
+
+  async function copyLog() {
+    await navigator.clipboard.writeText(job.output || job.error || "");
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }
+
+  async function downloadArtifact(item: ArtifactItem) {
+    setDownloading(item.name);
+    setArtifactError("");
+    try {
+      const response = await fetch(`/v1/jobs/${job.id}/artifacts/${encodeURIComponent(item.name)}`, { headers: requestHeaders() });
+      if (!response.ok) throw new Error(`下载失败（${response.status}）`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = item.name;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setArtifactError((error as Error).message);
+    } finally {
+      setDownloading("");
+    }
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal job-details">
+        <div className="modal-title job-details-title">
+          <div>
+            <span className="eyebrow">JOB DETAILS</span>
+            <h2>{job.name}</h2>
+            <code>{job.id}</code>
+          </div>
+          <div className="job-details-actions">
+            <span className={`status ${job.status}`}>{statusLabel[job.status]}</span>
+            <button type="button" onClick={onClose} aria-label="关闭">×</button>
+          </div>
+        </div>
+
+        <section className="job-detail-section">
+          <h3>执行信息</h3>
+          <div className="job-detail-grid">
+            <DetailItem label="任务镜像" value={job.image} wide />
+            <DetailItem label="执行节点" value={job.assigned_node || "等待调度"} />
+            <DetailItem label="资源池" value={job.requirements.pools?.join(", ") || "任意"} />
+            <DetailItem label="GPU" value={`${job.requirements.gpu_count} 张`} />
+            <DetailItem label="最低显存" value={`${job.requirements.min_vram_gb} GB`} />
+            <DetailItem label="尝试次数" value={`${job.attempts}/${job.max_retries + 1}`} />
+            <DetailItem label="运行时长" value={duration === null ? "尚未开始" : `${duration.toFixed(2)} 秒`} />
+            <DetailItem label="创建时间" value={new Date(job.created_at).toLocaleString()} />
+            <DetailItem label="完成时间" value={finished ? finished.toLocaleString() : "—"} />
+            {job.command?.length ? <DetailItem label="覆盖命令" value={job.command.join(" ")} wide /> : null}
+          </div>
+        </section>
+
+        {job.error && (
+          <section className="job-detail-section">
+            <h3>失败原因</h3>
+            <div className="job-error-detail">{job.error}</div>
+          </section>
+        )}
+
+        <section className="job-detail-section">
+          <div className="job-log-title">
+            <h3>执行日志</h3>
+            <button type="button" disabled={!job.output && !job.error} onClick={copyLog}>
+              {copied ? "已复制" : "复制日志"}
+            </button>
+          </div>
+          <pre className="job-log">{job.output || (job.status === "running" ? "任务正在运行，等待日志回传…" : "暂无日志输出")}</pre>
+          <small className="job-log-note">当前 Agent 在任务结束后一次性回传日志，最多保留最后 64 KB。</small>
+        </section>
+
+        <section className="job-detail-section artifact-panel">
+          <div className="artifact-heading">
+            <div><h3>任务产物</h3><p>任务写入 <code>$GPUFLOW_ARTIFACT_DIR</code> 的文件会自动归档。</p></div>
+            {artifacts?.enabled ? <span>对象存储已启用</span> : null}
+          </div>
+          {artifactError ? <div className="artifact-error">{artifactError}</div> : null}
+          {!artifacts ? <p className="artifact-empty">正在读取产物…</p> : !artifacts.enabled ? (
+            <p className="artifact-empty">尚未配置对象存储，当前任务不会保留文件产物。</p>
+          ) : artifacts.items.length === 0 ? (
+            <p className="artifact-empty">暂无产物。脚本需要将文件写入 $GPUFLOW_ARTIFACT_DIR。</p>
+          ) : <div className="artifact-list">{artifacts.items.map((item) => (
+            <div className="artifact-row" key={item.name}>
+              <div><strong>{item.name}</strong><span>{formatBytes(item.size)} · {new Date(item.last_modified).toLocaleString()}</span></div>
+              <button type="button" disabled={downloading === item.name} onClick={() => downloadArtifact(item)}>
+                {downloading === item.name ? "下载中…" : "下载产物"}
+              </button>
+            </div>
+          ))}</div>}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function DetailItem({ label, value, wide = false }: { label: string; value: string; wide?: boolean }) {
+  return (
+    <div className={wide ? "wide" : ""}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   );
 }
 
@@ -737,15 +884,18 @@ const gpuProfiles = [
 function ConnectNode({
   nodes,
   defaultAgentImage,
+  defaultPublicURL,
   onClose,
 }: {
   nodes: Node[];
   defaultAgentImage: string;
+  defaultPublicURL: string;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<"windows" | "docker">("windows");
   const [copied, setCopied] = useState(false);
   const [agentImage, setAgentImage] = useState(defaultAgentImage);
+  const [serverURL, setServerURL] = useState(defaultPublicURL);
   const [values, setValues] = useState({
     name: "local-gpu-01",
     pool: "default",
@@ -762,7 +912,8 @@ function ConnectNode({
       ...nodes.map((node) => node.pool),
     ]),
   ];
-  const server = window.location.origin;
+  const server = (serverURL.trim() || window.location.origin).replace(/\/+$/, "");
+  const localOnlyServer = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(server);
   const token = sessionStorage.getItem("gpuflow_token") || "";
   const windowsCommand = `${token ? `$env:GPUFLOW_TOKEN = "${token}"\n` : ""}.\\gpuflow.exe agent -server "${server}" -id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price} -executor docker`;
   const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  ${agentImage.trim() || "gpuflow:latest"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price}`;
@@ -817,23 +968,42 @@ function ConnectNode({
           <button disabled>阿里云 · 即将支持</button>
           <button disabled>腾讯云 · 即将支持</button>
         </div>
-        {mode === "docker" && (
-          <label className="agent-image-field">
-            Agent 镜像
+        <div className={`connection-settings ${mode === "docker" ? "two-columns" : ""}`}>
+          <label className="connection-field">
+            控制端地址
             <input
-              value={agentImage}
+              type="url"
+              value={serverURL}
               onChange={(event) => {
-                setAgentImage(event.target.value);
+                setServerURL(event.target.value);
                 setCopied(false);
               }}
-              placeholder="ghcr.io/owner/gpuflow:0.1.0"
+              placeholder="https://gpu-control.example.com"
             />
-            <small>
-              正式环境建议使用 GHCR 固定版本；本地构建可使用
-              gpuflow:latest。
+            <small className={localOnlyServer ? "warning" : ""}>
+              {localOnlyServer
+                ? "当前地址仅本机可用；远程节点请改为局域网 IP、域名或公网 HTTPS 地址。"
+                : "该地址将写入 Agent 命令，请确认目标 GPU 主机可以访问。"}
             </small>
           </label>
-        )}
+          {mode === "docker" && (
+            <label className="connection-field">
+              Agent 镜像
+              <input
+                value={agentImage}
+                onChange={(event) => {
+                  setAgentImage(event.target.value);
+                  setCopied(false);
+                }}
+                placeholder="ghcr.io/owner/gpuflow:0.1.0"
+              />
+              <small>
+                正式环境建议使用 GHCR 固定版本；本地构建可使用
+                gpuflow:latest。
+              </small>
+            </label>
+          )}
+        </div>
         <div className="form-grid compact">
           <label>
             节点标识（唯一）
@@ -940,6 +1110,7 @@ function BuildTaskImage({
 }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [runtime, setRuntime] = useState("pytorch");
   const defaultTag = `gpuflow-task/script:${new Date()
     .toISOString()
     .replace(/[-:T]/g, "")
@@ -981,17 +1152,33 @@ function BuildTaskImage({
           </label>
           <label>
             运行环境
-            <select name="runtime" defaultValue="pytorch">
+            <select
+              name="runtime"
+              value={runtime}
+              onChange={(event) => setRuntime(event.target.value)}
+            >
               <option value="shell">Shell · Node Alpine</option>
               <option value="python">Python 3.12 · CPU</option>
               <option value="pytorch">PyTorch 2.1 · CUDA 12.1</option>
               <option value="cuda12">CUDA 12.0 · Shell</option>
+              <option value="custom">自定义基础镜像…</option>
             </select>
           </label>
           <label>
             镜像名称
             <input name="image" defaultValue={defaultTag} required />
           </label>
+          {runtime === "custom" && (
+            <label className="wide">
+              自定义基础镜像
+              <input
+                name="base_image"
+                required
+                placeholder="例如：harbor.example.com/ai/pytorch:cuda12"
+              />
+              <small>适用于镜像代理、Harbor、私有仓库或本机已有镜像。</small>
+            </label>
+          )}
           <label className="wide">
             Python 依赖（可选）
             <textarea
@@ -1019,25 +1206,24 @@ function BuildTaskImage({
 
 function SubmitJob({
   nodes,
+  taskImages,
   initialImage,
-  initialCommand,
   onClose,
   onCreated,
 }: {
   nodes: Node[];
+  taskImages: TaskImage[];
   initialImage?: string;
-  initialCommand?: string;
   onClose: () => void;
   onCreated: () => void;
 }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [imagePreset, setImagePreset] = useState(
-    initialImage ? "custom" : "node:22-alpine",
+  const readyImages = taskImages.filter((image) => image.status === "ready");
+  const [selectedImage, setSelectedImage] = useState(
+    initialImage || readyImages[0]?.name || "node:22-alpine",
   );
-  const [commandPreset, setCommandPreset] = useState(
-    initialCommand ? "custom" : "test -c /dev/dxg && echo GPU_DEVICE_AVAILABLE",
-  );
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const pools = [...new Set(nodes.map((node) => node.pool))];
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1048,18 +1234,16 @@ function SubmitJob({
     const pool = String(values.get("pool") || "");
     try {
       const image =
-        imagePreset === "custom"
+        selectedImage === "custom"
           ? String(values.get("custom_image") || "").trim()
-          : imagePreset;
-      const selectedCommand =
-        commandPreset === "custom" ? command : commandPreset;
-      if (!image) throw new Error("请输入自定义容器镜像");
+          : selectedImage;
+      if (!image) throw new Error("请输入任务镜像地址");
       await api("/v1/jobs", {
         method: "POST",
         body: JSON.stringify({
           name: values.get("name"),
           image,
-          command: selectedCommand ? ["sh", "-c", selectedCommand] : [],
+          command: command ? ["sh", "-c", command] : [],
           requirements: {
             gpu_count: Number(values.get("gpu_count")),
             min_vram_gb: Number(values.get("vram")),
@@ -1089,69 +1273,52 @@ function SubmitJob({
           </button>
         </div>
         {error && <div className="notice error">{error}</div>}
-        <div className="form-grid">
+        <div className="form-grid submit-grid">
+          <div className="form-section-title wide">
+            <span>01</span>
+            <strong>任务信息</strong>
+          </div>
           <label>
             任务名称
             <input name="name" required placeholder="model-evaluation" />
+            <small>用于在任务队列中识别本次执行。</small>
           </label>
           <label>
-            容器镜像
+            任务镜像
             <select
-              value={imagePreset}
-              onChange={(event) => setImagePreset(event.target.value)}
+              value={selectedImage}
+              onChange={(event) => setSelectedImage(event.target.value)}
             >
-              <option value="node:22-alpine">Node Alpine · 设备测试</option>
-              <option value="nvidia/cuda:12.0.1-base-ubuntu22.04">
-                NVIDIA CUDA 12.0
-              </option>
-              <option value="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime">
-                PyTorch 2.5.1 CUDA
-              </option>
-              <option value="custom">自定义镜像…</option>
+              {readyImages.length > 0 && (
+                <optgroup label="已构建任务镜像">
+                  {readyImages.map((image) => (
+                    <option key={image.id} value={image.name}>{image.name}</option>
+                  ))}
+                </optgroup>
+              )}
+              <optgroup label="内置测试镜像">
+                <option value="node:22-alpine">Node Alpine · 设备测试</option>
+                <option value="nvidia/cuda:12.0.1-base-ubuntu22.04">NVIDIA CUDA 12.0</option>
+                <option value="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime">PyTorch 2.5.1 CUDA</option>
+              </optgroup>
+              <option value="custom">填写其他镜像地址…</option>
             </select>
+            <small>节点本地已有或能从镜像仓库拉取的镜像。</small>
           </label>
-          {imagePreset === "custom" && (
+          {selectedImage === "custom" && (
             <label className="wide">
-              自定义镜像
+              镜像地址
               <input
                 name="custom_image"
                 required
-                defaultValue={initialImage}
-                placeholder="registry/team/image:tag"
+                placeholder="ghcr.io/team/task:v1"
               />
             </label>
           )}
-          <label className="wide">
-            执行模板
-            <select
-              value={commandPreset}
-              onChange={(event) => setCommandPreset(event.target.value)}
-            >
-              <option value="test -c /dev/dxg && echo GPU_DEVICE_AVAILABLE">
-                检查GPU设备
-              </option>
-              <option value="nvidia-smi">查看NVIDIA状态</option>
-              <option
-                value={
-                  'python -c "import torch; print(torch.cuda.get_device_name(0))"'
-                }
-              >
-                检查PyTorch CUDA
-              </option>
-              <option value="custom">自定义命令…</option>
-            </select>
-          </label>
-          {commandPreset === "custom" && (
-            <label className="wide">
-              自定义命令
-              <input
-                name="command"
-                required
-                defaultValue={initialCommand}
-                placeholder="python evaluate.py"
-              />
-            </label>
-          )}
+          <div className="form-section-title wide">
+            <span>02</span>
+            <strong>资源要求</strong>
+          </div>
           <label>
             GPU数量
             <select name="gpu_count" defaultValue="1">
@@ -1174,6 +1341,10 @@ function SubmitJob({
               )}
             </select>
           </label>
+          <div className="form-section-title wide">
+            <span>03</span>
+            <strong>调度设置</strong>
+          </div>
           <label>
             资源池
             <select name="pool" defaultValue="">
@@ -1211,6 +1382,20 @@ function SubmitJob({
             </select>
           </label>
         </div>
+        <button
+          className="advanced-toggle"
+          type="button"
+          onClick={() => setShowAdvanced((value) => !value)}
+        >
+          {showAdvanced ? "收起高级设置" : "高级设置：覆盖镜像启动命令"}
+        </button>
+        {showAdvanced && (
+          <label className="advanced-command">
+            覆盖启动命令（可选）
+            <input name="command" placeholder="例如：python train.py" />
+            <small>留空时使用镜像自身的 CMD；仅在临时测试或需要更换入口时填写。</small>
+          </label>
+        )}
         <div className="modal-actions">
           <button type="button" onClick={onClose}>
             取消

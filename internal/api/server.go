@@ -3,11 +3,16 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"gpuflow/internal/artifact"
 	"gpuflow/internal/model"
 	"gpuflow/internal/store"
 	"gpuflow/internal/webui"
@@ -15,11 +20,12 @@ import (
 )
 
 type Server struct {
-	store   *store.Store
-	token   string
-	mux     *http.ServeMux
-	edition edition.Descriptor
-	images  *ImageBuilder
+	store     *store.Store
+	token     string
+	mux       *http.ServeMux
+	edition   edition.Descriptor
+	images    *ImageBuilder
+	artifacts artifact.Store
 }
 
 func New(s *store.Store, token string) *Server {
@@ -27,7 +33,15 @@ func New(s *store.Store, token string) *Server {
 }
 
 func NewWithEdition(s *store.Store, token string, descriptor edition.Descriptor) *Server {
-	server := &Server{store: s, token: token, mux: http.NewServeMux(), edition: descriptor, images: NewImageBuilder()}
+	return NewWithTaskImageStore(s, s, token, descriptor)
+}
+
+func NewWithTaskImageStore(s *store.Store, taskImages store.TaskImageStore, token string, descriptor edition.Descriptor) *Server {
+	return NewWithStores(s, taskImages, artifact.Disabled(), token, descriptor)
+}
+
+func NewWithStores(s *store.Store, taskImages store.TaskImageStore, artifacts artifact.Store, token string, descriptor edition.Descriptor) *Server {
+	server := &Server{store: s, token: token, mux: http.NewServeMux(), edition: descriptor, images: NewImageBuilder(taskImages), artifacts: artifacts}
 	server.routes()
 	return server
 }
@@ -43,6 +57,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/jobs", s.listJobs)
 	s.mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/status", s.updateJob)
+	s.mux.HandleFunc("POST /v1/jobs/{id}/artifacts", s.uploadArtifact)
+	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts", s.listArtifacts)
+	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts/{name}", s.downloadArtifact)
 	s.mux.HandleFunc("POST /v1/nodes/register", s.registerNode)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/heartbeat", s.heartbeat)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/next", s.nextJob)
@@ -51,6 +68,65 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/task-images/build", s.buildTaskImage)
 	s.mux.HandleFunc("GET /v1/task-images", s.listTaskImages)
 	s.mux.Handle("/", webui.Handler())
+}
+
+func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
+	if !s.artifacts.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, artifact.ErrDisabled.Error())
+		return
+	}
+	job, err := s.store.GetJob(r.PathValue("id"))
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	if nodeID := r.URL.Query().Get("node_id"); nodeID == "" || nodeID != job.AssignedNode {
+		writeError(w, http.StatusForbidden, "artifact upload is only allowed from the assigned node")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defer file.Close()
+	name := filepath.Base(header.Filename)
+	if err := s.artifacts.Put(r.Context(), job.ID, name, file, header.Size); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, artifact.Item{Name: name, Size: header.Size, LastModified: time.Now().UTC()})
+}
+
+func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.store.GetJob(r.PathValue("id")); err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	items, err := s.artifacts.List(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": s.artifacts.Enabled(), "items": items})
+}
+
+func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.store.GetJob(r.PathValue("id")); err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	reader, item, err := s.artifacts.Open(r.Context(), r.PathValue("id"), r.PathValue("name"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "artifact not found")
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": item.Name}))
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Length", fmt.Sprint(item.Size))
+	_, _ = io.Copy(w, reader)
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {

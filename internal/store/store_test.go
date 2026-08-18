@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -22,6 +23,29 @@ func TestScheduleChoosesCheapestEligibleNode(t *testing.T) {
 	got, _ := s.GetJob(j.ID)
 	if got.AssignedNode != "cheap" {
 		t.Fatalf("expected cheap node, got %q", got.AssignedNode)
+	}
+}
+
+func TestTaskImagesPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := model.TaskImage{ID: "img-test", Name: "gpuflow-task/test:v1", Status: "ready", CreatedAt: time.Now()}
+	if err := s.SaveTaskImage(image); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	images, err := reopened.ListTaskImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 1 || images[0].Name != image.Name {
+		t.Fatalf("unexpected persisted images: %+v", images)
 	}
 }
 

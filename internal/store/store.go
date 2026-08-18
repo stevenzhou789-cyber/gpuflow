@@ -22,8 +22,9 @@ var (
 )
 
 type snapshot struct {
-	Jobs  map[string]*model.Job  `json:"jobs"`
-	Nodes map[string]*model.Node `json:"nodes"`
+	Jobs       map[string]*model.Job       `json:"jobs"`
+	Nodes      map[string]*model.Node      `json:"nodes"`
+	TaskImages map[string]*model.TaskImage `json:"task_images,omitempty"`
 }
 
 type Store struct {
@@ -32,8 +33,13 @@ type Store struct {
 	state snapshot
 }
 
+type TaskImageStore interface {
+	SaveTaskImage(model.TaskImage) error
+	ListTaskImages() ([]model.TaskImage, error)
+}
+
 func Open(path string) (*Store, error) {
-	s := &Store{path: path, state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}}}
+	s := &Store{path: path, state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}}
 	if path == "" {
 		return s, nil
 	}
@@ -53,7 +59,28 @@ func Open(path string) (*Store, error) {
 	if s.state.Nodes == nil {
 		s.state.Nodes = map[string]*model.Node{}
 	}
+	if s.state.TaskImages == nil {
+		s.state.TaskImages = map[string]*model.TaskImage{}
+	}
 	return s, nil
+}
+
+func (s *Store) SaveTaskImage(image model.TaskImage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy := image
+	s.state.TaskImages[image.ID] = &copy
+	return s.saveLocked()
+}
+
+func (s *Store) ListTaskImages() ([]model.TaskImage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]model.TaskImage, 0, len(s.state.TaskImages))
+	for _, image := range s.state.TaskImages {
+		result = append(result, *image)
+	}
+	return result, nil
 }
 
 func (s *Store) saveLocked() error {

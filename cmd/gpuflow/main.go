@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"gpuflow/internal/agent"
+	"gpuflow/internal/artifact"
 	"gpuflow/internal/client"
 	"gpuflow/internal/model"
 	"gpuflow/pkg/edition"
@@ -38,6 +40,17 @@ func envFloat(name string, fallback float64) float64 {
 		return v
 	}
 	return fallback
+}
+func envBool(name string, fallback bool) bool {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 func usage() {
 	fmt.Fprintln(os.Stderr, "Usage: gpuflow <server|agent|submit|jobs|nodes|get> [options]")
@@ -72,13 +85,20 @@ func runServer(args []string) error {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	addr := fs.String("addr", env("GPUFLOW_ADDR", ":8080"), "listen address")
 	data := fs.String("data", env("GPUFLOW_DATA", "./data/state.json"), "state file")
+	mysqlDSN := fs.String("mysql-dsn", env("GPUFLOW_MYSQL_DSN", ""), "optional MySQL DSN for task image records")
 	token := fs.String("token", env("GPUFLOW_TOKEN", ""), "bearer token")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	descriptor := edition.Community()
 	descriptor.AgentImage = env("GPUFLOW_AGENT_IMAGE", descriptor.AgentImage)
-	handler, err := platform.NewHandler(*data, *token, descriptor)
+	descriptor.PublicURL = strings.TrimRight(strings.TrimSpace(env("GPUFLOW_PUBLIC_URL", "")), "/")
+	artifactConfig := artifact.Config{
+		Endpoint: env("GPUFLOW_S3_ENDPOINT", ""), AccessKey: env("GPUFLOW_S3_ACCESS_KEY", ""),
+		SecretKey: env("GPUFLOW_S3_SECRET_KEY", ""), Bucket: env("GPUFLOW_S3_BUCKET", "gpuflow-artifacts"),
+		Region: env("GPUFLOW_S3_REGION", ""), UseSSL: envBool("GPUFLOW_S3_USE_SSL", false),
+	}
+	handler, err := platform.NewHandler(*data, *mysqlDSN, *token, descriptor, artifactConfig)
 	if err != nil {
 		return err
 	}
@@ -111,6 +131,7 @@ func runAgent(args []string) error {
 	fs.IntVar(&cfg.VRAMGB, "vram", envInt("GPUFLOW_VRAM_GB", 24), "VRAM in GB")
 	fs.Float64Var(&cfg.HourlyPrice, "hourly-price", envFloat("GPUFLOW_HOURLY_PRICE", 0), "estimated hourly price")
 	fs.StringVar(&cfg.Executor, "executor", env("GPUFLOW_EXECUTOR", "docker"), "docker or mock")
+	fs.StringVar(&cfg.ArtifactDir, "artifact-dir", env("GPUFLOW_ARTIFACT_WORKDIR", ""), "host-visible artifact work directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

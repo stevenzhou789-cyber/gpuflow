@@ -8,6 +8,7 @@ type Descriptor struct {
 	LicensedTo string          `json:"licensed_to,omitempty"`
 	ExpiresAt  string          `json:"expires_at,omitempty"`
 	AgentImage string          `json:"agent_image,omitempty"`
+	PublicURL  string          `json:"public_url,omitempty"`
 	Features   map[string]bool `json:"features"`
 }
 

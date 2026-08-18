@@ -1,0 +1,54 @@
+services:
+  control-plane:
+    environment:
+      GPUFLOW_MYSQL_DSN: "gpuflow:${GPUFLOW_MYSQL_PASSWORD:-development-password}@tcp(mysql:3306)/gpuflow?parseTime=true&charset=utf8mb4"
+      GPUFLOW_S3_ENDPOINT: minio:9000
+      GPUFLOW_S3_ACCESS_KEY: ${GPUFLOW_MINIO_ROOT_USER:-gpuflow}
+      GPUFLOW_S3_SECRET_KEY: ${GPUFLOW_MINIO_ROOT_PASSWORD:-development-minio-password}
+      GPUFLOW_S3_BUCKET: ${GPUFLOW_S3_BUCKET:-gpuflow-artifacts}
+      GPUFLOW_S3_USE_SSL: "false"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  mysql:
+    image: ${GPUFLOW_MYSQL_IMAGE:-mysql:8.4}
+    environment:
+      MYSQL_DATABASE: gpuflow
+      MYSQL_USER: gpuflow
+      MYSQL_PASSWORD: ${GPUFLOW_MYSQL_PASSWORD:-development-password}
+      MYSQL_ROOT_PASSWORD: ${GPUFLOW_MYSQL_ROOT_PASSWORD:-root-development-password}
+    ports:
+      - "${GPUFLOW_MYSQL_BIND:-127.0.0.1}:${GPUFLOW_MYSQL_PORT:-3306}:3306"
+    volumes:
+      - gpuflow-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: ${GPUFLOW_MINIO_IMAGE:-minio/minio:latest}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${GPUFLOW_MINIO_ROOT_USER:-gpuflow}
+      MINIO_ROOT_PASSWORD: ${GPUFLOW_MINIO_ROOT_PASSWORD:-development-minio-password}
+    ports:
+      - "${GPUFLOW_MINIO_BIND:-127.0.0.1}:${GPUFLOW_MINIO_PORT:-9000}:9000"
+      - "${GPUFLOW_MINIO_BIND:-127.0.0.1}:${GPUFLOW_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - gpuflow-minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  gpuflow-mysql:
+  gpuflow-minio:

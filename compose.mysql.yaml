@@ -1,0 +1,28 @@
+services:
+  control-plane:
+    environment:
+      GPUFLOW_MYSQL_DSN: "gpuflow:${GPUFLOW_MYSQL_PASSWORD:-development-password}@tcp(mysql:3306)/gpuflow?parseTime=true&charset=utf8mb4"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: ${GPUFLOW_MYSQL_IMAGE:-mysql:8.4}
+    environment:
+      MYSQL_DATABASE: gpuflow
+      MYSQL_USER: gpuflow
+      MYSQL_PASSWORD: ${GPUFLOW_MYSQL_PASSWORD:-development-password}
+      MYSQL_ROOT_PASSWORD: ${GPUFLOW_MYSQL_ROOT_PASSWORD:-root-development-password}
+    ports:
+      - "${GPUFLOW_MYSQL_BIND:-127.0.0.1}:${GPUFLOW_MYSQL_PORT:-3306}:3306"
+    volumes:
+      - gpuflow-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  gpuflow-mysql:

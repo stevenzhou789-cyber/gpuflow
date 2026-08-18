@@ -17,6 +17,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gpuflow/internal/model"
+	"gpuflow/internal/store"
 )
 
 const maxTaskImageRequest = 6 << 20
@@ -24,6 +27,7 @@ const maxTaskImageRequest = 6 << 20
 var (
 	imageNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]*(?::[a-zA-Z0-9][a-zA-Z0-9._-]*)?$`)
 	filenamePattern  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+	baseImagePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*$`)
 	runtimeImages    = map[string]string{
 		"shell":   "node:22-alpine",
 		"python":  "python:3.12-slim",
@@ -32,32 +36,55 @@ var (
 	}
 )
 
-type TaskImage struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Runtime   string    `json:"runtime"`
-	BaseImage string    `json:"base_image"`
-	Filename  string    `json:"filename"`
-	Command   string    `json:"command"`
-	Status    string    `json:"status"`
-	Log       string    `json:"log,omitempty"`
-	Error     string    `json:"error,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
+type TaskImage = model.TaskImage
 
 type ImageBuilder struct {
 	mu     sync.RWMutex
 	images map[string]*TaskImage
 	run    func(context.Context, string, ...string) ([]byte, error)
+	store  store.TaskImageStore
 }
 
-func NewImageBuilder() *ImageBuilder {
-	return &ImageBuilder{
+func NewImageBuilder(storage store.TaskImageStore) *ImageBuilder {
+	builder := &ImageBuilder{
 		images: make(map[string]*TaskImage),
+		store:  storage,
 		run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
+	}
+	savedImages, _ := storage.ListTaskImages()
+	for _, saved := range savedImages {
+		image := saved
+		if image.Status == "building" {
+			image.Status = "failed"
+			image.Error = "控制端在镜像构建期间重启，请重新构建"
+			image.UpdatedAt = time.Now().UTC()
+			_ = storage.SaveTaskImage(image)
+		}
+		builder.images[image.ID] = &image
+	}
+	builder.discoverLocalImages()
+	return builder
+}
+
+func (b *ImageBuilder) discoverLocalImages() {
+	output, err := exec.Command("docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}").Output()
+	if err != nil {
+		return
+	}
+	known := make(map[string]bool, len(b.images))
+	for _, image := range b.images {
+		known[image.Name] = true
+	}
+	for _, name := range strings.Fields(string(output)) {
+		if !strings.HasPrefix(name, "gpuflow-task/") || known[name] {
+			continue
+		}
+		now := time.Now().UTC()
+		image := &TaskImage{ID: randomID(), Name: name, Runtime: "imported", BaseImage: "本机已有镜像", Filename: "—", Status: "ready", CreatedAt: now, UpdatedAt: now}
+		b.images[image.ID] = image
+		_ = b.store.SaveTaskImage(*image)
 	}
 }
 
@@ -87,9 +114,22 @@ func (s *Server) buildTaskImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	runtimeName := strings.TrimSpace(r.FormValue("runtime"))
-	baseImage, ok := runtimeImages[runtimeName]
-	if !ok {
-		writeError(w, http.StatusBadRequest, "不支持的运行环境")
+	baseImage := strings.TrimSpace(r.FormValue("base_image"))
+	if runtimeName == "custom" {
+		if baseImage == "" {
+			writeError(w, http.StatusBadRequest, "请输入自定义基础镜像")
+			return
+		}
+	} else {
+		var ok bool
+		baseImage, ok = runtimeImages[runtimeName]
+		if !ok {
+			writeError(w, http.StatusBadRequest, "不支持的运行环境")
+			return
+		}
+	}
+	if len(baseImage) > 255 || !baseImagePattern.MatchString(baseImage) {
+		writeError(w, http.StatusBadRequest, "基础镜像地址格式无效")
 		return
 	}
 	imageName := strings.ToLower(strings.TrimSpace(r.FormValue("image")))
@@ -147,6 +187,13 @@ func (s *Server) buildTaskImage(w http.ResponseWriter, r *http.Request) {
 	s.images.mu.Lock()
 	s.images.images[id] = image
 	s.images.mu.Unlock()
+	if err := s.images.store.SaveTaskImage(*image); err != nil {
+		s.images.mu.Lock()
+		delete(s.images.images, id)
+		s.images.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, "保存镜像构建记录失败: "+err.Error())
+		return
+	}
 
 	response := *image
 	go s.images.build(id, script, requirements)
@@ -182,7 +229,7 @@ func (b *ImageBuilder) build(id string, script []byte, requirements string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	output, runErr := b.run(ctx, "docker", "build", "--tag", image.Name, dir)
+	output, runErr := b.run(ctx, "docker", "build", "--label", "gpuflow.task-image=true", "--tag", image.Name, dir)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("构建超过 15 分钟")
 	}
@@ -206,16 +253,30 @@ func (b *ImageBuilder) finish(id string, output []byte, buildErr error) {
 		output = output[len(output)-(64<<10):]
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	image := b.images[id]
 	image.Log = string(output)
 	image.UpdatedAt = time.Now().UTC()
 	if buildErr != nil {
 		image.Status = "failed"
-		image.Error = buildErr.Error()
-		return
+		image.Error = readableBuildError(output, buildErr)
+	} else {
+		image.Status = "ready"
 	}
-	image.Status = "ready"
+	saved := *image
+	b.mu.Unlock()
+	_ = b.store.SaveTaskImage(saved)
+}
+
+func readableBuildError(output []byte, buildErr error) string {
+	message := strings.ToLower(string(output))
+	if strings.Contains(message, "failed to fetch anonymous token") ||
+		strings.Contains(message, "connection attempt failed") {
+		return "无法拉取基础镜像：请检查 Docker 网络、配置镜像加速，或使用自定义基础镜像地址"
+	}
+	if strings.Contains(message, "manifest unknown") || strings.Contains(message, "not found") {
+		return "基础镜像不存在或标签无效，请检查镜像地址"
+	}
+	return buildErr.Error()
 }
 
 func randomID() string {
