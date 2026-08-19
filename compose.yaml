@@ -1,10 +1,11 @@
 services:
   control-plane:
+    image: ${GPUFLOW_IMAGE:-gpuflow:local}
     build: .
     command: ["server", "-addr", ":8080"]
     environment:
       GPUFLOW_TOKEN: ${GPUFLOW_TOKEN:-development-token}
-      GPUFLOW_AGENT_IMAGE: ${GPUFLOW_AGENT_IMAGE:-gpuflow:latest}
+      GPUFLOW_AGENT_IMAGE: ${GPUFLOW_AGENT_IMAGE:-gpuflow:local}
       GPUFLOW_PUBLIC_URL: ${GPUFLOW_PUBLIC_URL:-}
       GPUFLOW_MYSQL_DSN: "gpuflow:${GPUFLOW_MYSQL_PASSWORD:-development-password}@tcp(mysql:3306)/gpuflow?parseTime=true&charset=utf8mb4"
       GPUFLOW_S3_ENDPOINT: minio:9000

@@ -62,7 +62,7 @@ Copy-Item .env.example .env
 docker compose up --build -d
 ```
 
-默认 Compose 只启动 GPUFlow 控制面、MySQL 和 MinIO，不会自动启动或注册算力节点，也不会自动提交任务。打开 [http://localhost:18080](http://localhost:18080)，使用 `.env` 中的 `GPUFLOW_TOKEN` 登录。
+Compose 会把当前源码构建为 `gpuflow:local`，供控制端和同一 Docker 主机上的容器 Agent 共用。默认只启动 GPUFlow 控制面、MySQL 和 MinIO，不会自动启动或注册算力节点，也不会自动提交任务。打开 [http://localhost:18080](http://localhost:18080)，使用 `.env` 中的 `GPUFLOW_TOKEN` 登录。
 
 确认三个服务正常：
 
@@ -156,7 +156,7 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts \
   -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \
-  gpuflow:latest agent \
+  ghcr.io/stevenzhou789-cyber/gpuflow:stable agent \
   -server "http://control-plane.example.com:8080" \
   -token "replace-with-your-token" \
   -id "lab-gpu-01" \
@@ -170,7 +170,7 @@ docker run -d \
   -executor docker
 ```
 
-`gpuflow:latest` 表示目标主机本地已有的 GPUFlow 镜像。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
+正式节点直接使用滚动更新的 `stable`；与控制端共用 Docker 的本地开发节点可以使用 Compose 自动构建的 `gpuflow:local`。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
 
 Agent 应使用稳定且唯一的 `-id`。任务执行期间 Agent 会持续发送心跳。同一 ID 的 Agent 重启后，会在剩余重试预算内清理遗留容器并从头重新执行中断的任务，同时记录恢复次数；预算耗尽时任务会直接失败。因此任务脚本应尽量保持幂等。
 
@@ -244,7 +244,7 @@ GPU 检测示例 [examples/gpu-smoke.py](examples/gpu-smoke.py) 应选择 **PyTo
 | `GPUFLOW_ADDR` | `:8080` | HTTP 监听地址 |
 | `GPUFLOW_TOKEN` | 空 | API Bearer Token；对外部署时必须设置 |
 | `GPUFLOW_PUBLIC_URL` | 当前页面来源 | Agent 命令使用的控制面公开地址 |
-| `GPUFLOW_AGENT_IMAGE` | `gpuflow:latest` | 接入页面生成 Docker Agent 命令时使用的镜像名 |
+| `GPUFLOW_AGENT_IMAGE` | `gpuflow:local` | 接入页面生成 Docker Agent 命令时使用的镜像名；远程节点使用 GHCR `stable` |
 | `GPUFLOW_MYSQL_DSN` | 无 | 必填；任务、节点和任务镜像记录使用的 MySQL DSN |
 | `GPUFLOW_S3_ENDPOINT` | 无 | 必填；MinIO/S3 兼容对象存储地址 |
 | `GPUFLOW_S3_ACCESS_KEY` | 无 | 必填；对象存储 Access Key |
@@ -282,16 +282,23 @@ docker compose up --build -d
 
 命令行参数会覆盖对应的环境变量。
 
-## 发布容器镜像
+## 自动构建与发布
 
-仓库内置 GitHub Actions 工作流。推送 `v*.*.*` 标签后会构建 `linux/amd64`、`linux/arm64` 镜像并发布到 `ghcr.io/<owner>/<repository>`：
+仓库内置 GitHub Actions 工作流，不需要在开发机手工制作发布产物：
+
+- Pull Request 会运行 Go 测试、构建 Web，并验证 Docker 镜像能够构建，但不会发布。
+- 推送到 `main` 会覆盖发布 `linux/amd64`、`linux/arm64` 的 `ghcr.io/stevenzhou789-cyber/gpuflow:stable`。
+- 发布完成后会保留当前多架构镜像及其平台清单，并删除 GHCR 中其余历史版本。
+- 同一次工作流会移动滚动的 `stable` Git 标签，并创建或更新同名 GitHub Release。
+- Release 固定提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`，不会累积版本标签。
+
+推送完成后可以直接拉取：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
 ```
 
-生产环境建议使用固定版本标签，不要依赖 `latest`。首次发布后还需要在 GitHub Packages 中确认镜像包的公开访问设置。
+工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release，不需要额外创建个人访问令牌。`stable` 是滚动标签，每次 `main` 发布都会替换原内容，因此部署前应先在测试节点验证。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置；如果包并非由本仓库工作流首次创建，还要在包的 **Manage Actions access** 中授予本仓库 Admin 权限，历史版本清理才会生效。
 
 ## 从源码开发
 

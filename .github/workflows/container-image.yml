@@ -1,9 +1,9 @@
-name: Container image
+name: Publish
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
   pull_request:
     paths:
       - ".github/workflows/container-image.yml"
@@ -25,8 +25,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      attestations: write
-      id-token: write
 
     steps:
       - name: Check out repository
@@ -56,12 +54,9 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ steps.image.outputs.name }}
-          flavor: latest=auto
+          flavor: latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=stable,enable=${{ github.event_name != 'pull_request' }}
 
       - name: Build and publish multi-platform image
         id: push
@@ -74,13 +69,123 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
+          provenance: false
+          sbom: false
 
-      - name: Attest published image
+      - name: Delete historical package versions
         if: github.event_name != 'pull_request'
-        uses: actions/attest@v4
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          CURRENT_DIGEST: ${{ steps.push.outputs.digest }}
+          OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          PACKAGE: ${{ github.event.repository.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          preserve="$(mktemp)"
+          versions="$(mktemp)"
+          printf '%s\n' "$CURRENT_DIGEST" > "$preserve"
+          docker buildx imagetools inspect "$IMAGE_NAME@$CURRENT_DIGEST" --raw \
+            | jq -r '.manifests[]?.digest' >> "$preserve"
+          sort -u -o "$preserve" "$preserve"
+
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            endpoint="orgs/$OWNER/packages/container/$PACKAGE/versions"
+          else
+            endpoint="users/$OWNER/packages/container/$PACKAGE/versions"
+          fi
+          gh api --paginate "$endpoint?per_page=100" \
+            --jq '.[] | [.id, .name] | @tsv' > "$versions"
+
+          if ! cut -f2 "$versions" | grep -Fxq "$CURRENT_DIGEST"; then
+            echo "Current image digest was not found in the package version list; refusing cleanup." >&2
+            exit 1
+          fi
+          while IFS=$'\t' read -r id digest; do
+            if [ -n "$id" ] && ! grep -Fxq "$digest" "$preserve"; then
+              gh api --method DELETE "$endpoint/$id"
+            fi
+          done < "$versions"
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          subject-name: ${{ steps.image.outputs.name }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web interface
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build dist
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o build/gpuflow ./cmd/gpuflow
+          tar -C build -czf "dist/gpuflow-linux-amd64.tar.gz" gpuflow
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o build/gpuflow ./cmd/gpuflow
+          tar -C build -czf "dist/gpuflow-linux-arm64.tar.gz" gpuflow
+
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o build/gpuflow.exe ./cmd/gpuflow
+          zip -j "dist/gpuflow-windows-amd64.zip" build/gpuflow.exe
+
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip > checksums.txt
+
+      - name: Move stable release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/stable" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/stable" \
+              -f sha="$GITHUB_SHA" \
+              -F force=true >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/stable" \
+              -f sha="$GITHUB_SHA" >/dev/null
+          fi
+
+      - name: Create or update stable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view stable >/dev/null 2>&1; then
+            gh release upload stable dist/* --clobber
+          else
+            gh release create stable dist/* \
+              --generate-notes \
+              --title "GPUFlow stable"
+          fi

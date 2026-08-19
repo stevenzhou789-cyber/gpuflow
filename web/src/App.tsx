@@ -356,7 +356,7 @@ function App() {
       {showConnect && (
         <ConnectNode
           nodes={nodes}
-          defaultAgentImage={edition.agent_image || "gpuflow:latest"}
+          defaultAgentImage={edition.agent_image || "gpuflow:local"}
           defaultPublicURL={edition.public_url || window.location.origin}
           onClose={() => setShowConnect(false)}
         />
@@ -1045,7 +1045,7 @@ function ConnectNode({
   const localOnlyServer = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(server);
   const token = sessionStorage.getItem("gpuflow_token") || "";
   const windowsCommand = `.\\gpuflow.exe agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price} -executor docker`;
-  const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  ${agentImage.trim() || "gpuflow:latest"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price}`;
+  const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price}`;
   const command = (mode === "windows" ? windowsCommand : dockerCommand).replace(
     /\n\+\s*/g,
     "\n  ",
@@ -1124,11 +1124,11 @@ function ConnectNode({
                   setAgentImage(event.target.value);
                   setCopied(false);
                 }}
-                placeholder="ghcr.io/owner/gpuflow:0.1.0"
+                placeholder="ghcr.io/owner/gpuflow:stable"
               />
               <small>
-                正式环境建议使用 GHCR 固定版本；本地构建可使用
-                gpuflow:latest。
+                远程节点使用 GHCR stable；本地构建可使用
+                gpuflow:local。
               </small>
             </label>
           )}
