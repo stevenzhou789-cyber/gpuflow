@@ -39,64 +39,63 @@ flowchart LR
 - 从 Python 或 Shell 脚本构建任务镜像
 - Windows、Linux 和 Docker Agent 接入指引
 
-## 三分钟体验
+## 快速开始
 
 ### 环境要求
 
 - Docker
 - Docker Compose
 
-### 启动控制面和演示节点
+### 1. 配置并启动服务
 
-在项目根目录执行：
-
-```bash
-docker compose --profile demo up --build -d
-```
-
-打开 [http://localhost:8080](http://localhost:8080)。未创建 `.env` 时，本地演示 Token 默认为：
-
-```text
-development-token
-```
-
-如果项目根目录已经存在 `.env`，请使用其中的 `GPUFLOW_TOKEN`。演示节点不声明 GPU，可用来体验节点管理、CPU 任务提交和调度流程。请勿把演示 Token 用于公网或生产环境。
-
-停止服务：
-
-```bash
-docker compose --profile demo down
-```
-
-## 一体化部署（GPUFlow + MySQL + MinIO）
-
-一体化部署会启动 GPUFlow 控制端、MySQL 和 MinIO。数据库与对象存储不会打进 GPUFlow 镜像，各自使用独立 Docker Volume：
+首次启动前复制环境变量示例，并修改其中的 Token、MySQL 密码和 MinIO 密码：
 
 ```bash
 cp .env.example .env
 docker compose up --build -d
 ```
 
-Windows PowerShell 可使用：
+Windows PowerShell：
 
 ```powershell
 Copy-Item .env.example .env
 docker compose up --build -d
 ```
 
-首次部署前，请修改 `.env` 中的 Token、MySQL 密码和 MinIO 密码。控制端会幂等创建 `jobs`、`nodes`、`task_images` 表与 `gpuflow-artifacts` 存储桶，不会清空已有数据。MinIO 控制台默认位于 [http://127.0.0.1:9001](http://127.0.0.1:9001)。
+默认 Compose 只启动 GPUFlow 控制面、MySQL 和 MinIO，不会自动启动或注册算力节点，也不会自动提交任务。打开 [http://localhost:18080](http://localhost:18080)，使用 `.env` 中的 `GPUFLOW_TOKEN` 登录。
 
-查看状态和日志：
+确认三个服务正常：
 
 ```bash
 docker compose ps
-docker compose logs -f control-plane mysql minio
 ```
+
+### 2. 接入算力节点
+
+在 Web 控制台进入 **节点 → 接入算力节点**，填写节点信息，并在目标机器执行页面生成的 Agent 命令。节点开始持续发送心跳后，页面才会显示 `ONLINE`；仅启动控制面不会产生在线节点。
+
+只验证 CPU 流程时，节点的 GPU 数量和显存可以填写 `0`。运行 GPU 任务时，应按目标机器的实际 GPU 数量、型号和显存填写，否则任务会因为找不到匹配节点而一直排队。
+
+### 3. 构建并提交第一个任务
+
+在 **任务镜像 → 上传任务脚本** 中选择 [examples/quick-smoke.sh](examples/quick-smoke.sh)，运行环境选择 **Shell**，完成镜像构建后点击 **使用此镜像提交任务**。CPU 节点测试时将任务的 GPU 数量和最低显存都设为 `0`，并确保任务资源池与节点一致或留空。
+
+任务完成后可以查看日志，并下载包含 `result.txt` 的 `artifacts.tar.gz`。更详细的节点参数和脚本构建说明见后文“接入真实 GPU 节点”和“从脚本构建任务镜像”。
 
 停止服务但保留数据：
 
 ```bash
 docker compose down
+```
+
+## 一体化部署与数据存储
+
+一体化部署会分别启动 GPUFlow 控制端、MySQL 和 MinIO 三个容器。MySQL 保存任务、节点和任务镜像记录，MinIO 保存任务产物；两者各自使用独立 Docker Volume，重新创建 GPUFlow 容器不会丢失这些数据。
+
+控制端会幂等创建 `jobs`、`nodes`、`task_images` 表与 `gpuflow-artifacts` 存储桶，不会清空已有数据。MinIO 控制台默认位于 [http://127.0.0.1:9001](http://127.0.0.1:9001)。查看运行日志：
+
+```bash
+docker compose logs -f control-plane mysql minio
 ```
 
 不要随意添加 `-v`，否则会删除 MySQL 和 MinIO 数据卷。
@@ -133,7 +132,7 @@ MySQL 和 MinIO/S3 都是必需依赖。MySQL DSN、S3 endpoint 或 S3 access/se
 接入时请注意：
 
 - **控制端地址**必须是目标主机能够访问的地址。
-- 本机测试可以使用 `http://127.0.0.1:8080`。
+- 本机测试可以使用 `http://127.0.0.1:18080`。
 - 远程节点应改为控制面所在机器的局域网 IP、域名或 HTTPS 地址。
 - **节点标识**必须唯一，并在节点重启后保持不变，例如 `lab-rtx4090-01`。
 - **调度参考单价**的单位为人民币元/GPU/小时，仅用于节点排序；本机测试可填写 `0`。
@@ -141,7 +140,7 @@ MySQL 和 MinIO/S3 都是必需依赖。MySQL DSN、S3 endpoint 或 S3 access/se
 控制面可通过 `GPUFLOW_PUBLIC_URL` 设置页面默认生成的远程访问地址：
 
 ```env
-GPUFLOW_PUBLIC_URL=http://127.0.0.1:8080
+GPUFLOW_PUBLIC_URL=http://127.0.0.1:18080
 ```
 
 默认值适合本机体验。部署到其他机器后，请由部署者改成节点实际可访问的地址。
@@ -184,8 +183,8 @@ Agent 应使用稳定且唯一的 `-id`。任务执行期间 Agent 会持续发�
 ```bash
 go build -o bin/gpuflow ./cmd/gpuflow
 ./bin/gpuflow submit \
-  -server http://localhost:8080 \
-  -token development-token \
+  -server http://localhost:18080 \
+  -token "与 .env 中 GPUFLOW_TOKEN 相同的值" \
   -file examples/job.json
 ```
 
@@ -205,7 +204,7 @@ gpuflow get JOB_ID
 CLI 命令也支持通过环境变量设置控制面地址和 Token：
 
 ```env
-GPUFLOW_SERVER=http://localhost:8080
+GPUFLOW_SERVER=http://localhost:18080
 GPUFLOW_TOKEN=replace-with-a-long-random-token
 ```
 
@@ -221,7 +220,7 @@ Web 控制台的 **镜像** 页面可以上传一个 `.py` 或 `.sh` 文件，�
 
 1. 在 **任务镜像 → 上传任务脚本** 中选择该文件。
 2. 运行环境选择 **Shell**，镜像名称填写 `gpuflow-task/quick-smoke:v1`，依赖留空。
-3. 构建成功后点击 **使用此镜像提交任务**。演示 CPU 节点将 GPU 数量设为 `0`；真实 GPU 节点可设为 `1`。
+3. 构建成功后点击 **使用此镜像提交任务**。CPU 节点将 GPU 数量和最低显存设为 `0`；真实 GPU 节点按实际资源填写。
 4. 任务完成后在 **任务队列** 点击任务，可查看执行信息与日志，并下载包含 `result.txt` 的 `artifacts.tar.gz`。
 
 GPU 检测示例 [examples/gpu-smoke.py](examples/gpu-smoke.py) 应选择 **PyTorch CUDA** 环境；PyTorch 已包含在基础镜像中，测试时依赖同样留空。

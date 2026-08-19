@@ -13,7 +13,7 @@ services:
       GPUFLOW_S3_BUCKET: ${GPUFLOW_S3_BUCKET:-gpuflow-artifacts}
       GPUFLOW_S3_USE_SSL: "false"
     ports:
-      - "8080:8080"
+      - "18080:8080"
     volumes:
       - //var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -21,29 +21,6 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    restart: unless-stopped
-
-  agent:
-    profiles: ["demo"]
-    build: .
-    command: ["agent"]
-    environment:
-      GPUFLOW_SERVER: http://control-plane:8080
-      GPUFLOW_TOKEN: ${GPUFLOW_TOKEN:-development-token}
-      GPUFLOW_NODE_ID: local-docker-agent
-      GPUFLOW_NODE_NAME: local-docker-agent
-      GPUFLOW_PROVIDER: local
-      GPUFLOW_POOL: development
-      GPUFLOW_GPU_MODEL: generic
-      GPUFLOW_GPU_COUNT: 0
-      GPUFLOW_VRAM_GB: 0
-      GPUFLOW_HOURLY_PRICE: 0
-      GPUFLOW_ARTIFACT_WORKDIR: /var/lib/gpuflow/artifacts
-    volumes:
-      - //var/run/docker.sock:/var/run/docker.sock
-      - /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts
-    depends_on:
-      - control-plane
     restart: unless-stopped
 
   mysql:
