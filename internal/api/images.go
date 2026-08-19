@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -60,7 +61,9 @@ func NewImageBuilder(storage store.TaskImageStore) *ImageBuilder {
 			image.Status = "failed"
 			image.Error = "控制端在镜像构建期间重启，请重新构建"
 			image.UpdatedAt = time.Now().UTC()
-			_ = storage.SaveTaskImage(image)
+			if err := storage.SaveTaskImage(image); err != nil {
+				log.Printf("persist interrupted task image %s: %v", image.ID, err)
+			}
 		}
 		builder.images[image.ID] = &image
 	}
@@ -83,8 +86,11 @@ func (b *ImageBuilder) discoverLocalImages() {
 		}
 		now := time.Now().UTC()
 		image := &TaskImage{ID: randomID(), Name: name, Runtime: "imported", BaseImage: "本机已有镜像", Filename: "—", Status: "ready", CreatedAt: now, UpdatedAt: now}
+		if err := b.store.SaveTaskImage(*image); err != nil {
+			log.Printf("persist discovered task image %s: %v", image.ID, err)
+			continue
+		}
 		b.images[image.ID] = image
-		_ = b.store.SaveTaskImage(*image)
 	}
 }
 
@@ -264,7 +270,19 @@ func (b *ImageBuilder) finish(id string, output []byte, buildErr error) {
 	}
 	saved := *image
 	b.mu.Unlock()
-	_ = b.store.SaveTaskImage(saved)
+	if err := b.store.SaveTaskImage(saved); err != nil {
+		message := "persist task image result: " + err.Error()
+		b.mu.Lock()
+		image.Status = "failed"
+		image.Error = message
+		image.UpdatedAt = time.Now().UTC()
+		saved = *image
+		b.mu.Unlock()
+		log.Printf("task image %s: %s", id, message)
+		if retryErr := b.store.SaveTaskImage(saved); retryErr != nil {
+			log.Printf("persist failed task image %s: %v", id, retryErr)
+		}
+	}
 }
 
 func readableBuildError(output []byte, buildErr error) string {

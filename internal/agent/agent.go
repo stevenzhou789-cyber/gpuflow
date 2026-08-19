@@ -23,7 +23,7 @@ type Config struct {
 	Server, Token, ID, Name, Provider, Pool, GPUModel, Executor, ArtifactDir string
 	GPUCount, VRAMGB                                                         int
 	HourlyPrice                                                              float64
-	PollInterval                                                             time.Duration
+	PollInterval, HeartbeatInterval, ArtifactUploadTimeout                   time.Duration
 }
 type Agent struct {
 	cfg    Config
@@ -35,6 +35,12 @@ var errJobCanceled = errors.New("job canceled")
 func New(cfg Config) *Agent {
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 3 * time.Second
+	}
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = 10 * time.Second
+	}
+	if cfg.ArtifactUploadTimeout == 0 {
+		cfg.ArtifactUploadTimeout = 30 * time.Minute
 	}
 	return &Agent{cfg: cfg, client: client.New(cfg.Server, cfg.Token)}
 }
@@ -89,6 +95,16 @@ func (a *Agent) tick(ctx context.Context) error {
 		return err
 	}
 	defer os.RemoveAll(artifactDir)
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		a.heartbeatLoop(heartbeatCtx)
+	}()
+	defer func() {
+		stopHeartbeat()
+		<-heartbeatDone
+	}()
 	output, runErr := a.execute(ctx, &job, artifactDir)
 	if errors.Is(runErr, errJobCanceled) {
 		_, err = a.client.Do(http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+a.cfg.ID, model.JobUpdate{Status: model.JobCanceled, Output: output}, nil)
@@ -103,11 +119,15 @@ func (a *Agent) tick(ctx context.Context) error {
 		output = appendOutput(output, "artifact packaging warning: "+bundleErr.Error())
 	} else if bundle != "" {
 		defer os.Remove(bundle)
-		if _, uploadErr := a.client.UploadArtifact("/v1/jobs/"+job.ID+"/artifacts?node_id="+a.cfg.ID, bundle); uploadErr != nil {
+		if uploadErr := a.uploadArtifact(ctx, job.ID, bundle); uploadErr != nil {
 			output = appendOutput(output, "artifact upload warning: "+uploadErr.Error())
 		} else {
 			output = appendOutput(output, "artifact uploaded: artifacts.tar.gz")
 		}
+	}
+	if _, statusErr := a.client.Do(http.MethodGet, "/v1/jobs/"+job.ID, nil, &latest); statusErr == nil && latest.Status == model.JobCanceling {
+		_, err = a.client.Do(http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+a.cfg.ID, model.JobUpdate{Status: model.JobCanceled, Output: output}, nil)
+		return err
 	}
 	update := model.JobUpdate{Status: model.JobSucceeded, Output: output}
 	if runErr != nil {
@@ -116,6 +136,46 @@ func (a *Agent) tick(ctx context.Context) error {
 	}
 	_, err = a.client.Do(http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+a.cfg.ID, update, nil)
 	return err
+}
+
+func (a *Agent) uploadArtifact(parent context.Context, jobID, bundle string) error {
+	ctx, cancel := context.WithTimeout(parent, a.cfg.ArtifactUploadTimeout)
+	defer cancel()
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				var latest model.Job
+				if _, err := a.client.DoContext(ctx, http.MethodGet, "/v1/jobs/"+jobID, nil, &latest); err == nil && (latest.Status == model.JobCanceling || latest.Status == model.JobCanceled) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	_, err := a.client.UploadArtifactContext(ctx, "/v1/jobs/"+jobID+"/artifacts?node_id="+a.cfg.ID, bundle)
+	cancel()
+	<-monitorDone
+	return err
+}
+
+func (a *Agent) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(a.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, _ = a.client.DoContext(ctx, http.MethodPost, "/v1/nodes/"+a.cfg.ID+"/heartbeat", nil, nil)
+		}
+	}
 }
 
 func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir string) (string, error) {
@@ -136,6 +196,9 @@ func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir stri
 	args = append(args, job.Image)
 	args = append(args, job.Command...)
 	containerName := "gpuflow-job-" + job.ID
+	// A previous agent process may have exited while Docker kept the job
+	// container alive. Remove it before rerunning the recovered attempt.
+	_ = exec.Command("docker", "rm", "-f", containerName).Run()
 	args = append([]string{"run", "--name", containerName}, args[1:]...)
 	cmd := exec.Command("docker", args...)
 	var output bytes.Buffer

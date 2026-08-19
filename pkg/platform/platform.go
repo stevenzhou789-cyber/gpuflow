@@ -1,7 +1,9 @@
 package platform
 
 import (
+	"errors"
 	"net/http"
+	"strings"
 
 	"gpuflow/internal/api"
 	"gpuflow/internal/artifact"
@@ -11,31 +13,23 @@ import (
 
 // NewHandler is the supported composition point for Community and commercial
 // distributions. Commercial code can add middleware without importing internal packages.
-func NewHandler(statePath, mysqlDSN, token string, descriptor edition.Descriptor, artifactConfig artifact.Config) (http.Handler, error) {
-	state, err := store.Open(statePath)
+func NewHandler(mysqlDSN, token string, descriptor edition.Descriptor, artifactConfig artifact.Config) (http.Handler, error) {
+	if strings.TrimSpace(mysqlDSN) == "" {
+		return nil, errors.New("GPUFLOW_MYSQL_DSN is required")
+	}
+	if strings.TrimSpace(artifactConfig.Endpoint) == "" {
+		return nil, errors.New("GPUFLOW_S3_ENDPOINT is required")
+	}
+	state, err := store.OpenMySQLStateStore(mysqlDSN)
 	if err != nil {
 		return nil, err
-	}
-	var taskImages store.TaskImageStore = state
-	if mysqlDSN != "" {
-		mysqlStore, err := store.OpenMySQLTaskImageStore(mysqlDSN)
-		if err != nil {
-			return nil, err
-		}
-		legacyImages, err := state.ListTaskImages()
-		if err != nil {
-			return nil, err
-		}
-		for _, image := range legacyImages {
-			if err := mysqlStore.SaveTaskImage(image); err != nil {
-				return nil, err
-			}
-		}
-		taskImages = mysqlStore
 	}
 	artifacts, err := artifact.Open(artifactConfig)
 	if err != nil {
 		return nil, err
 	}
-	return api.NewWithStores(state, taskImages, artifacts, token, descriptor).Handler(), nil
+	if !artifacts.Enabled() {
+		return nil, errors.New("MinIO/S3 artifact storage is required")
+	}
+	return api.NewWithStores(state, state, artifacts, token, descriptor).Handler(), nil
 }

@@ -15,6 +15,10 @@ type MySQLTaskImageStore struct {
 	db *sql.DB
 }
 
+const insertTaskImageSQL = `INSERT INTO task_images
+  (id, name, runtime, base_image, filename, command_text, status, build_log, error_message, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
 func OpenMySQLTaskImageStore(dsn string) (*MySQLTaskImageStore, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -60,15 +64,12 @@ func (s *MySQLTaskImageStore) migrate(ctx context.Context) error {
 }
 
 func (s *MySQLTaskImageStore) SaveTaskImage(image model.TaskImage) error {
-	const query = `INSERT INTO task_images
-  (id, name, runtime, base_image, filename, command_text, status, build_log, error_message, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE
+	const update = ` ON DUPLICATE KEY UPDATE
   id = VALUES(id), name = VALUES(name), runtime = VALUES(runtime), base_image = VALUES(base_image),
   filename = VALUES(filename), command_text = VALUES(command_text), status = VALUES(status),
 	build_log = VALUES(build_log), error_message = VALUES(error_message),
 	created_at = LEAST(created_at, VALUES(created_at)), updated_at = GREATEST(updated_at, VALUES(updated_at))`
-	_, err := s.db.Exec(query, image.ID, image.Name, image.Runtime, image.BaseImage, image.Filename,
+	_, err := s.db.Exec(insertTaskImageSQL+update, image.ID, image.Name, image.Runtime, image.BaseImage, image.Filename,
 		image.Command, image.Status, image.Log, image.Error, image.CreatedAt, image.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("save task image: %w", err)

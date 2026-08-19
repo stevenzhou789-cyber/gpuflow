@@ -187,7 +187,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	_ = s.store.Schedule(30 * time.Second)
+	s.scheduleBestEffort()
 	writeJSON(w, 201, j)
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +213,7 @@ func (s *Server) rerunJob(w http.ResponseWriter, r *http.Request) {
 		handleStoreError(w, err)
 		return
 	}
-	_ = s.store.Schedule(30 * time.Second)
+	s.scheduleBestEffort()
 	writeJSON(w, http.StatusCreated, j)
 }
 func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +225,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, j)
 }
 func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.GetJob(r.PathValue("id")); err != nil {
+	if err := s.store.BeginJobDeletion(r.PathValue("id")); err != nil {
 		handleStoreError(w, err)
 		return
 	}
@@ -252,7 +252,7 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	_ = s.store.Schedule(30 * time.Second)
+	s.scheduleBestEffort()
 	writeJSON(w, 200, saved)
 }
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
@@ -260,7 +260,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		handleStoreError(w, err)
 		return
 	}
-	_ = s.store.Schedule(30 * time.Second)
+	s.scheduleBestEffort()
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 func (s *Server) listNodes(w http.ResponseWriter, _ *http.Request) {
@@ -274,7 +274,10 @@ func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) nextJob(w http.ResponseWriter, r *http.Request) {
-	_ = s.store.Schedule(30 * time.Second)
+	if err := s.store.Schedule(30 * time.Second); err != nil {
+		writeError(w, http.StatusInternalServerError, "schedule jobs: "+err.Error())
+		return
+	}
 	j, err := s.store.NextJob(r.PathValue("id"))
 	if err != nil {
 		handleStoreError(w, err)
@@ -302,10 +305,20 @@ func (s *Server) updateJob(w http.ResponseWriter, r *http.Request) {
 		handleStoreError(w, err)
 		return
 	}
-	_ = s.store.Schedule(30 * time.Second)
+	s.scheduleBestEffort()
 	writeJSON(w, 200, j)
 }
+
+func (s *Server) scheduleBestEffort() {
+	if err := s.store.Schedule(30 * time.Second); err != nil {
+		log.Printf("schedule jobs: %v", err)
+	}
+}
 func handleStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrPersistence) {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, 404, "not found")
 		return

@@ -2,7 +2,6 @@ package store
 
 import (
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,7 +9,7 @@ import (
 )
 
 func TestScheduleChoosesCheapestEligibleNode(t *testing.T) {
-	s, _ := Open("")
+	s := NewMemory()
 	_, _ = s.RegisterNode(model.Node{ID: "expensive", Name: "expensive", GPUModel: "RTX 4090", GPUCount: 1, VRAMGB: 24, HourlyPrice: 4})
 	_, _ = s.RegisterNode(model.Node{ID: "cheap", Name: "cheap", GPUModel: "RTX 4090", GPUCount: 1, VRAMGB: 24, HourlyPrice: 2})
 	j, err := s.CreateJob(model.JobCreate{Name: "test", Image: "alpine", Requirements: model.Requirements{GPUCount: 1, MinVRAMGB: 20}})
@@ -26,31 +25,8 @@ func TestScheduleChoosesCheapestEligibleNode(t *testing.T) {
 	}
 }
 
-func TestTaskImagesPersist(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	image := model.TaskImage{ID: "img-test", Name: "gpuflow-task/test:v1", Status: "ready", CreatedAt: time.Now()}
-	if err := s.SaveTaskImage(image); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	images, err := reopened.ListTaskImages()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(images) != 1 || images[0].Name != image.Name {
-		t.Fatalf("unexpected persisted images: %+v", images)
-	}
-}
-
 func TestFailedJobRetries(t *testing.T) {
-	s, _ := Open("")
+	s := NewMemory()
 	_, _ = s.RegisterNode(model.Node{ID: "node", GPUCount: 1, VRAMGB: 24})
 	j, _ := s.CreateJob(model.JobCreate{Name: "retry", Image: "alpine", MaxRetries: 1, Requirements: model.Requirements{GPUCount: 1}})
 	_ = s.Schedule(time.Minute)
@@ -67,8 +43,45 @@ func TestFailedJobRetries(t *testing.T) {
 	}
 }
 
+func TestRegisterNodeRecoversRunningJob(t *testing.T) {
+	s := NewMemory()
+	node, _ := s.RegisterNode(model.Node{ID: "recover-node", GPUCount: 1, VRAMGB: 24})
+	job, _ := s.CreateJob(model.JobCreate{Name: "recover", Image: "alpine", MaxRetries: 1, Requirements: model.Requirements{GPUCount: 1}})
+	_ = s.Schedule(time.Minute)
+	_, _ = s.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobRunning, Output: "partial"})
+
+	restarted, err := s.RegisterNode(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := s.NextJob(restarted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.ID != job.ID || recovered.Status != model.JobAssigned {
+		t.Fatalf("expected interrupted job to be reassigned, got %+v", recovered)
+	}
+	if recovered.StartedAt != nil || recovered.Output != "" || recovered.Attempts != 2 || recovered.Recoveries != 1 {
+		t.Fatalf("unexpected recovered attempt: %+v", recovered)
+	}
+	if _, err := s.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobRunning}); err != nil {
+		t.Fatalf("restart recovered job: %v", err)
+	}
+	exhaustedNode, err := s.RegisterNode(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exhausted, err := s.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exhausted.Status != model.JobFailed || exhausted.Recoveries != 1 || exhaustedNode.Busy || exhaustedNode.CurrentJob != "" {
+		t.Fatalf("expected exhausted recovery budget to fail and release the node: job=%+v node=%+v", exhausted, exhaustedNode)
+	}
+}
+
 func TestDeleteNodeRejectsActiveJob(t *testing.T) {
-	s, _ := Open("")
+	s := NewMemory()
 	_, _ = s.RegisterNode(model.Node{ID: "node", GPUCount: 1, VRAMGB: 24})
 	job, _ := s.CreateJob(model.JobCreate{Name: "active", Image: "alpine", Requirements: model.Requirements{GPUCount: 1}})
 	_ = s.Schedule(time.Minute)
@@ -86,7 +99,7 @@ func TestDeleteNodeRejectsActiveJob(t *testing.T) {
 }
 
 func TestCancelRerunDeleteAndQueryJobs(t *testing.T) {
-	s, _ := Open("")
+	s := NewMemory()
 	node, _ := s.RegisterNode(model.Node{ID: "cancel-node", Pool: "default", GPUCount: 1, VRAMGB: 8})
 	job, _ := s.CreateJob(model.JobCreate{Name: "searchable training", Image: "alpine", Requirements: model.Requirements{GPUCount: 1, Pools: []string{"default"}}})
 	_ = s.Schedule(time.Minute)

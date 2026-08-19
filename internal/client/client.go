@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,10 @@ type Client struct {
 }
 
 func (c *Client) UploadArtifact(path, filePath string) (int, error) {
+	return c.UploadArtifactContext(context.Background(), path, filePath)
+}
+
+func (c *Client) UploadArtifactContext(ctx context.Context, path, filePath string) (int, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return 0, err
@@ -36,7 +41,7 @@ func (c *Client) UploadArtifact(path, filePath string) (int, error) {
 		}
 		_ = pipeWriter.CloseWithError(createErr)
 	}()
-	req, err := http.NewRequest(http.MethodPost, c.BaseURL+path, pipeReader)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, pipeReader)
 	if err != nil {
 		return 0, err
 	}
@@ -63,6 +68,10 @@ func New(baseURL, token string) *Client {
 }
 
 func (c *Client) Do(method, path string, body, out any) (int, error) {
+	return c.DoContext(context.Background(), method, path, body, out)
+}
+
+func (c *Client) DoContext(ctx context.Context, method, path string, body, out any) (int, error) {
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -71,7 +80,7 @@ func (c *Client) Do(method, path string, body, out any) (int, error) {
 		}
 		reader = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.BaseURL+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, reader)
 	if err != nil {
 		return 0, err
 	}

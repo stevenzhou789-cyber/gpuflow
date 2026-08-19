@@ -12,6 +12,7 @@ const (
 	JobCanceled  JobStatus = "canceled"
 	JobSucceeded JobStatus = "succeeded"
 	JobFailed    JobStatus = "failed"
+	JobDeleting  JobStatus = "deleting"
 )
 
 type Requirements struct {
@@ -35,6 +36,7 @@ type Job struct {
 	TimeoutSeconds int               `json:"timeout_seconds"`
 	MaxRetries     int               `json:"max_retries"`
 	Attempts       int               `json:"attempts"`
+	Recoveries     int               `json:"recoveries"`
 	Status         JobStatus         `json:"status"`
 	AssignedNode   string            `json:"assigned_node,omitempty"`
 	Output         string            `json:"output,omitempty"`

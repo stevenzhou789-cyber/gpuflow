@@ -84,8 +84,7 @@ func main() {
 func runServer(args []string) error {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	addr := fs.String("addr", env("GPUFLOW_ADDR", ":8080"), "listen address")
-	data := fs.String("data", env("GPUFLOW_DATA", "./data/state.json"), "state file")
-	mysqlDSN := fs.String("mysql-dsn", env("GPUFLOW_MYSQL_DSN", ""), "optional MySQL DSN for task image records")
+	mysqlDSN := fs.String("mysql-dsn", env("GPUFLOW_MYSQL_DSN", ""), "MySQL DSN (required)")
 	token := fs.String("token", env("GPUFLOW_TOKEN", ""), "bearer token")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -98,7 +97,7 @@ func runServer(args []string) error {
 		SecretKey: env("GPUFLOW_S3_SECRET_KEY", ""), Bucket: env("GPUFLOW_S3_BUCKET", "gpuflow-artifacts"),
 		Region: env("GPUFLOW_S3_REGION", ""), UseSSL: envBool("GPUFLOW_S3_USE_SSL", false),
 	}
-	handler, err := platform.NewHandler(*data, *mysqlDSN, *token, descriptor, artifactConfig)
+	handler, err := platform.NewHandler(*mysqlDSN, *token, descriptor, artifactConfig)
 	if err != nil {
 		return err
 	}

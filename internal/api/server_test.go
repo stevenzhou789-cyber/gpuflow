@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"gpuflow/internal/artifact"
 	"gpuflow/internal/model"
 	"gpuflow/internal/store"
 )
@@ -44,7 +45,7 @@ func request(t *testing.T, server *httptest.Server, method, path string, body an
 }
 
 func TestBuildTaskImageOverHTTP(t *testing.T) {
-	state, _ := store.Open("")
+	state := store.NewMemory()
 	handler := New(state, "test-token")
 	handler.images.run = func(_ context.Context, name string, args ...string) ([]byte, error) {
 		if name != "docker" || len(args) < 4 || args[0] != "build" {
@@ -99,10 +100,7 @@ func TestBuildTaskImageOverHTTP(t *testing.T) {
 }
 
 func TestJobLifecycleOverHTTP(t *testing.T) {
-	state, err := store.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
+	state := store.NewMemory()
 	server := httptest.NewServer(New(state, "test-token").Handler())
 	defer server.Close()
 
@@ -157,7 +155,7 @@ func TestJobLifecycleOverHTTP(t *testing.T) {
 }
 
 func TestDeleteBusyNodeReturnsConflict(t *testing.T) {
-	state, _ := store.Open("")
+	state := store.NewMemory()
 	server := httptest.NewServer(New(state, "test-token").Handler())
 	defer server.Close()
 	node := model.Node{ID: "busy-node", GPUCount: 1, VRAMGB: 24}
@@ -166,6 +164,63 @@ func TestDeleteBusyNodeReturnsConflict(t *testing.T) {
 	request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "active", Image: "alpine", Requirements: model.Requirements{GPUCount: 1}}, &job)
 	if status := request(t, server, http.MethodDelete, "/v1/nodes/busy-node", nil, nil); status != http.StatusConflict {
 		t.Fatalf("expected conflict, got %d", status)
+	}
+}
+
+type recordingArtifactStore struct {
+	artifact.Store
+	deleted   bool
+	deleteErr error
+}
+
+func (s *recordingArtifactStore) Delete(context.Context, string) error {
+	s.deleted = true
+	return s.deleteErr
+}
+
+func TestDeleteActiveJobKeepsArtifacts(t *testing.T) {
+	state := store.NewMemory()
+	artifacts := &recordingArtifactStore{Store: artifact.Disabled()}
+	handler := New(state, "test-token")
+	handler.artifacts = artifacts
+	server := httptest.NewServer(handler.Handler())
+	defer server.Close()
+
+	var job model.Job
+	request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "active", Image: "alpine"}, &job)
+	if status := request(t, server, http.MethodDelete, "/v1/jobs/"+job.ID, nil, nil); status != http.StatusConflict {
+		t.Fatalf("expected conflict, got %d", status)
+	}
+	if artifacts.deleted {
+		t.Fatal("artifacts were deleted before the active job was rejected")
+	}
+}
+
+func TestDeleteJobCanRetryAfterArtifactFailure(t *testing.T) {
+	state := store.NewMemory()
+	artifacts := &recordingArtifactStore{Store: artifact.Disabled(), deleteErr: errors.New("object store unavailable")}
+	handler := New(state, "test-token")
+	handler.artifacts = artifacts
+	server := httptest.NewServer(handler.Handler())
+	defer server.Close()
+
+	job, _ := state.CreateJob(model.JobCreate{Name: "delete-retry", Image: "alpine"})
+	if _, err := state.CancelJob(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status := request(t, server, http.MethodDelete, "/v1/jobs/"+job.ID, nil, nil); status != http.StatusBadGateway {
+		t.Fatalf("expected artifact failure, got %d", status)
+	}
+	deleting, err := state.GetJob(job.ID)
+	if err != nil || deleting.Status != model.JobDeleting {
+		t.Fatalf("job did not retain resumable deletion state: %+v err=%v", deleting, err)
+	}
+	artifacts.deleteErr = nil
+	if status := request(t, server, http.MethodDelete, "/v1/jobs/"+job.ID, nil, nil); status != http.StatusNoContent {
+		t.Fatalf("retry delete returned %d", status)
+	}
+	if _, err := state.GetJob(job.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("job still exists after retry: %v", err)
 	}
 }
 
@@ -178,5 +233,26 @@ func TestReadableBuildError(t *testing.T) {
 	message = readableBuildError([]byte("manifest unknown"), err)
 	if !strings.Contains(message, "标签无效") {
 		t.Fatalf("unexpected manifest error: %s", message)
+	}
+}
+
+type failingTaskImageStore struct{}
+
+func (failingTaskImageStore) SaveTaskImage(model.TaskImage) error {
+	return errors.New("storage unavailable")
+}
+
+func (failingTaskImageStore) ListTaskImages() ([]model.TaskImage, error) {
+	return nil, nil
+}
+
+func TestImageBuildPersistenceFailureIsVisible(t *testing.T) {
+	now := time.Now().UTC()
+	image := &TaskImage{ID: "img-persist", Name: "gpuflow-task/test:v1", Status: "building", CreatedAt: now, UpdatedAt: now}
+	builder := &ImageBuilder{images: map[string]*TaskImage{image.ID: image}, store: failingTaskImageStore{}}
+	builder.finish(image.ID, []byte("build completed"), nil)
+	got := builder.List()[0]
+	if got.Status != "failed" || !strings.Contains(got.Error, "storage unavailable") {
+		t.Fatalf("persistence failure was hidden: %+v", got)
 	}
 }

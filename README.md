@@ -4,7 +4,7 @@
 
 GPUFlow 把分散在本地工作站、实验室服务器和自建机房中的 GPU 节点接入同一个控制面，统一完成任务提交、资源匹配、执行监控、失败重试与日志查看。算力仍由使用者自己提供，GPUFlow 不转售算力，也不介入云厂商计费。
 
-> 当前状态：社区预览版。现阶段重点支持可信网络中的本地 Docker 节点；任务和节点使用 JSON 文件保存，任务镜像记录可选用 MySQL，任务产物可选用 S3 兼容对象存储，适合个人、实验室和小型团队验证批任务调度流程。
+> 当前状态：社区预览版。现阶段重点支持可信网络中的本地 Docker 节点；MySQL 保存任务、节点和任务镜像记录，MinIO/S3 保存任务产物，适合个人、实验室和小型团队验证批任务调度流程。
 
 ## 为什么使用 GPUFlow
 
@@ -34,7 +34,7 @@ flowchart LR
 - 任务停止、重跑、删除、搜索、过滤与分页
 - 任务产物自动归档与下载
 - Bearer Token API 鉴权
-- 任务和节点使用 JSON 文件持久化；任务镜像记录可选 MySQL
+- 任务、节点和任务镜像记录使用 MySQL 持久化
 - 响应式 Web 控制台
 - 从 Python 或 Shell 脚本构建任务镜像
 - Windows、Linux 和 Docker Agent 接入指引
@@ -54,13 +54,13 @@ flowchart LR
 docker compose --profile demo up --build -d
 ```
 
-打开 [http://localhost:8080](http://localhost:8080)，本地演示 Token 为：
+打开 [http://localhost:8080](http://localhost:8080)。未创建 `.env` 时，本地演示 Token 默认为：
 
 ```text
 development-token
 ```
 
-演示节点不声明 GPU，可用来体验节点管理、CPU 任务提交和调度流程。请勿把演示 Token 用于公网或生产环境。
+如果项目根目录已经存在 `.env`，请使用其中的 `GPUFLOW_TOKEN`。演示节点不声明 GPU，可用来体验节点管理、CPU 任务提交和调度流程。请勿把演示 Token 用于公网或生产环境。
 
 停止服务：
 
@@ -74,42 +74,50 @@ docker compose --profile demo down
 
 ```bash
 cp .env.example .env
-docker compose -f compose.yaml -f compose.full.yaml up --build -d
+docker compose up --build -d
 ```
 
 Windows PowerShell 可使用：
 
 ```powershell
 Copy-Item .env.example .env
-docker compose -f compose.yaml -f compose.full.yaml up --build -d
+docker compose up --build -d
 ```
 
-首次部署前，请修改 `.env` 中的 Token、MySQL 密码和 MinIO 密码。控制端会幂等创建 `task_images` 表与 `gpuflow-artifacts` 存储桶，不会清空已有数据。MinIO 控制台位于 [http://127.0.0.1:9001](http://127.0.0.1:9001)。
+首次部署前，请修改 `.env` 中的 Token、MySQL 密码和 MinIO 密码。控制端会幂等创建 `jobs`、`nodes`、`task_images` 表与 `gpuflow-artifacts` 存储桶，不会清空已有数据。MinIO 控制台默认位于 [http://127.0.0.1:9001](http://127.0.0.1:9001)。
 
 查看状态和日志：
 
 ```bash
-docker compose -f compose.yaml -f compose.full.yaml ps
-docker compose -f compose.yaml -f compose.full.yaml logs -f control-plane mysql minio
+docker compose ps
+docker compose logs -f control-plane mysql minio
 ```
 
 停止服务但保留数据：
 
 ```bash
-docker compose -f compose.yaml -f compose.full.yaml down
+docker compose down
 ```
 
 不要随意添加 `-v`，否则会删除 MySQL 和 MinIO 数据卷。
 
-任务脚本只需把需要保留的文件写入 `$GPUFLOW_ARTIFACT_DIR`。Agent 会在任务结束后生成 `artifacts.tar.gz` 并上传；在任务队列点击任务即可通过“下载产物”按钮获取。
+任务脚本只需把需要保留的文件写入 `$GPUFLOW_ARTIFACT_DIR`。目录中存在文件时，Agent 会在任务结束后生成 `artifacts.tar.gz` 并上传；在任务队列点击任务即可通过“下载产物”按钮获取。产物打包或上传失败会写入任务输出作为 warning，不改变任务程序本身的成功或失败状态。
 
-已有 MySQL 时无需使用 `compose.mysql.yaml`，只需为控制端设置：
+使用已有 MySQL 和 MinIO/S3 时，为控制端设置：
 
 ```env
 GPUFLOW_MYSQL_DSN=gpuflow:密码@tcp(mysql-host:3306)/gpuflow?parseTime=true&charset=utf8mb4
+GPUFLOW_S3_ENDPOINT=minio-host:9000
+GPUFLOW_S3_ACCESS_KEY=gpuflow
+GPUFLOW_S3_SECRET_KEY=替换为实际密码
+GPUFLOW_S3_BUCKET=gpuflow-artifacts
+GPUFLOW_S3_REGION=
+GPUFLOW_S3_USE_SSL=false
 ```
 
-已有 S3/MinIO 时也可直接配置 `GPUFLOW_S3_ENDPOINT`、`GPUFLOW_S3_ACCESS_KEY`、`GPUFLOW_S3_SECRET_KEY`、`GPUFLOW_S3_BUCKET` 和 `GPUFLOW_S3_USE_SSL`。
+使用外部服务时，应先创建 MySQL 数据库和账号，并授予建表及读写权限；S3 凭证需要具备目标存储桶的读、写、列举和删除权限，存储桶不存在时还需要创建权限。
+
+MySQL 和 MinIO/S3 都是必需依赖。MySQL DSN、S3 endpoint 或 S3 access/secret key 缺失，或者服务连接失败时，控制面会拒绝启动。
 
 ## 接入真实 GPU 节点
 
@@ -165,6 +173,8 @@ docker run -d \
 
 `gpuflow:latest` 表示目标主机本地已有的 GPUFlow 镜像。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
 
+Agent 应使用稳定且唯一的 `-id`。任务执行期间 Agent 会持续发送心跳。同一 ID 的 Agent 重启后，会在剩余重试预算内清理遗留容器并从头重新执行中断的任务，同时记录恢复次数；预算耗尽时任务会直接失败。因此任务脚本应尽量保持幂等。
+
 ## 提交任务
 
 最简单的方式是在 Web 控制台的 **任务** 页面创建任务。仓库也提供了一个 CPU 示例：[examples/job.json](examples/job.json)。
@@ -182,13 +192,15 @@ go build -o bin/gpuflow ./cmd/gpuflow
 常用命令：
 
 ```text
-gpuflow server [-addr :8080] [-data ./data/state.json] [-mysql-dsn DSN]
+gpuflow server [-addr :8080] -mysql-dsn DSN
 gpuflow agent  [-server URL] [-pool default] [-executor docker|mock]
 gpuflow submit -file examples/job.json
 gpuflow jobs
 gpuflow nodes
 gpuflow get JOB_ID
 ```
+
+`-mysql-dsn` 也可以通过必填环境变量 `GPUFLOW_MYSQL_DSN` 提供。启动控制面时还必须配置 `GPUFLOW_S3_ENDPOINT`、`GPUFLOW_S3_ACCESS_KEY` 和 `GPUFLOW_S3_SECRET_KEY`；完整示例见“一体化部署”和“从源码开发”。
 
 CLI 命令也支持通过环境变量设置控制面地址和 Token：
 
@@ -197,7 +209,7 @@ GPUFLOW_SERVER=http://localhost:8080
 GPUFLOW_TOKEN=replace-with-a-long-random-token
 ```
 
-任务队列支持按名称、ID、镜像或节点搜索，并可按状态、节点和资源池过滤。点击“重跑”会复制原任务配置并生成新的任务 ID；停止运行任务时，Agent 会执行 `docker stop` 并将状态更新为“已取消”。为避免丢失执行现场，只有已完成、失败或取消的任务可以删除，删除时会同时清理对象存储中的任务产物。
+任务队列支持按名称、ID、镜像或节点搜索，并可按状态、节点和资源池过滤。点击“重跑”会复制原任务配置并生成新的任务 ID；停止运行任务时，Agent 会执行 `docker stop` 并将状态更新为“已取消”。为避免丢失执行现场，只有已完成、失败或取消的任务可以删除。删除会先持久化为“删除中”，再清理对象存储产物并删除任务记录；任一步失败都可对同一任务重试删除，不会出现产物已丢失但任务恢复为普通终态的情况。
 
 ## 从脚本构建任务镜像
 
@@ -229,26 +241,26 @@ GPU 检测示例 [examples/gpu-smoke.py](examples/gpu-smoke.py) 应选择 **PyTo
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `GPUFLOW_ADDR` | `:8080` | HTTP 监听地址 |
-| `GPUFLOW_DATA` | `./data/state.json` | 状态文件路径 |
 | `GPUFLOW_TOKEN` | 空 | API Bearer Token；对外部署时必须设置 |
 | `GPUFLOW_PUBLIC_URL` | 当前页面来源 | Agent 命令使用的控制面公开地址 |
 | `GPUFLOW_AGENT_IMAGE` | `gpuflow:latest` | 接入页面生成 Docker Agent 命令时使用的镜像名 |
-| `GPUFLOW_MYSQL_DSN` | 空 | 可选，仅用于持久化任务镜像记录 |
-| `GPUFLOW_S3_ENDPOINT` | 空 | S3 兼容对象存储地址；为空时禁用产物上传 |
-| `GPUFLOW_S3_ACCESS_KEY` | 空 | 对象存储 Access Key |
-| `GPUFLOW_S3_SECRET_KEY` | 空 | 对象存储 Secret Key |
+| `GPUFLOW_MYSQL_DSN` | 无 | 必填；任务、节点和任务镜像记录使用的 MySQL DSN |
+| `GPUFLOW_S3_ENDPOINT` | 无 | 必填；MinIO/S3 兼容对象存储地址 |
+| `GPUFLOW_S3_ACCESS_KEY` | 无 | 必填；对象存储 Access Key |
+| `GPUFLOW_S3_SECRET_KEY` | 无 | 必填；对象存储 Secret Key |
 | `GPUFLOW_S3_BUCKET` | `gpuflow-artifacts` | 任务产物存储桶 |
+| `GPUFLOW_S3_REGION` | 空 | 可选；对象存储区域，MinIO 通常可留空 |
 | `GPUFLOW_S3_USE_SSL` | `false` | 是否使用 HTTPS 连接对象存储 |
 
 可复制 [.env.example](.env.example) 后按部署环境修改。
 
-如需同时启用 MySQL 与任务产物存储，可使用一体化配置：
+默认 Compose 已包含 MySQL 与 MinIO：
 
 ```bash
-docker compose -f compose.yaml -f compose.full.yaml up --build -d
+docker compose up --build -d
 ```
 
-未配置 MySQL 时，任务、节点和任务镜像记录都会写入 JSON 状态文件；配置 MySQL 后，任务镜像记录会写入 `task_images` 表。
+任务、节点和任务镜像记录分别写入 `jobs`、`nodes`、`task_images` 表，MySQL 是唯一核心状态真源。任务产物文件由 MinIO/S3 保存，不写入 MySQL。
 
 ### Agent
 
@@ -302,7 +314,11 @@ go build -o bin/gpuflow ./cmd/gpuflow
 启动控制面：
 
 ```bash
-./bin/gpuflow server -addr :8080 -data ./data/state.json
+GPUFLOW_MYSQL_DSN='gpuflow:密码@tcp(127.0.0.1:3306)/gpuflow?parseTime=true&charset=utf8mb4' \
+GPUFLOW_S3_ENDPOINT='127.0.0.1:9000' \
+GPUFLOW_S3_ACCESS_KEY='gpuflow' \
+GPUFLOW_S3_SECRET_KEY='替换为实际密码' \
+./bin/gpuflow server -addr :8080
 ```
 
 ## 安全与部署边界
@@ -317,7 +333,7 @@ GPUFlow Agent 通过 Docker Socket 启动任务容器，这等同于拥有宿主
 - 不要在公共日志、截图或仓库中提交真实 Token。
 - 对任务镜像设置来源限制，并为节点配置最小网络权限。
 
-当前 JSON 状态存储、单控制面和共享 Token 设计不适合作为不受信任用户共同使用的公网多租户平台。
+当前单控制面和共享 Token 设计不适合作为不受信任用户共同使用的公网多租户平台。
 
 ## 开源版与企业版边界
 

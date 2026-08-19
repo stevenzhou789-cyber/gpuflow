@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-type JobStatus = "queued" | "assigned" | "running" | "canceling" | "canceled" | "succeeded" | "failed";
+type JobStatus = "queued" | "assigned" | "running" | "canceling" | "canceled" | "succeeded" | "failed" | "deleting";
 
 type Job = {
   id: string;
@@ -9,6 +9,7 @@ type Job = {
   strategy: string;
   status: JobStatus;
   attempts: number;
+  recoveries: number;
   max_retries: number;
   assigned_node?: string;
   error?: string;
@@ -83,6 +84,7 @@ const statusLabel: Record<JobStatus, string> = {
   canceled: "已取消",
   succeeded: "已完成",
   failed: "失败",
+  deleting: "删除中",
 };
 
 const nav: { id: Page; label: string; mark: string }[] = [
@@ -721,6 +723,7 @@ function JobDetails({ job, onClose }: { job: Job; onClose: () => void }) {
             <DetailItem label="GPU" value={`${job.requirements.gpu_count} 张`} />
             <DetailItem label="最低显存" value={`${job.requirements.min_vram_gb} GB`} />
             <DetailItem label="尝试次数" value={`${job.attempts}/${job.max_retries + 1}`} />
+            <DetailItem label="恢复次数" value={String(job.recoveries || 0)} />
             <DetailItem label="运行时长" value={duration === null ? "尚未开始" : `${duration.toFixed(2)} 秒`} />
             <DetailItem label="创建时间" value={new Date(job.created_at).toLocaleString()} />
             <DetailItem label="完成时间" value={finished ? finished.toLocaleString() : "—"} />

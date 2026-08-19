@@ -2,12 +2,10 @@ package store
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -17,20 +15,21 @@ import (
 )
 
 var (
-	ErrNotFound  = errors.New("not found")
-	ErrNodeBusy  = errors.New("node has an assigned or running job")
-	ErrJobActive = errors.New("active job must be canceled before deletion")
+	ErrNotFound    = errors.New("not found")
+	ErrNodeBusy    = errors.New("node has an assigned or running job")
+	ErrJobActive   = errors.New("active job must be canceled before deletion")
+	ErrPersistence = errors.New("persist state")
 )
 
 type snapshot struct {
-	Jobs       map[string]*model.Job       `json:"jobs"`
-	Nodes      map[string]*model.Node      `json:"nodes"`
-	TaskImages map[string]*model.TaskImage `json:"task_images,omitempty"`
+	Jobs       map[string]*model.Job
+	Nodes      map[string]*model.Node
+	TaskImages map[string]*model.TaskImage
 }
 
 type Store struct {
 	mu    sync.Mutex
-	path  string
+	db    *sql.DB
 	state snapshot
 }
 
@@ -39,42 +38,31 @@ type TaskImageStore interface {
 	ListTaskImages() ([]model.TaskImage, error)
 }
 
-func Open(path string) (*Store, error) {
-	s := &Store{path: path, state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}}
-	if path == "" {
-		return s, nil
-	}
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(b, &s.state); err != nil {
-		return nil, fmt.Errorf("decode state: %w", err)
-	}
-	if s.state.Jobs == nil {
-		s.state.Jobs = map[string]*model.Job{}
-	}
-	if s.state.Nodes == nil {
-		s.state.Nodes = map[string]*model.Node{}
-	}
-	if s.state.TaskImages == nil {
-		s.state.TaskImages = map[string]*model.TaskImage{}
-	}
-	return s, nil
+// NewMemory creates a non-persistent store for isolated unit tests. Production
+// composition always uses OpenMySQLStateStore.
+func NewMemory() *Store {
+	return &Store{state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}}
 }
 
 func (s *Store) SaveTaskImage(image model.TaskImage) error {
+	if s.db != nil {
+		if err := (&MySQLTaskImageStore{db: s.db}).SaveTaskImage(image); err != nil {
+			return fmt.Errorf("%w: %v", ErrPersistence, err)
+		}
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	before := cloneSnapshot(s.state)
 	copy := image
 	s.state.TaskImages[image.ID] = &copy
-	return s.saveLocked()
+	return s.commitLocked(before)
 }
 
 func (s *Store) ListTaskImages() ([]model.TaskImage, error) {
+	if s.db != nil {
+		return (&MySQLTaskImageStore{db: s.db}).ListTaskImages()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := make([]model.TaskImage, 0, len(s.state.TaskImages))
@@ -84,23 +72,54 @@ func (s *Store) ListTaskImages() ([]model.TaskImage, error) {
 	return result, nil
 }
 
-func (s *Store) saveLocked() error {
-	if s.path == "" {
+func (s *Store) commitLocked(before snapshot) error {
+	if s.db == nil {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(s.state, "", "  ")
+	err := s.saveMySQLChangesLocked(before)
 	if err != nil {
-		return err
+		s.state = before
+		if errors.Is(err, ErrPersistence) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", ErrPersistence, err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
+	return nil
+}
+
+func cloneSnapshot(source snapshot) snapshot {
+	result := snapshot{Jobs: make(map[string]*model.Job, len(source.Jobs)), Nodes: make(map[string]*model.Node, len(source.Nodes)), TaskImages: make(map[string]*model.TaskImage, len(source.TaskImages))}
+	for id, job := range source.Jobs {
+		copy := *job
+		copy.Command = append([]string(nil), job.Command...)
+		copy.Environment = cloneStringMap(job.Environment)
+		copy.Requirements.GPUModels = append([]string(nil), job.Requirements.GPUModels...)
+		copy.Requirements.Providers = append([]string(nil), job.Requirements.Providers...)
+		copy.Requirements.Pools = append([]string(nil), job.Requirements.Pools...)
+		copy.Requirements.Labels = cloneStringMap(job.Requirements.Labels)
+		result.Jobs[id] = &copy
 	}
-	_ = os.Remove(s.path)
-	return os.Rename(tmp, s.path)
+	for id, node := range source.Nodes {
+		copy := *node
+		copy.Labels = cloneStringMap(node.Labels)
+		result.Nodes[id] = &copy
+	}
+	for id, image := range source.TaskImages {
+		copy := *image
+		result.TaskImages[id] = &copy
+	}
+	return result
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func newID(prefix string) string {
@@ -116,6 +135,7 @@ func (s *Store) CreateJob(in model.JobCreate) (*model.Job, error) {
 }
 
 func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job, error) {
+	before := cloneSnapshot(s.state)
 	now := time.Now().UTC()
 	strategy := in.Strategy
 	if strategy == "" {
@@ -129,7 +149,7 @@ func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job,
 		TimeoutSeconds: in.TimeoutSeconds, MaxRetries: in.MaxRetries, Status: model.JobQueued,
 		CreatedAt: now, UpdatedAt: now, RerunOf: rerunOf}
 	s.state.Jobs[j.ID] = j
-	if err := s.saveLocked(); err != nil {
+	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}
 	copy := *j
@@ -148,7 +168,7 @@ func (s *Store) RerunJob(id string) (*model.Job, error) {
 }
 
 func terminal(status model.JobStatus) bool {
-	return status == model.JobSucceeded || status == model.JobFailed || status == model.JobCanceled
+	return status == model.JobSucceeded || status == model.JobFailed || status == model.JobCanceled || status == model.JobDeleting
 }
 
 func (s *Store) CancelJob(id string) (*model.Job, error) {
@@ -159,6 +179,7 @@ func (s *Store) CancelJob(id string) (*model.Job, error) {
 		return nil, ErrNotFound
 	}
 	now := time.Now().UTC()
+	before := cloneSnapshot(s.state)
 	switch j.Status {
 	case model.JobQueued:
 		j.Status, j.FinishedAt = model.JobCanceled, &now
@@ -170,7 +191,7 @@ func (s *Store) CancelJob(id string) (*model.Job, error) {
 		return nil, errors.New("completed job cannot be canceled")
 	}
 	j.UpdatedAt = now
-	if err := s.saveLocked(); err != nil {
+	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}
 	copy := *j
@@ -180,6 +201,43 @@ func (s *Store) CancelJob(id string) (*model.Job, error) {
 func (s *Store) DeleteJob(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.validateJobDeletionLocked(id); err != nil {
+		return err
+	}
+	before := cloneSnapshot(s.state)
+	delete(s.state.Jobs, id)
+	return s.commitLocked(before)
+}
+
+// BeginJobDeletion durably marks a terminal job before its artifacts are
+// removed. A failed artifact or final state deletion can then be retried
+// without returning the job to a runnable state.
+func (s *Store) BeginJobDeletion(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.state.Jobs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if j.Status == model.JobDeleting {
+		return nil
+	}
+	if !terminal(j.Status) {
+		return ErrJobActive
+	}
+	before := cloneSnapshot(s.state)
+	j.Status = model.JobDeleting
+	j.UpdatedAt = time.Now().UTC()
+	return s.commitLocked(before)
+}
+
+func (s *Store) ValidateJobDeletion(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.validateJobDeletionLocked(id)
+}
+
+func (s *Store) validateJobDeletionLocked(id string) error {
 	j, ok := s.state.Jobs[id]
 	if !ok {
 		return ErrNotFound
@@ -187,8 +245,7 @@ func (s *Store) DeleteJob(id string) error {
 	if !terminal(j.Status) {
 		return ErrJobActive
 	}
-	delete(s.state.Jobs, id)
-	return s.saveLocked()
+	return nil
 }
 
 type JobQuery struct {
@@ -309,6 +366,8 @@ func (s *Store) ListJobs() []*model.Job {
 func (s *Store) RegisterNode(in model.Node) (*model.Node, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	before := cloneSnapshot(s.state)
+	now := time.Now().UTC()
 	if in.ID == "" {
 		in.ID = newID("node")
 	}
@@ -323,12 +382,34 @@ func (s *Store) RegisterNode(in model.Node) (*model.Node, error) {
 	}
 	if old, ok := s.state.Nodes[in.ID]; ok {
 		in.Busy, in.CurrentJob = old.Busy, old.CurrentJob
+		if in.CurrentJob != "" {
+			job := s.state.Jobs[in.CurrentJob]
+			switch {
+			case job == nil || terminal(job.Status):
+				in.Busy, in.CurrentJob = false, ""
+			case job.Status == model.JobRunning:
+				if job.Attempts > job.MaxRetries {
+					job.Status, job.FinishedAt = model.JobFailed, &now
+					job.Error = "agent restarted after interruption; retry budget exhausted"
+					job.UpdatedAt = now
+					in.Busy, in.CurrentJob = false, ""
+				} else {
+					// Registration means the agent process restarted. Re-run the
+					// interrupted work as another attempt within its retry budget.
+					job.Status = model.JobAssigned
+					job.Attempts++
+					job.Recoveries++
+					job.StartedAt, job.FinishedAt = nil, nil
+					job.Output, job.Error, job.UpdatedAt = "", "", now
+				}
+			}
+		}
 	} else {
 		in.Busy, in.CurrentJob = false, ""
 	}
-	in.LastHeartbeat = time.Now().UTC()
+	in.LastHeartbeat = now
 	s.state.Nodes[in.ID] = &in
-	if err := s.saveLocked(); err != nil {
+	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}
 	copy := in
@@ -342,8 +423,9 @@ func (s *Store) HeartbeatNode(id string) error {
 	if !ok {
 		return ErrNotFound
 	}
+	before := cloneSnapshot(s.state)
 	n.LastHeartbeat = time.Now().UTC()
-	return s.saveLocked()
+	return s.commitLocked(before)
 }
 
 func (s *Store) ListNodes() []*model.Node {
@@ -373,8 +455,9 @@ func (s *Store) DeleteNode(id string) error {
 			return ErrNodeBusy
 		}
 	}
+	before := cloneSnapshot(s.state)
 	delete(s.state.Nodes, id)
-	return s.saveLocked()
+	return s.commitLocked(before)
 }
 
 func containsFold(values []string, candidate string) bool {
@@ -441,6 +524,7 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.Before(jobs[j].CreatedAt) })
 	changed := false
+	before := cloneSnapshot(s.state)
 	for _, j := range jobs {
 		var best *model.Node
 		for _, n := range s.state.Nodes {
@@ -457,7 +541,9 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 		changed = true
 	}
 	if changed {
-		return s.saveLocked()
+		if err := s.commitLocked(before); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -474,8 +560,11 @@ func (s *Store) NextJob(nodeID string) (*model.Job, error) {
 	}
 	j, ok := s.state.Jobs[n.CurrentJob]
 	if !ok {
+		before := cloneSnapshot(s.state)
 		n.Busy, n.CurrentJob = false, ""
-		_ = s.saveLocked()
+		if err := s.commitLocked(before); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 	copy := *j
@@ -493,6 +582,7 @@ func (s *Store) UpdateJob(id, nodeID string, in model.JobUpdate) (*model.Job, er
 		return nil, errors.New("job is not assigned to this node")
 	}
 	now := time.Now().UTC()
+	before := cloneSnapshot(s.state)
 	switch in.Status {
 	case model.JobRunning:
 		if j.Status != model.JobAssigned {
@@ -530,7 +620,7 @@ func (s *Store) UpdateJob(id, nodeID string, in model.JobUpdate) (*model.Job, er
 		return nil, errors.New("unsupported status transition")
 	}
 	j.Output, j.Error, j.UpdatedAt = in.Output, in.Error, now
-	if err := s.saveLocked(); err != nil {
+	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}
 	copy := *j
