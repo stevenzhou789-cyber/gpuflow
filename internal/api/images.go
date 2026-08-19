@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +37,7 @@ var (
 		"cuda12":  "nvidia/cuda:12.0.1-base-ubuntu22.04",
 		"pytorch": "pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime",
 	}
+	errTaskImageBuilding = errors.New("task image is still building")
 )
 
 type TaskImage = model.TaskImage
@@ -43,6 +46,7 @@ type ImageBuilder struct {
 	mu     sync.RWMutex
 	images map[string]*TaskImage
 	run    func(context.Context, string, ...string) ([]byte, error)
+	remove func(context.Context, string) ([]byte, error)
 	store  store.TaskImageStore
 }
 
@@ -52,6 +56,9 @@ func NewImageBuilder(storage store.TaskImageStore) *ImageBuilder {
 		store:  storage,
 		run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
+		},
+		remove: func(ctx context.Context, image string) ([]byte, error) {
+			return exec.CommandContext(ctx, "docker", "image", "rm", image).CombinedOutput()
 		},
 	}
 	savedImages, _ := storage.ListTaskImages()
@@ -105,8 +112,122 @@ func (b *ImageBuilder) List() []TaskImage {
 	return result
 }
 
-func (s *Server) listTaskImages(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.images.List())
+type TaskImagePage struct {
+	Items      []TaskImage `json:"items"`
+	Total      int         `json:"total"`
+	Page       int         `json:"page"`
+	PageSize   int         `json:"page_size"`
+	TotalPages int         `json:"total_pages"`
+}
+
+func (b *ImageBuilder) Query(search string, page, pageSize int) TaskImagePage {
+	images := b.List()
+	search = strings.ToLower(strings.TrimSpace(search))
+	filtered := make([]TaskImage, 0, len(images))
+	for _, image := range images {
+		if search != "" && !strings.Contains(strings.ToLower(image.ID+" "+image.Name+" "+image.Runtime+" "+image.BaseImage+" "+image.Filename+" "+image.Status), search) {
+			continue
+		}
+		filtered = append(filtered, image)
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	total := len(filtered)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	pages := (total + pageSize - 1) / pageSize
+	return TaskImagePage{Items: filtered[start:end], Total: total, Page: page, PageSize: pageSize, TotalPages: pages}
+}
+
+func (b *ImageBuilder) Get(id string) (TaskImage, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	image, ok := b.images[id]
+	if !ok {
+		return TaskImage{}, store.ErrNotFound
+	}
+	return *image, nil
+}
+
+func (b *ImageBuilder) Delete(id string) error {
+	image, err := b.Get(id)
+	if err != nil {
+		return err
+	}
+	if image.Status == "building" {
+		return errTaskImageBuilding
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	output, removeErr := b.remove(ctx, image.Name)
+	if removeErr != nil && !dockerImageMissing(output) {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = removeErr.Error()
+		}
+		return fmt.Errorf("delete local Docker image: %s", message)
+	}
+	if err := b.store.DeleteTaskImage(id); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	b.mu.Lock()
+	delete(b.images, id)
+	b.mu.Unlock()
+	return nil
+}
+
+func dockerImageMissing(output []byte) bool {
+	message := strings.ToLower(string(output))
+	return strings.Contains(message, "no such image") || strings.Contains(message, "not found")
+}
+
+func (s *Server) listTaskImages(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery == "" {
+		writeJSON(w, http.StatusOK, s.images.List())
+		return
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	writeJSON(w, http.StatusOK, s.images.Query(r.URL.Query().Get("q"), page, pageSize))
+}
+
+func (s *Server) deleteTaskImage(w http.ResponseWriter, r *http.Request) {
+	image, err := s.images.Get(r.PathValue("id"))
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	if s.store.HasActiveJobForImage(image.Name) {
+		writeError(w, http.StatusConflict, "task image is referenced by an active job")
+		return
+	}
+	if err := s.images.Delete(image.ID); err != nil {
+		switch {
+		case errors.Is(err, errTaskImageBuilding):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not found")
+		case errors.Is(err, store.ErrPersistence):
+			writeError(w, http.StatusInternalServerError, err.Error())
+		default:
+			writeError(w, http.StatusBadGateway, err.Error())
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) buildTaskImage(w http.ResponseWriter, r *http.Request) {

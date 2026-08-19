@@ -25,7 +25,7 @@ flowchart LR
 
 ## 已有能力
 
-- 节点注册、心跳、在线状态和安全删除
+- 节点注册、心跳、在线状态、安全删除、搜索与分页
 - 运行任务中的节点禁止删除
 - `lowest_cost`、`most_vram` 调度策略
 - GPU 数量、最低显存和资源池约束
@@ -36,7 +36,7 @@ flowchart LR
 - Bearer Token API 鉴权
 - 任务、节点和任务镜像记录使用 MySQL 持久化
 - 响应式 Web 控制台
-- 从 Python 或 Shell 脚本构建任务镜像
+- 从 Python 或 Shell 脚本构建任务镜像，并支持搜索、分页和删除
 - Windows、Linux 和 Docker Agent 接入指引
 
 ## 快速开始
@@ -212,7 +212,9 @@ GPUFLOW_TOKEN=replace-with-a-long-random-token
 
 ## 从脚本构建任务镜像
 
-Web 控制台的 **镜像** 页面可以上传一个 `.py` 或 `.sh` 文件，并选择 Shell、Python 3.12、CUDA 12 或 PyTorch CUDA 基础环境。构建完成后，可以直接在任务表单中选择生成的镜像。
+Web 控制台的 **镜像** 页面可以上传一个 `.py` 或 `.sh` 文件，并选择 Shell、Python 3.12、CUDA 12 或 PyTorch CUDA 基础环境。构建完成后，可以直接在任务表单中选择生成的镜像。镜像和节点列表都支持服务端搜索与分页。
+
+删除任务镜像会同时删除控制端本地 Docker 镜像和 MySQL 中的 `task_images` 记录。构建中的镜像不能删除；仍被排队、已分配或运行中任务引用的镜像也不能删除。已完成任务只保留原镜像名称，不阻止镜像清理。
 
 ### 快速验证日志与产物下载
 

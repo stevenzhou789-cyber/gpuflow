@@ -36,6 +36,7 @@ type Store struct {
 type TaskImageStore interface {
 	SaveTaskImage(model.TaskImage) error
 	ListTaskImages() ([]model.TaskImage, error)
+	DeleteTaskImage(string) error
 }
 
 // NewMemory creates a non-persistent store for isolated unit tests. Production
@@ -70,6 +71,26 @@ func (s *Store) ListTaskImages() ([]model.TaskImage, error) {
 		result = append(result, *image)
 	}
 	return result, nil
+}
+
+func (s *Store) DeleteTaskImage(id string) error {
+	if s.db != nil {
+		if err := (&MySQLTaskImageStore{db: s.db}).DeleteTaskImage(id); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return err
+			}
+			return fmt.Errorf("%w: %v", ErrPersistence, err)
+		}
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.TaskImages[id]; !ok {
+		return ErrNotFound
+	}
+	before := cloneSnapshot(s.state)
+	delete(s.state.TaskImages, id)
+	return s.commitLocked(before)
 }
 
 func (s *Store) commitLocked(before snapshot) error {
@@ -261,6 +282,19 @@ type JobPage struct {
 	TotalPages int          `json:"total_pages"`
 }
 
+type NodeQuery struct {
+	Search         string
+	Page, PageSize int
+}
+
+type NodePage struct {
+	Items      []*model.Node `json:"items"`
+	Total      int           `json:"total"`
+	Page       int           `json:"page"`
+	PageSize   int           `json:"page_size"`
+	TotalPages int           `json:"total_pages"`
+}
+
 func (s *Store) QueryJobs(q JobQuery) JobPage {
 	jobs := s.ListJobs()
 	filtered := make([]*model.Job, 0, len(jobs))
@@ -301,26 +335,32 @@ func (s *Store) QueryJobs(q JobQuery) JobPage {
 		}
 		return av > bv
 	})
-	if q.Page < 1 {
-		q.Page = 1
-	}
-	if q.PageSize < 1 {
-		q.PageSize = 20
-	}
-	if q.PageSize > 100 {
-		q.PageSize = 100
-	}
 	total := len(filtered)
-	start := (q.Page - 1) * q.PageSize
+	page, pageSize, start, end, pages := pageBounds(q.Page, q.PageSize, total)
+	q.Page, q.PageSize = page, pageSize
+	return JobPage{Items: filtered[start:end], Total: total, Page: q.Page, PageSize: q.PageSize, TotalPages: pages}
+}
+
+func pageBounds(page, pageSize, total int) (int, int, int, int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	start := (page - 1) * pageSize
 	if start > total {
 		start = total
 	}
-	end := start + q.PageSize
+	end := start + pageSize
 	if end > total {
 		end = total
 	}
-	pages := (total + q.PageSize - 1) / q.PageSize
-	return JobPage{Items: filtered[start:end], Total: total, Page: q.Page, PageSize: q.PageSize, TotalPages: pages}
+	pages := (total + pageSize - 1) / pageSize
+	return page, pageSize, start, end, pages
 }
 
 func timeValue(value *time.Time) time.Time {
@@ -438,6 +478,32 @@ func (s *Store) ListNodes() []*model.Node {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
+}
+
+func (s *Store) QueryNodes(q NodeQuery) NodePage {
+	nodes := s.ListNodes()
+	search := strings.ToLower(strings.TrimSpace(q.Search))
+	filtered := make([]*model.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if search != "" && !strings.Contains(strings.ToLower(node.ID+" "+node.Name+" "+node.Provider+" "+node.Pool+" "+node.GPUModel), search) {
+			continue
+		}
+		filtered = append(filtered, node)
+	}
+	page, pageSize, start, end, pages := pageBounds(q.Page, q.PageSize, len(filtered))
+	q.Page, q.PageSize = page, pageSize
+	return NodePage{Items: filtered[start:end], Total: len(filtered), Page: q.Page, PageSize: q.PageSize, TotalPages: pages}
+}
+
+func (s *Store) HasActiveJobForImage(image string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, job := range s.state.Jobs {
+		if job.Image == image && !terminal(job.Status) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) DeleteNode(id string) error {

@@ -81,6 +81,13 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	if err != nil || len(images) != 1 || images[0].ID != image.ID || images[0].Status != "ready" {
 		t.Fatalf("unexpected persisted images: %+v err=%v", images, err)
 	}
+	if err := reopened.DeleteTaskImage(image.ID); err != nil {
+		t.Fatal(err)
+	}
+	images, err = reopened.ListTaskImages()
+	if err != nil || len(images) != 0 {
+		t.Fatalf("deleted task image still persisted: %+v err=%v", images, err)
+	}
 
 	if _, err := reopened.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobRunning}); err != nil {
 		t.Fatal(err)

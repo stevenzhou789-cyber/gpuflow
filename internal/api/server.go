@@ -71,6 +71,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/nodes/{id}", s.deleteNode)
 	s.mux.HandleFunc("POST /v1/task-images/build", s.buildTaskImage)
 	s.mux.HandleFunc("GET /v1/task-images", s.listTaskImages)
+	s.mux.HandleFunc("DELETE /v1/task-images/{id}", s.deleteTaskImage)
 	s.mux.Handle("/", webui.Handler())
 }
 
@@ -263,8 +264,14 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	s.scheduleBestEffort()
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
-func (s *Server) listNodes(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, s.store.ListNodes())
+func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery == "" {
+		writeJSON(w, 200, s.store.ListNodes())
+		return
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	writeJSON(w, 200, s.store.QueryNodes(store.NodeQuery{Search: r.URL.Query().Get("q"), Page: page, PageSize: pageSize}))
 }
 func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.DeleteNode(r.PathValue("id")); err != nil {

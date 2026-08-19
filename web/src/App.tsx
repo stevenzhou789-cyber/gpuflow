@@ -24,6 +24,7 @@ type Job = {
   requirements: { gpu_count: number; min_vram_gb: number; pools?: string[] };
 };
 type JobPage = { items: Job[]; total: number; page: number; page_size: number; total_pages: number };
+type NodePage = { items: Node[]; total: number; page: number; page_size: number; total_pages: number };
 
 type Node = {
   id: string;
@@ -70,6 +71,7 @@ type TaskImage = {
   created_at: string;
   updated_at: string;
 };
+type TaskImagePage = { items: TaskImage[]; total: number; page: number; page_size: number; total_pages: number };
 
 type ArtifactItem = { name: string; size: number; last_modified: string };
 type ArtifactResponse = { enabled: boolean; items: ArtifactItem[] };
@@ -215,26 +217,6 @@ function App() {
     refresh();
   }
 
-  async function deleteNode(node: Node) {
-    if (node.busy || node.current_job) return;
-    if (
-      !window.confirm(`确认删除节点“${node.name}”？已完成任务记录不会被删除。`)
-    )
-      return;
-    try {
-      await api<void>(`/v1/nodes/${encodeURIComponent(node.id)}`, {
-        method: "DELETE",
-      });
-      await refresh();
-    } catch (err) {
-      setError(
-        (err as Error).message === "node has an assigned or running job"
-          ? "该节点仍有任务正在分配或运行，不能删除。"
-          : (err as Error).message,
-      );
-    }
-  }
-
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -311,19 +293,18 @@ function App() {
         {page === "jobs" && <Jobs nodes={nodes} onSelect={setSelectedJob} onChanged={refresh} />}
         {page === "images" && (
           <TaskImages
-            images={taskImages}
             onBuild={() => setShowBuild(true)}
             onSubmit={(image) => {
               setSubmitPreset({ image: image.name });
               setShowSubmit(true);
             }}
+            onChanged={refresh}
           />
         )}
         {page === "nodes" && (
           <Nodes
-            nodes={nodes}
             onConnect={() => setShowConnect(true)}
-            onDelete={deleteNode}
+            onChanged={refresh}
           />
         )}
       </main>
@@ -796,14 +777,49 @@ const imageStatusLabel: Record<TaskImageStatus, string> = {
 };
 
 function TaskImages({
-  images,
   onBuild,
   onSubmit,
+  onChanged,
 }: {
-  images: TaskImage[];
   onBuild: () => void;
   onSubmit: (image: TaskImage) => void;
+  onChanged: () => Promise<void>;
 }) {
+  const [result, setResult] = useState<TaskImagePage>({ items: [], total: 0, page: 1, page_size: 12, total_pages: 0 });
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(1);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    const params = new URLSearchParams({ page: String(page), page_size: "12" });
+    if (query.trim()) params.set("q", query.trim());
+    try {
+      const next = await api<TaskImagePage>(`/v1/task-images?${params}`);
+      if (next.total_pages > 0 && page > next.total_pages) {
+        setPage(next.total_pages);
+        return;
+      }
+      setResult(next);
+      setError("");
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, [page, query]);
+
+  useEffect(() => { const timer = window.setTimeout(load, 250); return () => window.clearTimeout(timer); }, [load]);
+  useEffect(() => { const timer = window.setInterval(load, 5000); return () => window.clearInterval(timer); }, [load]);
+
+  async function remove(image: TaskImage) {
+    if (image.status === "building" || !window.confirm(`删除任务镜像“${image.name}”？这会同时删除控制端本地 Docker 镜像和数据库记录。`)) return;
+    try {
+      await api<void>(`/v1/task-images/${encodeURIComponent(image.id)}`, { method: "DELETE" });
+      await Promise.all([load(), onChanged()]);
+    } catch (err) {
+      const message = (err as Error).message;
+      setError(message === "task image is referenced by an active job" ? "仍有排队、已分配或运行中的任务使用该镜像，不能删除。" : message);
+    }
+  }
+
   return (
     <>
       <section className="connect-banner image-banner">
@@ -814,8 +830,13 @@ function TaskImages({
         </div>
         <button onClick={onBuild}>上传任务脚本 →</button>
       </section>
+      <section className="management-toolbar panel">
+        <input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="搜索镜像名称、ID、运行环境或基础镜像" />
+        <span>共 {result.total} 个镜像</span>
+      </section>
+      {error && <div className="notice error">{error}</div>}
       <section className="image-grid">
-        {images.map((image) => (
+        {result.items.map((image) => (
           <article className="image-card" key={image.id}>
             <div className="image-card-head">
               <span className={`status ${image.status}`}>
@@ -836,34 +857,65 @@ function TaskImages({
                 <pre>{image.log}</pre>
               </details>
             )}
-            <button
-              className="primary"
-              disabled={image.status !== "ready"}
-              onClick={() => onSubmit(image)}
-            >
-              使用此镜像提交任务
-            </button>
+            <div className="image-actions">
+              <button className="primary" disabled={image.status !== "ready"} onClick={() => onSubmit(image)}>使用此镜像提交任务</button>
+              <button className="danger" disabled={image.status === "building"} title={image.status === "building" ? "构建中的镜像不能删除" : "删除镜像"} onClick={() => remove(image)}>删除</button>
+            </div>
           </article>
         ))}
-        {!images.length && (
+        {!result.items.length && (
           <div className="panel image-empty">
-            <Empty title="还没有任务镜像" text="上传 .py 或 .sh 脚本创建第一个任务镜像。" />
+            <Empty title={query ? "没有匹配的任务镜像" : "还没有任务镜像"} text={query ? "请调整搜索关键词。" : "上传 .py 或 .sh 脚本创建第一个任务镜像。"} />
           </div>
         )}
       </section>
+      <PageControls page={result.page} totalPages={result.total_pages} onPage={setPage} />
     </>
   );
 }
 
 function Nodes({
-  nodes,
   onConnect,
-  onDelete,
+  onChanged,
 }: {
-  nodes: Node[];
   onConnect: () => void;
-  onDelete: (node: Node) => void;
+  onChanged: () => Promise<void>;
 }) {
+  const [result, setResult] = useState<NodePage>({ items: [], total: 0, page: 1, page_size: 12, total_pages: 0 });
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(1);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    const params = new URLSearchParams({ page: String(page), page_size: "12" });
+    if (query.trim()) params.set("q", query.trim());
+    try {
+      const next = await api<NodePage>(`/v1/nodes?${params}`);
+      if (next.total_pages > 0 && page > next.total_pages) {
+        setPage(next.total_pages);
+        return;
+      }
+      setResult(next);
+      setError("");
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, [page, query]);
+
+  useEffect(() => { const timer = window.setTimeout(load, 250); return () => window.clearTimeout(timer); }, [load]);
+  useEffect(() => { const timer = window.setInterval(load, 5000); return () => window.clearInterval(timer); }, [load]);
+
+  async function remove(node: Node) {
+    if (node.busy || node.current_job || !window.confirm(`确认删除节点“${node.name}”？已完成任务记录不会被删除。`)) return;
+    try {
+      await api<void>(`/v1/nodes/${encodeURIComponent(node.id)}`, { method: "DELETE" });
+      await Promise.all([load(), onChanged()]);
+    } catch (err) {
+      const message = (err as Error).message;
+      setError(message === "node has an assigned or running job" ? "该节点仍有任务正在分配或运行，不能删除。" : message);
+    }
+  }
+
   return (
     <>
       <section className="connect-banner">
@@ -874,8 +926,13 @@ function Nodes({
         </div>
         <button onClick={onConnect}>查看接入方式 →</button>
       </section>
+      <section className="management-toolbar panel">
+        <input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="搜索节点名称、ID、资源池、提供方或 GPU 型号" />
+        <span>共 {result.total} 个节点</span>
+      </section>
+      {error && <div className="notice error">{error}</div>}
       <section className="node-grid">
-        {nodes.map((node) => {
+        {result.items.map((node) => {
           const online =
             Date.now() - new Date(node.last_heartbeat).getTime() < 30_000;
           const locked = node.busy || Boolean(node.current_job);
@@ -891,7 +948,7 @@ function Nodes({
                     className="delete-node"
                     disabled={locked}
                     title={locked ? "节点有任务运行，不能删除" : "删除节点"}
-                    onClick={() => onDelete(node)}
+                    onClick={() => remove(node)}
                   >
                     删除
                   </button>
@@ -915,16 +972,28 @@ function Nodes({
             </article>
           );
         })}
-        {!nodes.length && (
+        {!result.items.length && (
           <div className="panel">
             <Empty
-              title="没有算力节点"
-              text="点击接入节点，复制命令到GPU主机运行。"
+              title={query ? "没有匹配的算力节点" : "没有算力节点"}
+              text={query ? "请调整搜索关键词。" : "点击接入节点，复制命令到GPU主机运行。"}
             />
           </div>
         )}
       </section>
+      <PageControls page={result.page} totalPages={result.total_pages} onPage={setPage} />
     </>
+  );
+}
+
+function PageControls({ page, totalPages, onPage }: { page: number; totalPages: number; onPage: (page: number) => void }) {
+  if (totalPages <= 1) return null;
+  return (
+    <div className="management-pagination">
+      <button disabled={page <= 1} onClick={() => onPage(page - 1)}>上一页</button>
+      <span>第 {page} / {totalPages} 页</span>
+      <button disabled={page >= totalPages} onClick={() => onPage(page + 1)}>下一页</button>
+    </div>
   );
 }
 

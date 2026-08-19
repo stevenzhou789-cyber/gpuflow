@@ -99,6 +99,84 @@ func TestBuildTaskImageOverHTTP(t *testing.T) {
 	}
 }
 
+func TestTaskImageSearchPaginationAndDeletion(t *testing.T) {
+	state := store.NewMemory()
+	now := time.Now().UTC()
+	alpha := model.TaskImage{ID: "img-alpha", Name: "gpuflow-task/alpha:v1", Runtime: "shell", BaseImage: "alpine", Filename: "alpha.sh", Status: "ready", CreatedAt: now, UpdatedAt: now}
+	beta := model.TaskImage{ID: "img-beta", Name: "gpuflow-task/beta:v1", Runtime: "python", BaseImage: "python:3.12", Filename: "beta.py", Status: "ready", CreatedAt: now.Add(-time.Minute), UpdatedAt: now}
+	building := model.TaskImage{ID: "img-building", Name: "gpuflow-task/building:v1", Runtime: "shell", BaseImage: "alpine", Filename: "build.sh", Status: "building", CreatedAt: now.Add(-2 * time.Minute), UpdatedAt: now}
+	for _, image := range []model.TaskImage{alpha, beta} {
+		if err := state.SaveTaskImage(image); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := New(state, "test-token")
+	if err := state.SaveTaskImage(building); err != nil {
+		t.Fatal(err)
+	}
+	handler.images.mu.Lock()
+	handler.images.images[building.ID] = &building
+	handler.images.mu.Unlock()
+	removed := make([]string, 0)
+	handler.images.remove = func(_ context.Context, image string) ([]byte, error) {
+		removed = append(removed, image)
+		return nil, nil
+	}
+	server := httptest.NewServer(handler.Handler())
+	defer server.Close()
+
+	var page TaskImagePage
+	if status := request(t, server, http.MethodGet, "/v1/task-images?page=1&page_size=1&q=alpha", nil, &page); status != http.StatusOK || page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != alpha.ID {
+		t.Fatalf("unexpected image page status=%d page=%+v", status, page)
+	}
+	job, err := state.CreateJob(model.JobCreate{Name: "uses alpha", Image: alpha.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := request(t, server, http.MethodDelete, "/v1/task-images/"+alpha.ID, nil, nil); status != http.StatusConflict || len(removed) != 0 {
+		t.Fatalf("active image deletion status=%d removed=%v", status, removed)
+	}
+	if _, err := state.CancelJob(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status := request(t, server, http.MethodDelete, "/v1/task-images/"+alpha.ID, nil, nil); status != http.StatusNoContent || len(removed) != 1 || removed[0] != alpha.Name {
+		t.Fatalf("image deletion status=%d removed=%v", status, removed)
+	}
+	if status := request(t, server, http.MethodDelete, "/v1/task-images/"+building.ID, nil, nil); status != http.StatusConflict {
+		t.Fatalf("building image deletion returned %d", status)
+	}
+	images, err := state.ListTaskImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := make(map[string]string, len(images))
+	for _, image := range images {
+		statuses[image.ID] = image.Status
+	}
+	if _, exists := statuses[alpha.ID]; exists {
+		t.Fatalf("deleted image still persisted: %+v", images)
+	}
+	if statuses[beta.ID] != "ready" || statuses[building.ID] != "building" {
+		t.Fatalf("remaining test images changed unexpectedly: %+v", images)
+	}
+}
+
+func TestNodeSearchPaginationOverHTTP(t *testing.T) {
+	state := store.NewMemory()
+	server := httptest.NewServer(New(state, "test-token").Handler())
+	defer server.Close()
+	for _, node := range []model.Node{
+		{ID: "alpha-node", Name: "Alpha GPU", Provider: "local", Pool: "lab-a", GPUModel: "RTX-4090"},
+		{ID: "beta-node", Name: "Beta GPU", Provider: "local", Pool: "lab-b", GPUModel: "A100"},
+	} {
+		request(t, server, http.MethodPost, "/v1/nodes/register", node, &node)
+	}
+	var page store.NodePage
+	if status := request(t, server, http.MethodGet, "/v1/nodes?page=1&page_size=1&q=4090", nil, &page); status != http.StatusOK || page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != "alpha-node" {
+		t.Fatalf("unexpected node page status=%d page=%+v", status, page)
+	}
+}
+
 func TestJobLifecycleOverHTTP(t *testing.T) {
 	state := store.NewMemory()
 	server := httptest.NewServer(New(state, "test-token").Handler())
@@ -244,6 +322,10 @@ func (failingTaskImageStore) SaveTaskImage(model.TaskImage) error {
 
 func (failingTaskImageStore) ListTaskImages() ([]model.TaskImage, error) {
 	return nil, nil
+}
+
+func (failingTaskImageStore) DeleteTaskImage(string) error {
+	return errors.New("storage unavailable")
 }
 
 func TestImageBuildPersistenceFailureIsVisible(t *testing.T) {

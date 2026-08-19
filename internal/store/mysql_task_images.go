@@ -100,3 +100,18 @@ FROM task_images ORDER BY created_at DESC`
 	}
 	return images, nil
 }
+
+func (s *MySQLTaskImageStore) DeleteTaskImage(id string) error {
+	result, err := s.db.Exec("DELETE FROM task_images WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete task image: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete task image result: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
