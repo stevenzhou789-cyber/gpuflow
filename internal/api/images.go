@@ -42,20 +42,33 @@ var (
 
 type TaskImage = model.TaskImage
 
+type ImagePublisher interface {
+	Publish(context.Context, io.Writer, string) (string, error)
+}
+
 type ImageBuilder struct {
-	mu     sync.RWMutex
-	images map[string]*TaskImage
-	run    func(context.Context, string, ...string) ([]byte, error)
-	remove func(context.Context, string) ([]byte, error)
-	store  store.TaskImageStore
+	mu        sync.RWMutex
+	images    map[string]*TaskImage
+	run       func(context.Context, io.Writer, string, ...string) error
+	remove    func(context.Context, string) ([]byte, error)
+	store     store.TaskImageStore
+	publisher ImagePublisher
 }
 
 func NewImageBuilder(storage store.TaskImageStore) *ImageBuilder {
+	return NewImageBuilderWithPublisher(storage, nil)
+}
+
+func NewImageBuilderWithPublisher(storage store.TaskImageStore, publisher ImagePublisher) *ImageBuilder {
 	builder := &ImageBuilder{
-		images: make(map[string]*TaskImage),
-		store:  storage,
-		run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			return exec.CommandContext(ctx, name, args...).CombinedOutput()
+		images:    make(map[string]*TaskImage),
+		store:     storage,
+		publisher: publisher,
+		run: func(ctx context.Context, output io.Writer, name string, args ...string) error {
+			command := exec.CommandContext(ctx, name, args...)
+			command.Stdout = output
+			command.Stderr = output
+			return command.Run()
 		},
 		remove: func(ctx context.Context, image string) ([]byte, error) {
 			return exec.CommandContext(ctx, "docker", "image", "rm", image).CombinedOutput()
@@ -356,11 +369,59 @@ func (b *ImageBuilder) build(id string, script []byte, requirements string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	output, runErr := b.run(ctx, "docker", "build", "--label", "gpuflow.task-image=true", "--tag", image.Name, dir)
+	output := &liveBuildLog{builder: b, imageID: id}
+	_, _ = output.Write([]byte("开始执行 Docker 镜像构建…\n"))
+	runErr := b.run(ctx, output, "docker", "build", "--label", "gpuflow.task-image=true", "--tag", image.Name, dir)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("构建超过 15 分钟")
 	}
-	b.finish(id, output, runErr)
+	if runErr == nil && b.publisher != nil {
+		_, _ = output.Write([]byte("\nDocker image built; publishing to the enterprise registry...\n"))
+		publishCtx, publishCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		publishedName, publishErr := b.publisher.Publish(publishCtx, output, image.Name)
+		publishCancel()
+		if publishErr != nil {
+			runErr = fmt.Errorf("publish task image: %w", publishErr)
+		} else {
+			b.mu.Lock()
+			if current := b.images[id]; current != nil {
+				current.Name = publishedName
+			}
+			b.mu.Unlock()
+		}
+	}
+	b.finish(id, output.Bytes(), runErr)
+}
+
+type liveBuildLog struct {
+	mu      sync.Mutex
+	builder *ImageBuilder
+	imageID string
+	output  []byte
+}
+
+func (w *liveBuildLog) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.output = append(w.output, p...)
+	if len(w.output) > 64<<10 {
+		w.output = append([]byte(nil), w.output[len(w.output)-(64<<10):]...)
+	}
+	current := string(w.output)
+	w.mu.Unlock()
+
+	w.builder.mu.Lock()
+	if image := w.builder.images[w.imageID]; image != nil {
+		image.Log = current
+		image.UpdatedAt = time.Now().UTC()
+	}
+	w.builder.mu.Unlock()
+	return len(p), nil
+}
+
+func (w *liveBuildLog) Bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.output...)
 }
 
 func taskDockerfile(image TaskImage, hasRequirements bool) string {

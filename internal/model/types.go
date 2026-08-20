@@ -39,6 +39,7 @@ type Job struct {
 	Recoveries     int               `json:"recoveries"`
 	Status         JobStatus         `json:"status"`
 	AssignedNode   string            `json:"assigned_node,omitempty"`
+	AllocatedGPUs  []int             `json:"allocated_gpus,omitempty"`
 	Output         string            `json:"output,omitempty"`
 	Error          string            `json:"error,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
@@ -71,6 +72,8 @@ type Node struct {
 	Labels        map[string]string `json:"labels,omitempty"`
 	Busy          bool              `json:"busy"`
 	CurrentJob    string            `json:"current_job,omitempty"`
+	ActiveJobs    []string          `json:"active_jobs,omitempty"`
+	AllocatedGPUs int               `json:"allocated_gpu_count"`
 	LastHeartbeat time.Time         `json:"last_heartbeat"`
 }
 
@@ -78,6 +81,10 @@ type JobUpdate struct {
 	Status JobStatus `json:"status"`
 	Output string    `json:"output,omitempty"`
 	Error  string    `json:"error,omitempty"`
+}
+
+type JobLogUpdate struct {
+	Output string `json:"output"`
 }
 
 type TaskImage struct {

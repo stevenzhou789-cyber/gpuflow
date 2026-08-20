@@ -12,6 +12,7 @@ type Job = {
   recoveries: number;
   max_retries: number;
   assigned_node?: string;
+  allocated_gpus?: number[];
   error?: string;
   output?: string;
   command?: string[];
@@ -37,6 +38,8 @@ type Node = {
   hourly_price: number;
   busy: boolean;
   current_job?: string;
+  active_jobs?: string[];
+  allocated_gpu_count: number;
   last_heartbeat: string;
 };
 
@@ -151,6 +154,7 @@ function App() {
   );
   const [showSubmit, setShowSubmit] = useState(false);
   const [showBuild, setShowBuild] = useState(false);
+  const [buildPreset, setBuildPreset] = useState<TaskImage | null>(null);
   const [showConnect, setShowConnect] = useState(false);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [submitPreset, setSubmitPreset] = useState<{ image: string } | null>(null);
@@ -185,7 +189,7 @@ function App() {
 
   useEffect(() => {
     if (edition.features.cost_analytics && !authRequired) {
-      api<Insights>("/commercial/v1/insights")
+      api<Insights>("/enterprise/v1/insights")
         .then(setInsights)
         .catch(() => undefined);
     }
@@ -262,7 +266,10 @@ function App() {
                 ＋ 接入节点
               </button>
             ) : page === "images" ? (
-              <button className="primary" onClick={() => setShowBuild(true)}>
+              <button className="primary" onClick={() => {
+                setBuildPreset(null);
+                setShowBuild(true);
+              }}>
                 ＋ 构建镜像
               </button>
             ) : (
@@ -293,7 +300,14 @@ function App() {
         {page === "jobs" && <Jobs nodes={nodes} onSelect={setSelectedJob} onChanged={refresh} />}
         {page === "images" && (
           <TaskImages
-            onBuild={() => setShowBuild(true)}
+            onBuild={() => {
+              setBuildPreset(null);
+              setShowBuild(true);
+            }}
+            onRebuild={(image) => {
+              setBuildPreset(image);
+              setShowBuild(true);
+            }}
             onSubmit={(image) => {
               setSubmitPreset({ image: image.name });
               setShowSubmit(true);
@@ -345,6 +359,7 @@ function App() {
       )}
       {showBuild && (
         <BuildTaskImage
+          initialImage={buildPreset || undefined}
           onClose={() => setShowBuild(false)}
           onCreated={() => {
             setShowBuild(false);
@@ -356,6 +371,7 @@ function App() {
       {showConnect && (
         <ConnectNode
           nodes={nodes}
+          editionName={edition.name}
           defaultAgentImage={edition.agent_image || "gpuflow:local"}
           defaultPublicURL={edition.public_url || window.location.origin}
           onClose={() => setShowConnect(false)}
@@ -410,7 +426,7 @@ function Overview({
           value={
             edition.features.cost_analytics
               ? `${(insights?.average_runtime_minutes || 0).toFixed(1)}m`
-              : "Pro"
+              : "Enterprise"
           }
           note={
             edition.features.cost_analytics
@@ -636,7 +652,8 @@ function Jobs({ nodes, onSelect, onChanged }: { nodes: Node[]; onSelect: (job: J
   );
 }
 
-function JobDetails({ job, onClose }: { job: Job; onClose: () => void }) {
+function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => void }) {
+  const [job, setJob] = useState(initialJob);
   const [copied, setCopied] = useState(false);
   const [artifacts, setArtifacts] = useState<ArtifactResponse | null>(null);
   const [artifactError, setArtifactError] = useState("");
@@ -646,6 +663,23 @@ function JobDetails({ job, onClose }: { job: Job; onClose: () => void }) {
   const duration = started
     ? Math.max(0, ((finished || new Date()).getTime() - started.getTime()) / 1000)
     : null;
+
+  useEffect(() => setJob(initialJob), [initialJob]);
+
+  useEffect(() => {
+    if (!["assigned", "running", "canceling"].includes(job.status)) return;
+    let active = true;
+    const refresh = () =>
+      api<Job>(`/v1/jobs/${job.id}`)
+        .then((latest) => active && setJob(latest))
+        .catch(() => undefined);
+    void refresh();
+    const timer = window.setInterval(refresh, 1000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [job.id, job.status]);
 
   useEffect(() => {
     let active = true;
@@ -700,6 +734,9 @@ function JobDetails({ job, onClose }: { job: Job; onClose: () => void }) {
           <div className="job-detail-grid">
             <DetailItem label="任务镜像" value={job.image} wide />
             <DetailItem label="执行节点" value={job.assigned_node || "等待调度"} />
+            {job.allocated_gpus?.length ? (
+              <DetailItem label="分配 GPU" value={job.allocated_gpus.map((gpu) => `GPU ${gpu}`).join(", ")} />
+            ) : null}
             <DetailItem label="资源池" value={job.requirements.pools?.join(", ") || "任意"} />
             <DetailItem label="GPU" value={`${job.requirements.gpu_count} 张`} />
             <DetailItem label="最低显存" value={`${job.requirements.min_vram_gb} GB`} />
@@ -728,7 +765,7 @@ function JobDetails({ job, onClose }: { job: Job; onClose: () => void }) {
             </button>
           </div>
           <pre className="job-log">{job.output || (job.status === "running" ? "任务正在运行，等待日志回传…" : "暂无日志输出")}</pre>
-          <small className="job-log-note">当前 Agent 在任务结束后一次性回传日志，最多保留最后 64 KB。</small>
+          <small className="job-log-note">运行日志约每 2 秒同步，最多保留最后 64 KB。</small>
         </section>
 
         <section className="job-detail-section artifact-panel">
@@ -778,10 +815,12 @@ const imageStatusLabel: Record<TaskImageStatus, string> = {
 
 function TaskImages({
   onBuild,
+  onRebuild,
   onSubmit,
   onChanged,
 }: {
   onBuild: () => void;
+  onRebuild: (image: TaskImage) => void;
   onSubmit: (image: TaskImage) => void;
   onChanged: () => Promise<void>;
 }) {
@@ -789,6 +828,8 @@ function TaskImages({
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const [error, setError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [logImageID, setLogImageID] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const params = new URLSearchParams({ page: String(page), page_size: "12" });
@@ -807,7 +848,12 @@ function TaskImages({
   }, [page, query]);
 
   useEffect(() => { const timer = window.setTimeout(load, 250); return () => window.clearTimeout(timer); }, [load]);
-  useEffect(() => { const timer = window.setInterval(load, 5000); return () => window.clearInterval(timer); }, [load]);
+  const hasBuildingImage = result.items.some((image) => image.status === "building");
+  const logImage = result.items.find((image) => image.id === logImageID);
+  useEffect(() => {
+    const timer = window.setInterval(load, hasBuildingImage ? 1000 : 5000);
+    return () => window.clearInterval(timer);
+  }, [load, hasBuildingImage]);
 
   async function remove(image: TaskImage) {
     if (image.status === "building" || !window.confirm(`删除任务镜像“${image.name}”？这会同时删除控制端本地 Docker 镜像和数据库记录。`)) return;
@@ -817,6 +863,15 @@ function TaskImages({
     } catch (err) {
       const message = (err as Error).message;
       setError(message === "task image is referenced by an active job" ? "仍有排队、已分配或运行中的任务使用该镜像，不能删除。" : message);
+    }
+  }
+
+  async function refreshImages() {
+    setRefreshing(true);
+    try {
+      await Promise.all([load(), onChanged()]);
+    } finally {
+      setRefreshing(false);
     }
   }
 
@@ -833,6 +888,16 @@ function TaskImages({
       <section className="management-toolbar panel">
         <input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="搜索镜像名称、ID、运行环境或基础镜像" />
         <span>共 {result.total} 个镜像</span>
+        <button
+          className={`refresh-button ${refreshing ? "refreshing" : ""}`}
+          type="button"
+          title="刷新镜像状态和构建日志"
+          aria-label="刷新镜像状态和构建日志"
+          disabled={refreshing}
+          onClick={refreshImages}
+        >
+          ↻
+        </button>
       </section>
       {error && <div className="notice error">{error}</div>}
       <section className="image-grid">
@@ -851,14 +916,14 @@ function TaskImages({
               <div><dt>入口</dt><dd>{image.command}</dd></div>
             </dl>
             {image.error && <div className="notice error">{image.error}</div>}
-            {image.log && (
-              <details>
-                <summary>构建日志</summary>
-                <pre>{image.log}</pre>
-              </details>
+            {(image.log || image.status === "building") && (
+              <button className="build-log-button" type="button" onClick={() => setLogImageID(image.id)}>
+                {image.status === "building" ? "查看实时构建日志" : "查看构建日志"} →
+              </button>
             )}
             <div className="image-actions">
               <button className="primary" disabled={image.status !== "ready"} onClick={() => onSubmit(image)}>使用此镜像提交任务</button>
+              <button className="secondary" disabled={image.status === "building"} onClick={() => onRebuild(image)}>编辑重建</button>
               <button className="danger" disabled={image.status === "building"} title={image.status === "building" ? "构建中的镜像不能删除" : "删除镜像"} onClick={() => remove(image)}>删除</button>
             </div>
           </article>
@@ -870,6 +935,28 @@ function TaskImages({
         )}
       </section>
       <PageControls page={result.page} totalPages={result.total_pages} onPage={setPage} />
+      {logImage && (
+        <div className="modal-backdrop">
+          <div className="modal build-log-modal">
+            <div className="modal-title">
+              <div>
+                <span className="eyebrow">DOCKER BUILD OUTPUT</span>
+                <h2>构建日志</h2>
+                <small>{logImage.name}</small>
+              </div>
+              <button type="button" onClick={() => setLogImageID(null)} aria-label="关闭">×</button>
+            </div>
+            <div className="build-log-status">
+              <span className={`status ${logImage.status}`}>{imageStatusLabel[logImage.status]}</span>
+              <span>{logImage.status === "building" ? "日志每秒自动刷新" : timeAgo(logImage.updated_at)}</span>
+            </div>
+            <pre className="build-log-view">{logImage.log || "等待 Docker 构建输出…"}</pre>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setLogImageID(null)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -963,7 +1050,11 @@ function Nodes({
                 <span>{node.vram_gb} GB VRAM</span>
               </div>
               <div className="node-footer">
-                <span>{node.busy ? `执行 ${node.current_job}` : "空闲"}</span>
+                <span>
+                  {node.busy
+                    ? `${node.active_jobs?.length || 1} 个任务 · ${node.allocated_gpu_count || node.gpu_count}/${node.gpu_count} GPU`
+                    : `空闲 · 0/${node.gpu_count} GPU`}
+                </span>
                 <strong>
                   ¥{node.hourly_price.toFixed(2)}
                   <small>/GPU小时</small>
@@ -1012,11 +1103,13 @@ const gpuProfiles = [
 
 function ConnectNode({
   nodes,
+  editionName,
   defaultAgentImage,
   defaultPublicURL,
   onClose,
 }: {
   nodes: Node[];
+  editionName: string;
   defaultAgentImage: string;
   defaultPublicURL: string;
   onClose: () => void;
@@ -1025,6 +1118,11 @@ function ConnectNode({
   const [copied, setCopied] = useState(false);
   const [agentImage, setAgentImage] = useState(defaultAgentImage);
   const [serverURL, setServerURL] = useState(defaultPublicURL);
+  const [agentToken, setAgentToken] = useState(
+    editionName === "enterprise"
+      ? ""
+      : sessionStorage.getItem("gpuflow_token") || "",
+  );
   const [values, setValues] = useState({
     name: "local-gpu-01",
     pool: "default",
@@ -1043,8 +1141,9 @@ function ConnectNode({
   ];
   const server = (serverURL.trim() || window.location.origin).replace(/\/+$/, "");
   const localOnlyServer = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(server);
-  const token = sessionStorage.getItem("gpuflow_token") || "";
-  const windowsCommand = `.\\gpuflow.exe agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price} -executor docker`;
+  const binary = editionName === "enterprise" ? "gpuflow-enterprise.exe" : "gpuflow.exe";
+  const token = agentToken;
+  const windowsCommand = `.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price} -executor docker`;
   const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price}`;
   const command = (mode === "windows" ? windowsCommand : dockerCommand).replace(
     /\n\+\s*/g,
@@ -1113,6 +1212,27 @@ function ConnectNode({
               {localOnlyServer
                 ? "当前地址仅本机可用；远程节点请改为局域网 IP、域名或公网 HTTPS 地址。"
                 : "该地址将写入 Agent 命令，请确认目标 GPU 主机可以访问。"}
+            </small>
+          </label>
+          <label className="connection-field">
+            Agent Token
+            <input
+              type="password"
+              value={agentToken}
+              onChange={(event) => {
+                setAgentToken(event.target.value);
+                setCopied(false);
+              }}
+              placeholder={
+                editionName === "enterprise"
+                  ? "填写 GPUFLOW_AGENT_TOKEN"
+                  : "与控制端 Token 一致"
+              }
+            />
+            <small>
+              {editionName === "enterprise"
+                ? "使用企业部署生成的 Agent Token，不要把管理员 Token 放到计算节点。"
+                : "Agent 使用该 Token 注册并领取任务。"}
             </small>
           </label>
           {mode === "docker" && (
@@ -1231,19 +1351,27 @@ function ConnectNode({
 }
 
 function BuildTaskImage({
+  initialImage,
   onClose,
   onCreated,
 }: {
+  initialImage?: TaskImage;
   onClose: () => void;
   onCreated: () => void;
 }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [runtime, setRuntime] = useState("pytorch");
-  const defaultTag = `gpuflow-task/script:${new Date()
+  const supportedRuntime = ["shell", "python", "pytorch", "cuda12", "custom"].includes(initialImage?.runtime || "")
+    ? initialImage!.runtime
+    : "pytorch";
+  const [runtime, setRuntime] = useState(supportedRuntime);
+  const timestamp = new Date()
     .toISOString()
     .replace(/[-:T]/g, "")
-    .slice(0, 14)}`;
+    .slice(0, 14);
+  const defaultTag = initialImage
+    ? rebuildImageName(initialImage.name, timestamp)
+    : `gpuflow-task/script:${timestamp}`;
 
   async function build(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1268,7 +1396,7 @@ function BuildTaskImage({
         <div className="modal-title">
           <div>
             <span className="eyebrow">BUILD TASK IMAGE</span>
-            <h2>从脚本构建任务镜像</h2>
+            <h2>{initialImage ? "编辑并重新构建镜像" : "从脚本构建任务镜像"}</h2>
           </div>
           <button type="button" onClick={onClose} aria-label="关闭">×</button>
         </div>
@@ -1277,7 +1405,7 @@ function BuildTaskImage({
           <label className="wide">
             任务脚本
             <input name="script" type="file" accept=".py,.sh" required />
-            <small>支持 Python 或 Shell 单文件，最大 5 MB。</small>
+            <small>{initialImage ? `原脚本：${initialImage.filename}。请重新选择修改后的文件。` : "支持 Python 或 Shell 单文件，最大 5 MB。"}</small>
           </label>
           <label>
             运行环境
@@ -1303,6 +1431,7 @@ function BuildTaskImage({
               <input
                 name="base_image"
                 required
+                defaultValue={initialImage?.base_image || ""}
                 placeholder="例如：harbor.example.com/ai/pytorch:cuda12"
               />
               <small>适用于镜像代理、Harbor、私有仓库或本机已有镜像。</small>
@@ -1331,6 +1460,15 @@ function BuildTaskImage({
       </form>
     </div>
   );
+}
+
+function rebuildImageName(name: string, timestamp: string) {
+  const lastSlash = name.lastIndexOf("/");
+  const tagSeparator = name.lastIndexOf(":");
+  if (tagSeparator > lastSlash) {
+    return `${name.slice(0, tagSeparator)}:${name.slice(tagSeparator + 1)}-rebuild-${timestamp}`;
+  }
+  return `${name}:rebuild-${timestamp}`;
 }
 
 function SubmitJob({

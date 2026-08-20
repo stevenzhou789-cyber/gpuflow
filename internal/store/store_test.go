@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,5 +130,79 @@ func TestCancelRerunDeleteAndQueryJobs(t *testing.T) {
 	}
 	if err := s.DeleteJob(rerun.ID); !errors.Is(err, ErrJobActive) {
 		t.Fatalf("expected active conflict, got %v", err)
+	}
+}
+
+func TestUpdateJobOutputWhileRunning(t *testing.T) {
+	s := NewMemory()
+	node, _ := s.RegisterNode(model.Node{ID: "log-node", GPUCount: 1})
+	job, _ := s.CreateJob(model.JobCreate{Name: "logs", Image: "alpine"})
+	_ = s.Schedule(time.Minute)
+	_, _ = s.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobRunning})
+
+	updated, err := s.UpdateJobOutput(job.ID, node.ID, strings.Repeat("x", 70<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.JobRunning || len(updated.Output) != 64<<10 {
+		t.Fatalf("unexpected live log update: status=%s bytes=%d", updated.Status, len(updated.Output))
+	}
+	if _, err := s.UpdateJobOutput(job.ID, "other-node", "forbidden"); err == nil {
+		t.Fatal("expected another node's log update to fail")
+	}
+}
+
+func TestGPUGranularSchedulingAllocatesDistinctDevices(t *testing.T) {
+	s := NewMemory()
+	s.SetGPUGranularScheduling(true)
+	node, _ := s.RegisterNode(model.Node{ID: "four-gpu", GPUCount: 4, VRAMGB: 24})
+	first, _ := s.CreateJob(model.JobCreate{Name: "first", Image: "train", Requirements: model.Requirements{GPUCount: 2}})
+	second, _ := s.CreateJob(model.JobCreate{Name: "second", Image: "train", Requirements: model.Requirements{GPUCount: 2}})
+	third, _ := s.CreateJob(model.JobCreate{Name: "third", Image: "train", Requirements: model.Requirements{GPUCount: 1}})
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	first, _ = s.GetJob(first.ID)
+	second, _ = s.GetJob(second.ID)
+	third, _ = s.GetJob(third.ID)
+	if first.Status != model.JobAssigned || second.Status != model.JobAssigned || third.Status != model.JobQueued {
+		t.Fatalf("unexpected statuses: %s %s %s", first.Status, second.Status, third.Status)
+	}
+	if !reflect.DeepEqual(first.AllocatedGPUs, []int{0, 1}) || !reflect.DeepEqual(second.AllocatedGPUs, []int{2, 3}) {
+		t.Fatalf("overlapping allocations: %v %v", first.AllocatedGPUs, second.AllocatedGPUs)
+	}
+	claimedOne, _ := s.NextJob(node.ID)
+	claimedTwo, _ := s.NextJob(node.ID)
+	if claimedOne == nil || claimedTwo == nil || claimedOne.ID == claimedTwo.ID {
+		t.Fatalf("concurrent workers did not claim distinct jobs: %+v %+v", claimedOne, claimedTwo)
+	}
+	_, _ = s.UpdateJob(first.ID, node.ID, model.JobUpdate{Status: model.JobRunning})
+	_, _ = s.UpdateJob(first.ID, node.ID, model.JobUpdate{Status: model.JobSucceeded})
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	third, _ = s.GetJob(third.ID)
+	if third.Status != model.JobAssigned || !reflect.DeepEqual(third.AllocatedGPUs, []int{0}) {
+		t.Fatalf("released GPU was not reused: %+v", third)
+	}
+	nodes := s.ListNodes()
+	if len(nodes) != 1 || nodes[0].AllocatedGPUs != 3 || len(nodes[0].ActiveJobs) != 2 {
+		t.Fatalf("unexpected node usage: %+v", nodes)
+	}
+}
+
+func TestCommunitySchedulingRemainsWholeNodeExclusive(t *testing.T) {
+	s := NewMemory()
+	_, _ = s.RegisterNode(model.Node{ID: "community-four-gpu", GPUCount: 4, VRAMGB: 24})
+	first, _ := s.CreateJob(model.JobCreate{Name: "first", Image: "train", Requirements: model.Requirements{GPUCount: 1}})
+	second, _ := s.CreateJob(model.JobCreate{Name: "second", Image: "train", Requirements: model.Requirements{GPUCount: 1}})
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	first, _ = s.GetJob(first.ID)
+	second, _ = s.GetJob(second.ID)
+	if first.Status != model.JobAssigned || second.Status != model.JobQueued || len(first.AllocatedGPUs) != 0 {
+		t.Fatalf("community scheduling stopped being whole-node exclusive: %+v %+v", first, second)
 	}
 }

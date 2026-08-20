@@ -1,7 +1,7 @@
 package edition
 
 // Descriptor is returned to the UI and is also the stable extension contract
-// used by commercial builds. Keep it data-only so community and commercial
+// used by Enterprise builds. Keep it data-only so Community and Enterprise
 // binaries can share the same frontend.
 type Descriptor struct {
 	Name       string          `json:"name"`

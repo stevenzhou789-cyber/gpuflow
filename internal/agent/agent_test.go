@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -58,6 +59,23 @@ func TestArchiveArtifactsSkipsEmptyDirectory(t *testing.T) {
 	bundle, err := archiveArtifacts(t.TempDir())
 	if err != nil || bundle != "" {
 		t.Fatalf("expected no bundle, got %q, %v", bundle, err)
+	}
+}
+
+func TestLiveJobLogKeepsLatestOutput(t *testing.T) {
+	log := &liveJobLog{}
+	_, _ = log.Write([]byte(strings.Repeat("a", 40<<10)))
+	_, _ = log.Write([]byte(strings.Repeat("b", 40<<10)))
+	output := log.String()
+	if len(output) != 64<<10 || !strings.HasSuffix(output, strings.Repeat("b", 40<<10)) {
+		t.Fatalf("unexpected retained output: bytes=%d", len(output))
+	}
+}
+
+func TestDockerGPUSelectorUsesAllocatedDevices(t *testing.T) {
+	job := &model.Job{Requirements: model.Requirements{GPUCount: 2}, AllocatedGPUs: []int{1, 3}}
+	if selector := dockerGPUSelector(job); selector != `"device=1,3"` {
+		t.Fatalf("unexpected selector %q", selector)
 	}
 }
 

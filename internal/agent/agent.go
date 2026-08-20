@@ -2,7 +2,6 @@ package agent
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -12,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gpuflow/internal/client"
@@ -51,6 +52,21 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("register node: %w", err)
 	}
 	a.cfg.ID = n.ID
+	workers := a.cfg.GPUCount
+	if workers < 1 {
+		workers = 1
+	}
+	var group sync.WaitGroup
+	for index := 0; index < workers; index++ {
+		group.Add(1)
+		go func() { defer group.Done(); a.runWorker(ctx) }()
+	}
+	<-ctx.Done()
+	group.Wait()
+	return ctx.Err()
+}
+
+func (a *Agent) runWorker(ctx context.Context) {
 	ticker := time.NewTicker(a.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -59,7 +75,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		case <-ticker.C:
 		}
 	}
@@ -187,8 +203,9 @@ func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir stri
 	defer cancel()
 	args := []string{"run", "--rm", "--label", "gpuflow.job=" + job.ID}
 	args = append(args, "--mount", "type=bind,source="+artifactDir+",target=/gpuflow/artifacts", "-e", "GPUFLOW_ARTIFACT_DIR=/gpuflow/artifacts")
+	args = append(args, "-e", "PYTHONUNBUFFERED=1")
 	if job.Requirements.GPUCount > 0 {
-		args = append(args, "--gpus", fmt.Sprintf("%d", job.Requirements.GPUCount))
+		args = append(args, "--gpus", dockerGPUSelector(job))
 	}
 	for k, v := range job.Environment {
 		args = append(args, "-e", k+"="+v)
@@ -201,9 +218,9 @@ func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir stri
 	_ = exec.Command("docker", "rm", "-f", containerName).Run()
 	args = append([]string{"run", "--name", containerName}, args[1:]...)
 	cmd := exec.Command("docker", args...)
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	output := &liveJobLog{}
+	cmd.Stdout = output
+	cmd.Stderr = output
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("docker run failed: %w", err)
 	}
@@ -212,6 +229,8 @@ func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir stri
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var err error
+	var lastUploaded string
+	var lastUpload time.Time
 	for {
 		select {
 		case err = <-done:
@@ -221,6 +240,14 @@ func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir stri
 			err = <-done
 			goto finished
 		case <-ticker.C:
+			current := output.String()
+			if current != lastUploaded && time.Since(lastUpload) >= 2*time.Second {
+				if uploadErr := a.uploadLiveLog(parent, job.ID, current); uploadErr != nil {
+					fmt.Printf("agent log upload warning: %v\n", uploadErr)
+				} else {
+					lastUploaded, lastUpload = current, time.Now()
+				}
+			}
 			var latest model.Job
 			if _, pollErr := a.client.Do(http.MethodGet, "/v1/jobs/"+job.ID, nil, &latest); pollErr == nil && (latest.Status == model.JobCanceling || latest.Status == model.JobCanceled) {
 				_ = exec.Command("docker", "stop", "--time", "10", containerName).Run()
@@ -243,6 +270,45 @@ finished:
 		return text, fmt.Errorf("docker run failed: %w", err)
 	}
 	return strings.TrimSpace(text), nil
+}
+
+func dockerGPUSelector(job *model.Job) string {
+	if len(job.AllocatedGPUs) == 0 {
+		return strconv.Itoa(job.Requirements.GPUCount)
+	}
+	indices := make([]string, len(job.AllocatedGPUs))
+	for index, gpu := range job.AllocatedGPUs {
+		indices[index] = strconv.Itoa(gpu)
+	}
+	return `"device=` + strings.Join(indices, ",") + `"`
+}
+
+type liveJobLog struct {
+	mu     sync.Mutex
+	output []byte
+}
+
+func (w *liveJobLog) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.output = append(w.output, p...)
+	if len(w.output) > 64<<10 {
+		w.output = append([]byte(nil), w.output[len(w.output)-(64<<10):]...)
+	}
+	return len(p), nil
+}
+
+func (w *liveJobLog) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return strings.ToValidUTF8(string(w.output), "�")
+}
+
+func (a *Agent) uploadLiveLog(parent context.Context, jobID, output string) error {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	_, err := a.client.DoContext(ctx, http.MethodPost, "/v1/jobs/"+jobID+"/logs?node_id="+a.cfg.ID, model.JobLogUpdate{Output: output}, nil)
+	return err
 }
 
 func appendOutput(output, line string) string {

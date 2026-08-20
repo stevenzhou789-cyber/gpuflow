@@ -42,7 +42,11 @@ func NewWithTaskImageStore(s *store.Store, taskImages store.TaskImageStore, toke
 }
 
 func NewWithStores(s *store.Store, taskImages store.TaskImageStore, artifacts artifact.Store, token string, descriptor edition.Descriptor) *Server {
-	server := &Server{store: s, token: token, mux: http.NewServeMux(), edition: descriptor, images: NewImageBuilder(taskImages), artifacts: artifacts}
+	return NewWithStoresAndPublisher(s, taskImages, artifacts, token, descriptor, nil)
+}
+
+func NewWithStoresAndPublisher(s *store.Store, taskImages store.TaskImageStore, artifacts artifact.Store, token string, descriptor edition.Descriptor, publisher ImagePublisher) *Server {
+	server := &Server{store: s, token: token, mux: http.NewServeMux(), edition: descriptor, images: NewImageBuilderWithPublisher(taskImages, publisher), artifacts: artifacts}
 	server.routes()
 	return server
 }
@@ -61,6 +65,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancelJob)
 	s.mux.HandleFunc("DELETE /v1/jobs/{id}", s.deleteJob)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/status", s.updateJob)
+	s.mux.HandleFunc("POST /v1/jobs/{id}/logs", s.updateJobLog)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/artifacts", s.uploadArtifact)
 	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts", s.listArtifacts)
 	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts/{name}", s.downloadArtifact)
@@ -314,6 +319,25 @@ func (s *Server) updateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	s.scheduleBestEffort()
 	writeJSON(w, 200, j)
+}
+
+func (s *Server) updateJobLog(w http.ResponseWriter, r *http.Request) {
+	var in model.JobLogUpdate
+	if err := decode(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	nodeID := r.URL.Query().Get("node_id")
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, "node_id is required")
+		return
+	}
+	job, err := s.store.UpdateJobOutput(r.PathValue("id"), nodeID, in.Output)
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
 }
 
 func (s *Server) scheduleBestEffort() {

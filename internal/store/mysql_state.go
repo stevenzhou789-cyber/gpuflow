@@ -4,13 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
 
 	"gpuflow/internal/model"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
 )
 
 const mysqlJobsSchema = `CREATE TABLE IF NOT EXISTS jobs (
@@ -27,6 +28,7 @@ const mysqlJobsSchema = `CREATE TABLE IF NOT EXISTS jobs (
   recoveries INT NOT NULL,
   status VARCHAR(32) NOT NULL,
   assigned_node VARCHAR(64) NOT NULL,
+  allocated_gpus_json JSON NULL,
   output MEDIUMTEXT NOT NULL,
   error_message TEXT NOT NULL,
   created_at DATETIME(6) NOT NULL,
@@ -76,11 +78,18 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 			return nil, fmt.Errorf("migrate %s: %w", name, err)
 		}
 	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN allocated_gpus_json JSON NULL AFTER assigned_node"); err != nil {
+		var mysqlErr *mysqldriver.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate job GPU allocations: %w", err)
+		}
+	}
 	if err := (&MySQLTaskImageStore{db: db}).migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	s := &Store{db: db, state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}}
+	s := &Store{db: db, state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}, claimedJobs: map[string]time.Time{}}
 	if err := s.loadMySQL(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -91,24 +100,29 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 func (s *Store) loadMySQL(ctx context.Context) error {
 	const jobsQuery = `SELECT id, name, image, command_json, environment_json, requirements_json,
   strategy, timeout_seconds, max_retries, attempts, recoveries, status, assigned_node,
-  output, error_message, created_at, updated_at, started_at, finished_at, rerun_of FROM jobs`
+  allocated_gpus_json, output, error_message, created_at, updated_at, started_at, finished_at, rerun_of FROM jobs`
 	rows, err := s.db.QueryContext(ctx, jobsQuery)
 	if err != nil {
 		return fmt.Errorf("load jobs: %w", err)
 	}
 	for rows.Next() {
 		var job model.Job
-		var commandJSON, environmentJSON, requirementsJSON []byte
+		var commandJSON, environmentJSON, requirementsJSON, allocatedGPUsJSON []byte
 		var startedAt, finishedAt sql.NullTime
 		if err := rows.Scan(&job.ID, &job.Name, &job.Image, &commandJSON, &environmentJSON, &requirementsJSON,
 			&job.Strategy, &job.TimeoutSeconds, &job.MaxRetries, &job.Attempts, &job.Recoveries, &job.Status,
-			&job.AssignedNode, &job.Output, &job.Error, &job.CreatedAt, &job.UpdatedAt, &startedAt, &finishedAt, &job.RerunOf); err != nil {
+			&job.AssignedNode, &allocatedGPUsJSON, &job.Output, &job.Error, &job.CreatedAt, &job.UpdatedAt, &startedAt, &finishedAt, &job.RerunOf); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan job: %w", err)
 		}
 		if err := decodeJobJSON(&job, commandJSON, environmentJSON, requirementsJSON); err != nil {
 			rows.Close()
 			return fmt.Errorf("decode job %s: %w", job.ID, err)
+		}
+		if len(allocatedGPUsJSON) > 0 {
+			if err := json.Unmarshal(allocatedGPUsJSON, &job.AllocatedGPUs); err != nil {
+				return fmt.Errorf("decode job %s GPU allocations: %w", job.ID, err)
+			}
 		}
 		if startedAt.Valid {
 			value := startedAt.Time
@@ -149,6 +163,9 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate nodes: %w", err)
 	}
+	for id := range s.state.Nodes {
+		s.refreshNodeUsageLocked(id)
+	}
 	return nil
 }
 
@@ -167,13 +184,13 @@ func decodeJobJSON(job *model.Job, commandJSON, environmentJSON, requirementsJSO
 
 const upsertJobSQL = `INSERT INTO jobs (id, name, image, command_json, environment_json,
   requirements_json, strategy, timeout_seconds, max_retries, attempts, recoveries, status,
-  assigned_node, output, error_message, created_at, updated_at, started_at, finished_at, rerun_of)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  assigned_node, allocated_gpus_json, output, error_message, created_at, updated_at, started_at, finished_at, rerun_of)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE name=VALUES(name), image=VALUES(image), command_json=VALUES(command_json),
   environment_json=VALUES(environment_json), requirements_json=VALUES(requirements_json),
   strategy=VALUES(strategy), timeout_seconds=VALUES(timeout_seconds), max_retries=VALUES(max_retries),
   attempts=VALUES(attempts), recoveries=VALUES(recoveries), status=VALUES(status),
-  assigned_node=VALUES(assigned_node), output=VALUES(output), error_message=VALUES(error_message),
+  assigned_node=VALUES(assigned_node), allocated_gpus_json=VALUES(allocated_gpus_json), output=VALUES(output), error_message=VALUES(error_message),
   created_at=VALUES(created_at), updated_at=VALUES(updated_at), started_at=VALUES(started_at),
   finished_at=VALUES(finished_at), rerun_of=VALUES(rerun_of)`
 
@@ -223,9 +240,13 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 		if err != nil {
 			return fmt.Errorf("encode job %s requirements: %w", job.ID, err)
 		}
+		allocatedGPUsJSON, err := json.Marshal(job.AllocatedGPUs)
+		if err != nil {
+			return fmt.Errorf("encode job %s GPU allocations: %w", job.ID, err)
+		}
 		if _, err := tx.ExecContext(ctx, upsertJobSQL, job.ID, job.Name, job.Image, commandJSON,
 			environmentJSON, requirementsJSON, job.Strategy, job.TimeoutSeconds, job.MaxRetries,
-			job.Attempts, job.Recoveries, job.Status, job.AssignedNode, job.Output, job.Error,
+			job.Attempts, job.Recoveries, job.Status, job.AssignedNode, allocatedGPUsJSON, job.Output, job.Error,
 			job.CreatedAt, job.UpdatedAt, nullableTime(job.StartedAt), nullableTime(job.FinishedAt), job.RerunOf); err != nil {
 			return fmt.Errorf("insert job %s: %w", job.ID, err)
 		}

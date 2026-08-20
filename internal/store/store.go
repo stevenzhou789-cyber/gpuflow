@@ -28,9 +28,11 @@ type snapshot struct {
 }
 
 type Store struct {
-	mu    sync.Mutex
-	db    *sql.DB
-	state snapshot
+	mu                    sync.Mutex
+	db                    *sql.DB
+	state                 snapshot
+	gpuGranularScheduling bool
+	claimedJobs           map[string]time.Time
 }
 
 type TaskImageStore interface {
@@ -42,7 +44,16 @@ type TaskImageStore interface {
 // NewMemory creates a non-persistent store for isolated unit tests. Production
 // composition always uses OpenMySQLStateStore.
 func NewMemory() *Store {
-	return &Store{state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}}
+	return &Store{state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}, claimedJobs: map[string]time.Time{}}
+}
+
+func (s *Store) SetGPUGranularScheduling(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gpuGranularScheduling = enabled
+	for id := range s.state.Nodes {
+		s.refreshNodeUsageLocked(id)
+	}
 }
 
 func (s *Store) SaveTaskImage(image model.TaskImage) error {
@@ -112,6 +123,7 @@ func cloneSnapshot(source snapshot) snapshot {
 	result := snapshot{Jobs: make(map[string]*model.Job, len(source.Jobs)), Nodes: make(map[string]*model.Node, len(source.Nodes)), TaskImages: make(map[string]*model.TaskImage, len(source.TaskImages))}
 	for id, job := range source.Jobs {
 		copy := *job
+		copy.AllocatedGPUs = append([]int(nil), job.AllocatedGPUs...)
 		copy.Command = append([]string(nil), job.Command...)
 		copy.Environment = cloneStringMap(job.Environment)
 		copy.Requirements.GPUModels = append([]string(nil), job.Requirements.GPUModels...)
@@ -123,6 +135,7 @@ func cloneSnapshot(source snapshot) snapshot {
 	for id, node := range source.Nodes {
 		copy := *node
 		copy.Labels = cloneStringMap(node.Labels)
+		copy.ActiveJobs = append([]string(nil), node.ActiveJobs...)
 		result.Nodes[id] = &copy
 	}
 	for id, image := range source.TaskImages {
@@ -388,6 +401,7 @@ func (s *Store) GetJob(id string) (*model.Job, error) {
 		return nil, ErrNotFound
 	}
 	copy := *j
+	copy.AllocatedGPUs = append([]int(nil), j.AllocatedGPUs...)
 	return &copy, nil
 }
 
@@ -397,6 +411,7 @@ func (s *Store) ListJobs() []*model.Job {
 	result := make([]*model.Job, 0, len(s.state.Jobs))
 	for _, j := range s.state.Jobs {
 		copy := *j
+		copy.AllocatedGPUs = append([]int(nil), j.AllocatedGPUs...)
 		result = append(result, &copy)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
@@ -420,35 +435,31 @@ func (s *Store) RegisterNode(in model.Node) (*model.Node, error) {
 	if in.Pool == "" {
 		in.Pool = "default"
 	}
-	if old, ok := s.state.Nodes[in.ID]; ok {
-		in.Busy, in.CurrentJob = old.Busy, old.CurrentJob
-		if in.CurrentJob != "" {
-			job := s.state.Jobs[in.CurrentJob]
-			switch {
-			case job == nil || terminal(job.Status):
-				in.Busy, in.CurrentJob = false, ""
-			case job.Status == model.JobRunning:
-				if job.Attempts > job.MaxRetries {
-					job.Status, job.FinishedAt = model.JobFailed, &now
-					job.Error = "agent restarted after interruption; retry budget exhausted"
-					job.UpdatedAt = now
-					in.Busy, in.CurrentJob = false, ""
-				} else {
-					// Registration means the agent process restarted. Re-run the
-					// interrupted work as another attempt within its retry budget.
-					job.Status = model.JobAssigned
-					job.Attempts++
-					job.Recoveries++
-					job.StartedAt, job.FinishedAt = nil, nil
-					job.Output, job.Error, job.UpdatedAt = "", "", now
-				}
+	if _, ok := s.state.Nodes[in.ID]; ok {
+		for _, job := range s.state.Jobs {
+			if job.AssignedNode != in.ID || !activeJob(job.Status) {
+				continue
+			}
+			delete(s.claimedJobs, job.ID)
+			if job.Status != model.JobRunning {
+				continue
+			}
+			if job.Attempts > job.MaxRetries {
+				job.Status, job.FinishedAt = model.JobFailed, &now
+				job.Error, job.UpdatedAt = "agent restarted after interruption; retry budget exhausted", now
+				job.AllocatedGPUs = nil
+			} else {
+				job.Status = model.JobAssigned
+				job.Attempts++
+				job.Recoveries++
+				job.StartedAt, job.FinishedAt = nil, nil
+				job.Output, job.Error, job.UpdatedAt = "", "", now
 			}
 		}
-	} else {
-		in.Busy, in.CurrentJob = false, ""
 	}
 	in.LastHeartbeat = now
 	s.state.Nodes[in.ID] = &in
+	s.refreshNodeUsageLocked(in.ID)
 	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}
@@ -474,6 +485,7 @@ func (s *Store) ListNodes() []*model.Node {
 	result := make([]*model.Node, 0, len(s.state.Nodes))
 	for _, n := range s.state.Nodes {
 		copy := *n
+		copy.ActiveJobs = append([]string(nil), n.ActiveJobs...)
 		result = append(result, &copy)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
@@ -538,8 +550,67 @@ func containsFold(values []string, candidate string) bool {
 	return false
 }
 
+func activeJob(status model.JobStatus) bool {
+	return status == model.JobAssigned || status == model.JobRunning || status == model.JobCanceling
+}
+
+func (s *Store) usedGPUSetLocked(nodeID string) map[int]bool {
+	used := map[int]bool{}
+	for _, job := range s.state.Jobs {
+		if job.AssignedNode != nodeID || !activeJob(job.Status) {
+			continue
+		}
+		allocated := job.AllocatedGPUs
+		if len(allocated) == 0 && s.gpuGranularScheduling {
+			for index := 0; index < job.Requirements.GPUCount; index++ {
+				allocated = append(allocated, index)
+			}
+		}
+		for _, index := range allocated {
+			used[index] = true
+		}
+	}
+	return used
+}
+
+func (s *Store) availableGPUsLocked(node *model.Node, count int) []int {
+	used := s.usedGPUSetLocked(node.ID)
+	available := make([]int, 0, count)
+	for index := 0; index < node.GPUCount && len(available) < count; index++ {
+		if !used[index] {
+			available = append(available, index)
+		}
+	}
+	return available
+}
+
+func (s *Store) refreshNodeUsageLocked(nodeID string) {
+	node := s.state.Nodes[nodeID]
+	if node == nil {
+		return
+	}
+	node.ActiveJobs = nil
+	node.AllocatedGPUs = 0
+	for _, job := range s.state.Jobs {
+		if job.AssignedNode == nodeID && activeJob(job.Status) {
+			node.ActiveJobs = append(node.ActiveJobs, job.ID)
+			if s.gpuGranularScheduling {
+				node.AllocatedGPUs += len(job.AllocatedGPUs)
+			} else {
+				node.AllocatedGPUs = node.GPUCount
+			}
+		}
+	}
+	sort.Strings(node.ActiveJobs)
+	node.Busy = len(node.ActiveJobs) > 0
+	node.CurrentJob = ""
+	if len(node.ActiveJobs) > 0 {
+		node.CurrentJob = node.ActiveJobs[0]
+	}
+}
+
 func eligible(j *model.Job, n *model.Node, now time.Time, offlineAfter time.Duration) bool {
-	if n.Busy || now.Sub(n.LastHeartbeat) > offlineAfter {
+	if now.Sub(n.LastHeartbeat) > offlineAfter {
 		return false
 	}
 	r := j.Requirements
@@ -594,16 +665,25 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 	for _, j := range jobs {
 		var best *model.Node
 		for _, n := range s.state.Nodes {
-			if eligible(j, n, now, offlineAfter) && betterNode(j.Strategy, n, best) {
+			capacityAvailable := !n.Busy
+			if s.gpuGranularScheduling {
+				capacityAvailable = len(s.availableGPUsLocked(n, j.Requirements.GPUCount)) == j.Requirements.GPUCount
+			}
+			if capacityAvailable && eligible(j, n, now, offlineAfter) && betterNode(j.Strategy, n, best) {
 				best = n
 			}
 		}
 		if best == nil {
 			continue
 		}
-		best.Busy, best.CurrentJob = true, j.ID
+		if s.gpuGranularScheduling {
+			j.AllocatedGPUs = s.availableGPUsLocked(best, j.Requirements.GPUCount)
+		} else {
+			j.AllocatedGPUs = nil
+		}
 		j.Status, j.AssignedNode, j.UpdatedAt = model.JobAssigned, best.ID, now
 		j.Attempts++
+		s.refreshNodeUsageLocked(best.ID)
 		changed = true
 	}
 	if changed {
@@ -621,19 +701,27 @@ func (s *Store) NextJob(nodeID string) (*model.Job, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if n.CurrentJob == "" {
-		return nil, nil
-	}
-	j, ok := s.state.Jobs[n.CurrentJob]
-	if !ok {
-		before := cloneSnapshot(s.state)
-		n.Busy, n.CurrentJob = false, ""
-		if err := s.commitLocked(before); err != nil {
-			return nil, err
+	_ = n
+	var j *model.Job
+	for _, candidate := range s.state.Jobs {
+		claimedAt, claimed := s.claimedJobs[candidate.ID]
+		if claimed && time.Since(claimedAt) >= 30*time.Second {
+			delete(s.claimedJobs, candidate.ID)
+			claimed = false
 		}
+		if candidate.AssignedNode != nodeID || (candidate.Status != model.JobAssigned && candidate.Status != model.JobCanceling) || claimed {
+			continue
+		}
+		if j == nil || candidate.CreatedAt.Before(j.CreatedAt) {
+			j = candidate
+		}
+	}
+	if j == nil {
 		return nil, nil
 	}
+	s.claimedJobs[j.ID] = time.Now()
 	copy := *j
+	copy.AllocatedGPUs = append([]int(nil), j.AllocatedGPUs...)
 	return &copy, nil
 }
 
@@ -654,22 +742,20 @@ func (s *Store) UpdateJob(id, nodeID string, in model.JobUpdate) (*model.Job, er
 		if j.Status != model.JobAssigned {
 			return nil, errors.New("job is not assigned")
 		}
+		delete(s.claimedJobs, j.ID)
 		j.Status, j.StartedAt = model.JobRunning, &now
 	case model.JobSucceeded:
 		if j.Status != model.JobRunning && j.Status != model.JobAssigned {
 			return nil, errors.New("job is not running")
 		}
 		j.Status, j.FinishedAt = model.JobSucceeded, &now
-		if n := s.state.Nodes[nodeID]; n != nil {
-			n.Busy, n.CurrentJob = false, ""
-		}
+		delete(s.claimedJobs, j.ID)
 	case model.JobFailed:
-		if n := s.state.Nodes[nodeID]; n != nil {
-			n.Busy, n.CurrentJob = false, ""
-		}
+		delete(s.claimedJobs, j.ID)
 		j.FinishedAt = &now
 		if j.Attempts <= j.MaxRetries {
 			j.Status, j.AssignedNode = model.JobQueued, ""
+			j.AllocatedGPUs = nil
 			j.StartedAt, j.FinishedAt = nil, nil
 		} else {
 			j.Status = model.JobFailed
@@ -679,13 +765,38 @@ func (s *Store) UpdateJob(id, nodeID string, in model.JobUpdate) (*model.Job, er
 			return nil, errors.New("job is not canceling")
 		}
 		j.Status, j.FinishedAt = model.JobCanceled, &now
-		if n := s.state.Nodes[nodeID]; n != nil {
-			n.Busy, n.CurrentJob = false, ""
-		}
+		delete(s.claimedJobs, j.ID)
 	default:
 		return nil, errors.New("unsupported status transition")
 	}
 	j.Output, j.Error, j.UpdatedAt = in.Output, in.Error, now
+	s.refreshNodeUsageLocked(nodeID)
+	if err := s.commitLocked(before); err != nil {
+		return nil, err
+	}
+	copy := *j
+	return &copy, nil
+}
+
+func (s *Store) UpdateJobOutput(id, nodeID, output string) (*model.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.state.Jobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if j.AssignedNode != nodeID {
+		return nil, errors.New("job is not assigned to this node")
+	}
+	if j.Status != model.JobRunning && j.Status != model.JobCanceling {
+		return nil, errors.New("job is not running")
+	}
+	if len(output) > 64<<10 {
+		output = output[len(output)-(64<<10):]
+	}
+	before := cloneSnapshot(s.state)
+	j.Output = output
+	j.UpdatedAt = time.Now().UTC()
 	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}

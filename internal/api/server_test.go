@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,13 @@ import (
 	"gpuflow/internal/model"
 	"gpuflow/internal/store"
 )
+
+type testImagePublisher struct{}
+
+func (testImagePublisher) Publish(_ context.Context, output io.Writer, image string) (string, error) {
+	_, _ = io.WriteString(output, "image pushed")
+	return "registry.example.com/" + image, nil
+}
 
 func request(t *testing.T, server *httptest.Server, method, path string, body any, out any) int {
 	t.Helper()
@@ -47,12 +55,14 @@ func request(t *testing.T, server *httptest.Server, method, path string, body an
 func TestBuildTaskImageOverHTTP(t *testing.T) {
 	state := store.NewMemory()
 	handler := New(state, "test-token")
-	handler.images.run = func(_ context.Context, name string, args ...string) ([]byte, error) {
+	handler.images.run = func(_ context.Context, output io.Writer, name string, args ...string) error {
 		if name != "docker" || len(args) < 4 || args[0] != "build" {
 			t.Fatalf("unexpected build command: %s %v", name, args)
 		}
-		return []byte("image built"), nil
+		_, _ = io.WriteString(output, "image built")
+		return nil
 	}
+	handler.images.publisher = testImagePublisher{}
 	server := httptest.NewServer(handler.Handler())
 	defer server.Close()
 
@@ -86,9 +96,16 @@ func TestBuildTaskImageOverHTTP(t *testing.T) {
 		if status := request(t, server, http.MethodGet, "/v1/task-images", nil, &images); status != http.StatusOK {
 			t.Fatalf("list returned %d", status)
 		}
-		if len(images) == 1 && images[0].Status == "ready" {
-			if images[0].Command != "python /workspace/smoke.py" || !strings.Contains(images[0].Log, "image built") {
-				t.Fatalf("unexpected image: %+v", images[0])
+		var built *TaskImage
+		for index := range images {
+			if images[index].Name == "registry.example.com/gpuflow-task/smoke:test" {
+				built = &images[index]
+				break
+			}
+		}
+		if built != nil && built.Status == "ready" {
+			if built.Command != "python /workspace/smoke.py" || !strings.Contains(built.Log, "image built") || !strings.Contains(built.Log, "image pushed") {
+				t.Fatalf("unexpected image: %+v", built)
 			}
 			break
 		}
@@ -96,6 +113,24 @@ func TestBuildTaskImageOverHTTP(t *testing.T) {
 			t.Fatalf("image did not become ready: %+v", images)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestLiveBuildLogIsVisibleWhileBuilding(t *testing.T) {
+	now := time.Now().UTC()
+	image := &TaskImage{ID: "img-live-log", Status: "building", CreatedAt: now, UpdatedAt: now}
+	builder := &ImageBuilder{images: map[string]*TaskImage{image.ID: image}}
+	output := &liveBuildLog{builder: builder, imageID: image.ID}
+
+	if _, err := io.WriteString(output, "Step 1/4 : FROM python:3.12-slim\n"); err != nil {
+		t.Fatal(err)
+	}
+	current, err := builder.Get(image.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(current.Log, "Step 1/4") || current.UpdatedAt.Before(now) {
+		t.Fatalf("live build output was not published: %+v", current)
 	}
 }
 
@@ -202,6 +237,12 @@ func TestJobLifecycleOverHTTP(t *testing.T) {
 
 	if status := request(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id=local-1", model.JobUpdate{Status: model.JobRunning}, &job); status != http.StatusOK {
 		t.Fatalf("running update returned %d", status)
+	}
+	if status := request(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/logs?node_id=local-1", model.JobLogUpdate{Output: "epoch 1/10"}, &job); status != http.StatusOK {
+		t.Fatalf("live log update returned %d", status)
+	}
+	if job.Status != model.JobRunning || job.Output != "epoch 1/10" {
+		t.Fatalf("live log changed job incorrectly: %+v", job)
 	}
 	if status := request(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id=local-1", model.JobUpdate{Status: model.JobSucceeded, Output: "done"}, &job); status != http.StatusOK {
 		t.Fatalf("success update returned %d", status)
