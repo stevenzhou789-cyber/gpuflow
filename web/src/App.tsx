@@ -402,7 +402,7 @@ function Overview({
   const recent = jobs.slice(0, 5);
   return (
     <>
-      <section className="metrics">
+      <section className={`metrics ${edition.features.cost_analytics ? "" : "community"}`}>
         <Metric
           label="运行中任务"
           value={metrics.active}
@@ -421,20 +421,14 @@ function Overview({
           note={`基于 ${jobs.length} 次执行`}
           tone="amber"
         />
-        <Metric
-          label="平均运行时长"
-          value={
-            edition.features.cost_analytics
-              ? `${(insights?.average_runtime_minutes || 0).toFixed(1)}m`
-              : "Enterprise"
-          }
-          note={
-            edition.features.cost_analytics
-              ? insights?.recommendation || "正在生成运行洞察"
-              : "升级后查看成本洞察"
-          }
-          tone="purple"
-        />
+        {edition.features.cost_analytics && (
+          <Metric
+            label="平均运行时长"
+            value={`${(insights?.average_runtime_minutes || 0).toFixed(1)}m`}
+            note={insights?.recommendation || "正在生成运行洞察"}
+            tone="purple"
+          />
+        )}
       </section>
       <section className="grid-main">
         <div className="panel">
