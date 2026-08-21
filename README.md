@@ -151,7 +151,7 @@ GPUFLOW_PUBLIC_URL=http://127.0.0.1:18080
 
 GPUFlow 不区分“CLI 程序”和“Agent 程序”。控制端、Agent 和命令行工具都由同一个 `gpuflow` 可执行文件提供，通过 `server`、`agent`、`submit` 等子命令选择运行模式。
 
-Windows x64 节点可以从 [GPUFlow stable Release](https://github.com/stevenzhou789-cyber/gpuflow/releases/tag/stable) 下载 `gpuflow-windows-amd64.zip`，解压后得到 `gpuflow.exe`。也可以在源码根目录自行构建：
+Windows x64 节点可以从 [GPUFlow Releases](https://github.com/stevenzhou789-cyber/gpuflow/releases) 下载所需 `v*` 版本的 `gpuflow-windows-amd64.zip`，解压后得到 `gpuflow.exe`。也可以在源码根目录自行构建：
 
 ```powershell
 New-Item -ItemType Directory -Force .\bin
@@ -191,43 +191,43 @@ Windows Agent 的启动方式如下；实际使用时，应优先复制控制台
 | 部署环境 | 推荐获取方式 | 使用的程序或镜像 |
 | --- | --- | --- |
 | 本机源码体验 | 执行 `docker compose up --build -d`，由 Compose 从当前源码构建 | `gpuflow:local` |
-| 可访问互联网的 Linux 节点 | 从 GHCR 拉取滚动稳定镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:stable` |
-| 多节点或企业内网 | 将 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:stable` |
+| 可访问互联网的 Linux 节点 | 从 GHCR 拉取明确的版本镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0` |
+| 多节点或企业内网 | 将同一版本的 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:v1.0.0` |
 | 无法访问外网的离线节点 | 在联网机器拉取对应架构镜像，使用 `docker save` 导出后传入离线环境并执行 `docker load` | 导入后的本地镜像标签 |
-| Windows 原生 Agent | 下载 stable Release 中的 Windows 压缩包，或使用 Go 从源码构建 | `gpuflow.exe`，不需要 Agent 镜像 |
+| Windows 原生 Agent | 下载对应 `v*` Release 中的 Windows 压缩包，或使用 Go 从源码构建 | `gpuflow.exe`，不需要 Agent 镜像 |
 | 修改源码后的自定义部署 | 在仓库根目录执行 `docker build` | 自定义镜像标签 |
 
 可联网的 Linux/Docker 环境直接拉取：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
 ```
 
 同步到私有仓库：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
-docker tag ghcr.io/stevenzhou789-cyber/gpuflow:stable \
-  harbor.example.com/gpuflow/gpuflow:stable
-docker push harbor.example.com/gpuflow/gpuflow:stable
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
+docker tag ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 \
+  harbor.example.com/gpuflow/gpuflow:v1.0.0
+docker push harbor.example.com/gpuflow/gpuflow:v1.0.0
 ```
 
 同步完成后，在控制端 `.env` 中设置镜像地址，Web 控制台生成的 Docker Agent 命令就会使用该地址：
 
 ```env
-GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:stable
+GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:v1.0.0
 ```
 
 离线环境应明确选择目标 CPU 架构。以下示例导出 Linux amd64 镜像：
 
 ```bash
 # 在可联网机器执行
-docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:stable
-docker save -o gpuflow-stable-linux-amd64.tar \
-  ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
+docker save -o gpuflow-v1.0.0-linux-amd64.tar \
+  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
 
 # 将 tar 文件复制到离线节点后执行
-docker load -i gpuflow-stable-linux-amd64.tar
+docker load -i gpuflow-v1.0.0-linux-amd64.tar
 ```
 
 ARM64 节点将 `linux/amd64` 改为 `linux/arm64`。如果修改过源码，可以在仓库根目录构建本地镜像：
@@ -249,7 +249,7 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts \
   -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \
-  ghcr.io/stevenzhou789-cyber/gpuflow:stable agent \
+  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 agent \
   -server "http://control-plane.example.com:8080" \
   -token "replace-with-your-token" \
   -id "lab-gpu-01" \
@@ -263,7 +263,7 @@ docker run -d \
   -executor docker
 ```
 
-正式节点直接使用滚动更新的 `stable`；与控制端共用 Docker 的本地开发节点可以使用 Compose 自动构建的 `gpuflow:local`。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
+正式节点应使用明确的 `v*` 版本、`sha-*` 镜像或 Digest；与控制端共用 Docker 的本地开发节点可以使用 Compose 自动构建的 `gpuflow:local`。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
 
 Agent 应使用稳定且唯一的 `-id`。任务执行期间 Agent 会持续发送心跳。同一 ID 的 Agent 重启后，会在剩余重试预算内清理遗留容器并从头重新执行中断的任务，同时记录恢复次数；预算耗尽时任务会直接失败。因此任务脚本应尽量保持幂等。
 
@@ -336,7 +336,7 @@ GPU 检测示例 [examples/gpu-smoke.py](examples/gpu-smoke.py) 应选择 **PyTo
 | `GPUFLOW_ADDR` | `:8080` | HTTP 监听地址 |
 | `GPUFLOW_TOKEN` | 空 | API Bearer Token；对外部署时必须设置 |
 | `GPUFLOW_PUBLIC_URL` | 当前页面来源 | Agent 命令使用的控制面公开地址 |
-| `GPUFLOW_AGENT_IMAGE` | `gpuflow:local` | 接入页面生成 Docker Agent 命令时使用的镜像名；远程节点使用 GHCR `stable` |
+| `GPUFLOW_AGENT_IMAGE` | `gpuflow:local` | 接入页面生成 Docker Agent 命令时使用的镜像名；远程节点应设为明确版本或 Digest |
 | `GPUFLOW_MYSQL_DSN` | 无 | 必填；任务、节点和任务镜像记录使用的 MySQL DSN |
 | `GPUFLOW_S3_ENDPOINT` | 无 | 必填；MinIO/S3 兼容对象存储地址 |
 | `GPUFLOW_S3_ACCESS_KEY` | 无 | 必填；对象存储 Access Key |
@@ -379,18 +379,18 @@ docker compose up --build -d
 仓库内置 GitHub Actions 工作流，不需要在开发机手工制作发布产物：
 
 - Pull Request 会运行 Go 测试、构建 Web，并验证 Docker 镜像能够构建，但不会发布。
-- 推送到 `main` 会覆盖发布 `linux/amd64`、`linux/arm64` 的 `ghcr.io/stevenzhou789-cyber/gpuflow:stable`。
-- 发布完成后会保留当前多架构镜像及其平台清单，并删除 GHCR 中其余历史版本。
-- 同一次工作流会移动滚动的 `stable` Git 标签，并创建或更新同名 GitHub Release。
-- Release 固定提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`，不会累积版本标签。
+- 推送到 `main` 会发布 `linux/amd64`、`linux/arm64` 的 `sha-<commit>` 镜像。
+- 推送 `v*` Git 标签会额外发布同名镜像，并创建或更新对应的 GitHub Release。
+- 版本化 Release 提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`。
+- 已发布的版本镜像保留在 GHCR，便于回滚和审计。
 
 推送完成后可以直接拉取：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
 ```
 
-工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release，不需要额外创建个人访问令牌。`stable` 是滚动标签，每次 `main` 发布都会替换原内容，因此部署前应先在测试节点验证。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置；如果包并非由本仓库工作流首次创建，还要在包的 **Manage Actions access** 中授予本仓库 Admin 权限，历史版本清理才会生效。
+工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release，不需要额外创建个人访问令牌。生产部署建议记录镜像 Digest，获得比版本标签更严格的产物固定。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置。
 
 ## 从源码开发
 

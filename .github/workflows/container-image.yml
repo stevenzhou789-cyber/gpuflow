@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
     paths:
       - ".github/workflows/container-image.yml"
@@ -56,7 +58,8 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           flavor: latest=false
           tags: |
-            type=raw,value=stable,enable=${{ github.event_name != 'pull_request' }}
+            type=sha,format=short
+            type=ref,event=tag
 
       - name: Build and publish multi-platform image
         id: push
@@ -72,45 +75,8 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Delete historical package versions
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          IMAGE_NAME: ${{ steps.image.outputs.name }}
-          CURRENT_DIGEST: ${{ steps.push.outputs.digest }}
-          OWNER: ${{ github.repository_owner }}
-          OWNER_TYPE: ${{ github.event.repository.owner.type }}
-          PACKAGE: ${{ github.event.repository.name }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          preserve="$(mktemp)"
-          versions="$(mktemp)"
-          printf '%s\n' "$CURRENT_DIGEST" > "$preserve"
-          docker buildx imagetools inspect "$IMAGE_NAME@$CURRENT_DIGEST" --raw \
-            | jq -r '.manifests[]?.digest' >> "$preserve"
-          sort -u -o "$preserve" "$preserve"
-
-          if [ "$OWNER_TYPE" = "Organization" ]; then
-            endpoint="orgs/$OWNER/packages/container/$PACKAGE/versions"
-          else
-            endpoint="users/$OWNER/packages/container/$PACKAGE/versions"
-          fi
-          gh api --paginate "$endpoint?per_page=100" \
-            --jq '.[] | [.id, .name] | @tsv' > "$versions"
-
-          if ! cut -f2 "$versions" | grep -Fxq "$CURRENT_DIGEST"; then
-            echo "Current image digest was not found in the package version list; refusing cleanup." >&2
-            exit 1
-          fi
-          while IFS=$'\t' read -r id digest; do
-            if [ -n "$id" ] && ! grep -Fxq "$digest" "$preserve"; then
-              gh api --method DELETE "$endpoint/$id"
-            fi
-          done < "$versions"
-
   release:
-    if: github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -160,32 +126,17 @@ jobs:
           cd dist
           sha256sum ./*.tar.gz ./*.zip > checksums.txt
 
-      - name: Move stable release tag
+      - name: Create or update versioned GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/stable" >/dev/null 2>&1; then
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/stable" \
-              -f sha="$GITHUB_SHA" \
-              -F force=true >/dev/null
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/*.zip dist/*.tar.gz dist/checksums.txt --clobber
           else
-            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/tags/stable" \
-              -f sha="$GITHUB_SHA" >/dev/null
-          fi
-
-      - name: Create or update stable GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if gh release view stable >/dev/null 2>&1; then
-            gh release upload stable dist/* --clobber
-          else
-            gh release create stable dist/* \
+            gh release create "$VERSION" dist/*.zip dist/*.tar.gz dist/checksums.txt \
               --generate-notes \
-              --title "GPUFlow stable"
+              --title "GPUFlow $VERSION"
           fi
