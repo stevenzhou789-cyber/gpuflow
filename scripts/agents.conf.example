@@ -1,0 +1,4 @@
+# One node per line: SSH target|absolute Agent installation directory
+# Configure SSH keys/ProxyJump in ~/.ssh/config rather than placing secrets here.
+ops@gpu-01|/opt/gpuflow-agent
+ops@gpu-02|/opt/gpuflow-agent

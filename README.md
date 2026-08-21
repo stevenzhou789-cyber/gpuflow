@@ -120,6 +120,73 @@ GPUFLOW_S3_USE_SSL=false
 
 MySQL 和 MinIO/S3 都是必需依赖。MySQL DSN、S3 endpoint 或 S3 access/secret key 缺失，或者服务连接失败时，控制面会拒绝启动。
 
+## 原地升级与回滚
+
+正式部署使用不可变的 `v*` 镜像后，可以在控制面服务器执行一条命令完成原地升级：
+
+```bash
+./scripts/upgrade.sh v1.0.1
+```
+
+脚本会先确认目标镜像存在，把 `.env`、`compose.yaml` 和 MySQL 备份到 `.gpuflow/backups/`，然后替换控制面容器并检查 `/healthz`。MySQL 与 MinIO Volume 不会被删除。健康检查失败时会自动切回原控制面镜像，但不会自动覆盖数据库。
+
+默认镜像仓库为 `ghcr.io/stevenzhou789-cyber/gpuflow`。使用企业私有仓库时可以指定：
+
+```bash
+./scripts/upgrade.sh v1.0.1 \
+  --image-repository harbor.example.com/gpuflow/gpuflow
+```
+
+### 集中升级 Agent
+
+要让控制面服务器逐台升级 Linux/Docker Agent，节点应使用 [deploy/agent/compose.yaml](deploy/agent/compose.yaml) 管理，而不是保留一条无法可靠还原参数的临时 `docker run` 命令。在每个节点初始化一次：
+
+```bash
+sudo mkdir -p /opt/gpuflow-agent
+sudo cp deploy/agent/compose.yaml deploy/agent/.env.example /opt/gpuflow-agent/
+sudo chown -R "$USER":"$USER" /opt/gpuflow-agent
+cd /opt/gpuflow-agent
+sudo mv .env.example .env
+# 编辑 .env 中的控制面地址、Token、节点 ID 和 GPU 信息
+docker compose up -d
+```
+
+在控制面复制节点清单并填写 SSH 地址：
+
+```bash
+cp scripts/agents.conf.example scripts/agents.conf
+```
+
+清单格式为 `SSH目标|Agent安装目录`：
+
+```text
+ops@gpu-01|/opt/gpuflow-agent
+ops@gpu-02|/opt/gpuflow-agent
+```
+
+SSH 密钥、堡垒机和 `ProxyJump` 应配置在控制面服务器的 `~/.ssh/config`，不要把密码或私钥写进清单。存在 `scripts/agents.conf` 时，`upgrade.sh` 会在控制面升级成功后逐台升级 Agent；未配置清单时只升级控制面。节点上仍有带 `gpuflow.job` 标签的运行任务时，脚本会停止并保留该节点当前版本，不会中断任务。处理完任务后重新执行同一升级命令即可。
+
+只升级控制面或只升级 Agent：
+
+```bash
+./scripts/upgrade.sh v1.0.1 --skip-agents
+./scripts/upgrade-agents.sh v1.0.1
+```
+
+程序版本回滚同样从控制面执行：
+
+```bash
+./scripts/rollback.sh v1.0.0
+```
+
+回滚脚本只切换控制面和 Agent 镜像，不恢复 MySQL 或 MinIO 数据。跨越不兼容数据库迁移之前，应先根据对应版本的升级说明判断旧程序是否能够读取当前数据库；需要恢复数据库备份时必须单独安排维护窗口，并接受备份时间点之后的数据会丢失。
+
+脚本需要 Linux、Bash、Docker Compose v2；批量升级还需要控制面能够使用 SSH 公钥登录节点。交付 ZIP 解压后如果脚本没有执行权限，先运行：
+
+```bash
+chmod +x scripts/*.sh
+```
+
 ## 接入真实 GPU 节点
 
 目标主机需要具备：
@@ -382,6 +449,7 @@ docker compose up --build -d
 - 推送到 `main` 会发布 `linux/amd64`、`linux/arm64` 的 `sha-<commit>` 镜像。
 - 推送 `v*` Git 标签会额外发布同名镜像，并创建或更新对应的 GitHub Release。
 - 版本化 Release 提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`。
+- 版本化 Release 还会生成 `gpuflow-deployment-v*.tar.gz`，其中包含面向客户运维的独立 `README.md`、Compose、升级/回滚脚本和 Agent 部署模板。
 - 已发布的版本镜像保留在 GHCR，便于回滚和审计。
 
 推送完成后可以直接拉取：

@@ -123,6 +123,17 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o build/gpuflow.exe ./cmd/gpuflow
           zip -j "dist/gpuflow-windows-amd64.zip" build/gpuflow.exe
 
+          package_dir="build/gpuflow-deployment-${GITHUB_REF_NAME}"
+          mkdir -p "$package_dir"
+          cp compose.yaml .env.example LICENSE "$package_dir/"
+          cp deploy/README.md "$package_dir/README.md"
+          cp README.md "$package_dir/PROJECT-README.md"
+          cp -R scripts deploy "$package_dir/"
+          chmod +x "$package_dir"/scripts/*.sh
+          printf '%s\n' "$GITHUB_REF_NAME" > "$package_dir/VERSION"
+          tar -C build -czf "dist/gpuflow-deployment-${GITHUB_REF_NAME}.tar.gz" \
+            "gpuflow-deployment-${GITHUB_REF_NAME}"
+
           cd dist
           sha256sum ./*.tar.gz ./*.zip > checksums.txt
 

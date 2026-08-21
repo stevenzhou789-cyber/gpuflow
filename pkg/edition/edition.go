@@ -15,7 +15,7 @@ type Descriptor struct {
 func Community() Descriptor {
 	return Descriptor{
 		Name:       "community",
-		AgentImage: "gpuflow:latest",
+		AgentImage: "gpuflow:local",
 		Features: map[string]bool{
 			"basic_scheduler": true,
 			"cost_analytics":  false,

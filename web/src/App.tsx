@@ -1238,10 +1238,10 @@ function ConnectNode({
                   setAgentImage(event.target.value);
                   setCopied(false);
                 }}
-                placeholder="ghcr.io/owner/gpuflow:stable"
+                placeholder="ghcr.io/owner/gpuflow:v1.0.0"
               />
               <small>
-                远程节点使用 GHCR stable；本地构建可使用
+                远程节点使用固定版本或 Digest；本地构建可使用
                 gpuflow:local。
               </small>
             </label>

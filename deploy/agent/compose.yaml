@@ -1,0 +1,21 @@
+services:
+  agent:
+    image: ${GPUFLOW_AGENT_IMAGE:?set GPUFLOW_AGENT_IMAGE in .env}
+    command: ["agent"]
+    environment:
+      GPUFLOW_SERVER: ${GPUFLOW_SERVER:?set GPUFLOW_SERVER in .env}
+      GPUFLOW_TOKEN: ${GPUFLOW_TOKEN:?set GPUFLOW_TOKEN in .env}
+      GPUFLOW_NODE_ID: ${GPUFLOW_NODE_ID:?set GPUFLOW_NODE_ID in .env}
+      GPUFLOW_NODE_NAME: ${GPUFLOW_NODE_NAME:-local-agent}
+      GPUFLOW_PROVIDER: ${GPUFLOW_PROVIDER:-local}
+      GPUFLOW_POOL: ${GPUFLOW_POOL:-default}
+      GPUFLOW_GPU_MODEL: ${GPUFLOW_GPU_MODEL:-generic}
+      GPUFLOW_GPU_COUNT: ${GPUFLOW_GPU_COUNT:-1}
+      GPUFLOW_VRAM_GB: ${GPUFLOW_VRAM_GB:-24}
+      GPUFLOW_HOURLY_PRICE: ${GPUFLOW_HOURLY_PRICE:-0}
+      GPUFLOW_EXECUTOR: docker
+      GPUFLOW_ARTIFACT_WORKDIR: /var/lib/gpuflow/artifacts
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts
+    restart: unless-stopped

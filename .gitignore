@@ -7,4 +7,8 @@
 /web/vite.config.d.ts
 .vscode/
 .env
+deploy/agent/.env
+scripts/agents.conf
+.gpuflow/
+/.issuer/
 *.exe
