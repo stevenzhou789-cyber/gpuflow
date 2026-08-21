@@ -147,6 +147,97 @@ GPUFLOW_PUBLIC_URL=http://127.0.0.1:18080
 
 默认值适合本机体验。部署到其他机器后，请由部署者改成节点实际可访问的地址。
 
+### 获取 GPUFlow Agent
+
+GPUFlow 不区分“CLI 程序”和“Agent 程序”。控制端、Agent 和命令行工具都由同一个 `gpuflow` 可执行文件提供，通过 `server`、`agent`、`submit` 等子命令选择运行模式。
+
+Windows x64 节点可以从 [GPUFlow stable Release](https://github.com/stevenzhou789-cyber/gpuflow/releases/tag/stable) 下载 `gpuflow-windows-amd64.zip`，解压后得到 `gpuflow.exe`。也可以在源码根目录自行构建：
+
+```powershell
+New-Item -ItemType Directory -Force .\bin
+go build -trimpath -o .\bin\gpuflow.exe .\cmd\gpuflow
+```
+
+Linux 节点从源码构建：
+
+```bash
+mkdir -p bin
+go build -trimpath -o ./bin/gpuflow ./cmd/gpuflow
+```
+
+Windows Agent 的启动方式如下；实际使用时，应优先复制控制台生成的命令，并确保 Token 与控制端 `.env` 中的 `GPUFLOW_TOKEN` 完全一致：
+
+```powershell
+.\gpuflow.exe agent `
+  -server "http://127.0.0.1:18080" `
+  -token "与 .env 中 GPUFLOW_TOKEN 相同的值" `
+  -id "local-gpu-01" `
+  -name "local-gpu-01" `
+  -provider local `
+  -pool local `
+  -gpu-model "RTX-3050-Laptop" `
+  -gpu-count 1 `
+  -vram 4 `
+  -hourly-price 0 `
+  -executor docker
+```
+
+可执行文件路径应写成 `.\gpuflow.exe`，不能写成 `.\gpuflow\.exe`。`-server` 后面必须是纯 URL；远程节点不能使用 `127.0.0.1`，应改为控制端所在机器的局域网 IP、域名或公网 HTTPS 地址。
+
+### 不同部署环境的程序与镜像获取
+
+`gpuflow` 系统镜像既可以运行控制端，也可以通过 `agent` 子命令运行容器化 Agent。应根据部署环境选择获取方式：
+
+| 部署环境 | 推荐获取方式 | 使用的程序或镜像 |
+| --- | --- | --- |
+| 本机源码体验 | 执行 `docker compose up --build -d`，由 Compose 从当前源码构建 | `gpuflow:local` |
+| 可访问互联网的 Linux 节点 | 从 GHCR 拉取滚动稳定镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:stable` |
+| 多节点或企业内网 | 将 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:stable` |
+| 无法访问外网的离线节点 | 在联网机器拉取对应架构镜像，使用 `docker save` 导出后传入离线环境并执行 `docker load` | 导入后的本地镜像标签 |
+| Windows 原生 Agent | 下载 stable Release 中的 Windows 压缩包，或使用 Go 从源码构建 | `gpuflow.exe`，不需要 Agent 镜像 |
+| 修改源码后的自定义部署 | 在仓库根目录执行 `docker build` | 自定义镜像标签 |
+
+可联网的 Linux/Docker 环境直接拉取：
+
+```bash
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
+```
+
+同步到私有仓库：
+
+```bash
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker tag ghcr.io/stevenzhou789-cyber/gpuflow:stable \
+  harbor.example.com/gpuflow/gpuflow:stable
+docker push harbor.example.com/gpuflow/gpuflow:stable
+```
+
+同步完成后，在控制端 `.env` 中设置镜像地址，Web 控制台生成的 Docker Agent 命令就会使用该地址：
+
+```env
+GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:stable
+```
+
+离线环境应明确选择目标 CPU 架构。以下示例导出 Linux amd64 镜像：
+
+```bash
+# 在可联网机器执行
+docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker save -o gpuflow-stable-linux-amd64.tar \
+  ghcr.io/stevenzhou789-cyber/gpuflow:stable
+
+# 将 tar 文件复制到离线节点后执行
+docker load -i gpuflow-stable-linux-amd64.tar
+```
+
+ARM64 节点将 `linux/amd64` 改为 `linux/arm64`。如果修改过源码，可以在仓库根目录构建本地镜像：
+
+```bash
+docker build -t gpuflow:local .
+```
+
+这里的 `gpuflow` 系统镜像与用户任务镜像不是同一个概念。系统镜像用于运行控制端或 Agent；任务镜像用于执行用户脚本。Community 在控制端本地构建任务镜像，多机部署时还需要把任务镜像推送到所有 Agent 都能访问的共享仓库，或者预先在每台节点上加载相同标签的任务镜像，否则远程 Agent 无法启动任务容器。
+
 ### Docker Agent 的运行方式
 
 Agent 需要访问宿主机 Docker，因此容器启动时通常要挂载 Docker Socket：
@@ -180,10 +271,9 @@ Agent 应使用稳定且唯一的 `-id`。任务执行期间 Agent 会持续发�
 
 最简单的方式是在 Web 控制台的 **任务** 页面创建任务。仓库也提供了一个 CPU 示例：[examples/job.json](examples/job.json)。
 
-从源码构建 CLI 后，可以这样提交：
+获取或构建上述完整 GPUFlow 程序后，也可以通过同一个可执行文件提交任务：
 
 ```bash
-go build -o bin/gpuflow ./cmd/gpuflow
 ./bin/gpuflow submit \
   -server http://localhost:18080 \
   -token "与 .env 中 GPUFLOW_TOKEN 相同的值" \
@@ -310,7 +400,7 @@ docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
 - Node.js 22+
 - npm
 
-构建 Web 前端并运行测试：
+构建 Web 前端、运行测试并生成完整 GPUFlow 程序：
 
 ```bash
 cd web
@@ -318,7 +408,16 @@ npm ci
 npm run build
 cd ..
 go test ./...
-go build -o bin/gpuflow ./cmd/gpuflow
+go build -trimpath -o bin/gpuflow ./cmd/gpuflow
+```
+
+Windows PowerShell 使用 `.exe` 文件名：
+
+```powershell
+npm --prefix web ci
+npm --prefix web run build
+go test ./...
+go build -trimpath -o .\bin\gpuflow.exe .\cmd\gpuflow
 ```
 
 启动控制面：
