@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +25,10 @@ type testImagePublisher struct{}
 func (testImagePublisher) Publish(_ context.Context, output io.Writer, image string) (string, error) {
 	_, _ = io.WriteString(output, "image pushed")
 	return "registry.example.com/" + image, nil
+}
+
+func (testImagePublisher) PublishedImageName(image string) string {
+	return "registry.example.com/" + image
 }
 
 func request(t *testing.T, server *httptest.Server, method, path string, body any, out any) int {
@@ -113,6 +119,75 @@ func TestBuildTaskImageOverHTTP(t *testing.T) {
 			t.Fatalf("image did not become ready: %+v", images)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+
+	var duplicatePayload bytes.Buffer
+	duplicateWriter := multipart.NewWriter(&duplicatePayload)
+	_ = duplicateWriter.WriteField("runtime", "python")
+	_ = duplicateWriter.WriteField("image", "gpuflow-task/smoke:test")
+	duplicateFile, err := duplicateWriter.CreateFormFile("script", "smoke.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = duplicateFile.Write([]byte("print('duplicate')\n"))
+	_ = duplicateWriter.Close()
+
+	duplicateRequest, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/task-images/build", &duplicatePayload)
+	duplicateRequest.Header.Set("Authorization", "Bearer test-token")
+	duplicateRequest.Header.Set("Content-Type", duplicateWriter.FormDataContentType())
+	duplicateResponse, err := http.DefaultClient.Do(duplicateRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer duplicateResponse.Body.Close()
+	if duplicateResponse.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate build returned %d, want %d", duplicateResponse.StatusCode, http.StatusConflict)
+	}
+}
+
+func TestReserveTaskImageNameIsAtomic(t *testing.T) {
+	builder := &ImageBuilder{
+		images:    make(map[string]*TaskImage),
+		store:     store.NewMemory(),
+		publisher: testImagePublisher{},
+	}
+
+	const attempts = 8
+	start := make(chan struct{})
+	results := make(chan error, attempts)
+	var workers sync.WaitGroup
+	for index := range attempts {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			now := time.Now().UTC()
+			results <- builder.reserve(&TaskImage{
+				ID:        fmt.Sprintf("img-%d", index),
+				Name:      "gpuflow-task/concurrent:v1",
+				Status:    "building",
+				CreatedAt: now,
+				UpdatedAt: now,
+			})
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	accepted, conflicts := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			accepted++
+		case errors.Is(err, errTaskImageNameConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected reserve error: %v", err)
+		}
+	}
+	if accepted != 1 || conflicts != attempts-1 {
+		t.Fatalf("accepted=%d conflicts=%d, want 1 and %d", accepted, conflicts, attempts-1)
 	}
 }
 

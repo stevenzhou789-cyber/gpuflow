@@ -37,13 +37,18 @@ var (
 		"cuda12":  "nvidia/cuda:12.0.1-base-ubuntu22.04",
 		"pytorch": "pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime",
 	}
-	errTaskImageBuilding = errors.New("task image is still building")
+	errTaskImageBuilding     = errors.New("task image is still building")
+	errTaskImageNameConflict = errors.New("task image name already exists")
 )
 
 type TaskImage = model.TaskImage
 
 type ImagePublisher interface {
 	Publish(context.Context, io.Writer, string) (string, error)
+}
+
+type publishedImageNameResolver interface {
+	PublishedImageName(string) string
 }
 
 type ImageBuilder struct {
@@ -173,6 +178,28 @@ func (b *ImageBuilder) Get(id string) (TaskImage, error) {
 		return TaskImage{}, store.ErrNotFound
 	}
 	return *image, nil
+}
+
+func (b *ImageBuilder) reserve(image *TaskImage) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	names := map[string]struct{}{image.Name: {}}
+	if resolver, ok := b.publisher.(publishedImageNameResolver); ok {
+		if publishedName := resolver.PublishedImageName(image.Name); publishedName != "" {
+			names[publishedName] = struct{}{}
+		}
+	}
+	for _, existing := range b.images {
+		if _, exists := names[existing.Name]; exists {
+			return errTaskImageNameConflict
+		}
+	}
+	if err := b.store.SaveTaskImage(*image); err != nil {
+		return err
+	}
+	b.images[image.ID] = image
+	return nil
 }
 
 func (b *ImageBuilder) Delete(id string) error {
@@ -324,13 +351,11 @@ func (s *Server) buildTaskImage(w http.ResponseWriter, r *http.Request) {
 		command = "python /workspace/" + filename
 	}
 	image := &TaskImage{ID: id, Name: imageName, Runtime: runtimeName, BaseImage: baseImage, Filename: filename, Command: command, Status: "building", CreatedAt: now, UpdatedAt: now}
-	s.images.mu.Lock()
-	s.images.images[id] = image
-	s.images.mu.Unlock()
-	if err := s.images.store.SaveTaskImage(*image); err != nil {
-		s.images.mu.Lock()
-		delete(s.images.images, id)
-		s.images.mu.Unlock()
+	if err := s.images.reserve(image); err != nil {
+		if errors.Is(err, errTaskImageNameConflict) {
+			writeError(w, http.StatusConflict, "task image name already exists; use a new tag")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "保存镜像构建记录失败: "+err.Error())
 		return
 	}
