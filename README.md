@@ -450,6 +450,7 @@ docker compose up --build -d
 - 推送 `v*` Git 标签会额外发布同名镜像，并创建或更新对应的 GitHub Release。
 - 版本化 Release 提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`。
 - 版本化 Release 还会生成 `gpuflow-deployment-v*.tar.gz`，其中包含面向客户运维的独立 `README.md`、Compose、升级/回滚脚本和 Agent 部署模板。
+- 发布镜像会按不可变 Digest 进行 Cosign 签名；Release 中的程序包和 `checksums.txt` 会附带 `.sigstore.json` 签名 bundle，并提供 `cosign.pub` 公钥。
 - 已发布的版本镜像保留在 GHCR，便于回滚和审计。
 
 推送完成后可以直接拉取：
@@ -459,6 +460,15 @@ docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
 ```
 
 工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release，不需要额外创建个人访问令牌。生产部署建议记录镜像 Digest，获得比版本标签更严格的产物固定。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置。
+
+下载 Release 中的 `cosign.pub` 和对应 bundle 后，可以验证镜像或安装包：
+
+```bash
+cosign verify --key cosign.pub ghcr.io/stevenzhou789-cyber/gpuflow@sha256:<digest>
+cosign verify-blob --key cosign.pub \
+  --bundle gpuflow-linux-amd64.tar.gz.sigstore.json \
+  gpuflow-linux-amd64.tar.gz
+```
 
 ## 从源码开发
 

@@ -75,6 +75,25 @@ jobs:
           provenance: false
           sbom: false
 
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Sign container image by digest
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
@@ -137,6 +156,25 @@ jobs:
           cd dist
           sha256sum ./*.tar.gz ./*.zip > checksums.txt
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Sign release artifacts
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign public-key --key env://COSIGN_PRIVATE_KEY > dist/cosign.pub
+          for artifact in dist/*.tar.gz dist/*.zip dist/checksums.txt; do
+            cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
+              --bundle "${artifact}.sigstore.json" \
+              "$artifact"
+          done
+
       - name: Create or update versioned GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -145,9 +183,14 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" dist/*.zip dist/*.tar.gz dist/checksums.txt --clobber
+            gh release upload "$VERSION" \
+              dist/*.zip dist/*.tar.gz dist/checksums.txt \
+              dist/*.sigstore.json dist/cosign.pub \
+              --clobber
           else
-            gh release create "$VERSION" dist/*.zip dist/*.tar.gz dist/checksums.txt \
+            gh release create "$VERSION" \
+              dist/*.zip dist/*.tar.gz dist/checksums.txt \
+              dist/*.sigstore.json dist/cosign.pub \
               --generate-notes \
               --title "GPUFlow $VERSION"
           fi
