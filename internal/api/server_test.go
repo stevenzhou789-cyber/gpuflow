@@ -18,6 +18,7 @@ import (
 	"gpuflow/internal/artifact"
 	"gpuflow/internal/model"
 	"gpuflow/internal/store"
+	"gpuflow/pkg/edition"
 )
 
 type testImagePublisher struct{}
@@ -284,6 +285,107 @@ func TestNodeSearchPaginationOverHTTP(t *testing.T) {
 	var page store.NodePage
 	if status := request(t, server, http.MethodGet, "/v1/nodes?page=1&page_size=1&q=4090", nil, &page); status != http.StatusOK || page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != "alpha-node" {
 		t.Fatalf("unexpected node page status=%d page=%+v", status, page)
+	}
+}
+
+func TestEnterpriseNodeCapacityOverHTTP(t *testing.T) {
+	state := store.NewMemory()
+	descriptor := edition.Community()
+	descriptor.Name = "enterprise"
+	descriptor.MaxNodes = 2
+	descriptor.MaxGPUs = 2
+	descriptor.MaxCPUCores = 8
+	server := httptest.NewServer(NewWithEdition(state, "test-token", descriptor).Handler())
+	defer server.Close()
+
+	missingCPU := model.Node{ID: "missing-cpu", GPUCount: 1}
+	if status := request(t, server, http.MethodPost, "/v1/nodes/register", missingCPU, nil); status != http.StatusForbidden {
+		t.Fatalf("missing CPU count returned %d", status)
+	}
+	first := model.Node{ID: "first", GPUCount: 1, CPUCores: 4}
+	if status := request(t, server, http.MethodPost, "/v1/nodes/register", first, &first); status != http.StatusOK {
+		t.Fatalf("first registration returned %d", status)
+	}
+	second := model.Node{ID: "second", GPUCount: 1, CPUCores: 4}
+	if status := request(t, server, http.MethodPost, "/v1/nodes/register", second, &second); status != http.StatusOK {
+		t.Fatalf("second registration returned %d", status)
+	}
+	third := model.Node{ID: "third", GPUCount: 0, CPUCores: 1}
+	if status := request(t, server, http.MethodPost, "/v1/nodes/register", third, nil); status != http.StatusForbidden {
+		t.Fatalf("node overage returned %d", status)
+	}
+	first.CPUCores = 5
+	if status := request(t, server, http.MethodPost, "/v1/nodes/register", first, nil); status != http.StatusForbidden {
+		t.Fatalf("CPU expansion overage returned %d", status)
+	}
+	first.CPUCores = 4
+	if status := request(t, server, http.MethodPost, "/v1/nodes/register", first, &first); status != http.StatusOK {
+		t.Fatalf("same-capacity reconnect returned %d", status)
+	}
+}
+
+func TestEnterpriseNodeCapacityAdmissionIsAtomic(t *testing.T) {
+	state := store.NewMemory()
+	descriptor := edition.Community()
+	descriptor.MaxNodes = 1
+	descriptor.MaxGPUs = 1
+	descriptor.MaxCPUCores = 1
+	server := httptest.NewServer(NewWithEdition(state, "test-token", descriptor).Handler())
+	defer server.Close()
+
+	const candidates = 8
+	start := make(chan struct{})
+	results := make(chan int, candidates)
+	errs := make(chan error, candidates)
+	var wg sync.WaitGroup
+	for i := 0; i < candidates; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			payload, err := json.Marshal(model.Node{ID: fmt.Sprintf("concurrent-%d", index), GPUCount: 1, CPUCores: 1})
+			if err != nil {
+				errs <- err
+				return
+			}
+			req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/nodes/register", bytes.NewReader(payload))
+			if err != nil {
+				errs <- err
+				return
+			}
+			req.Header.Set("Authorization", "Bearer test-token")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				errs <- err
+				return
+			}
+			_ = resp.Body.Close()
+			results <- resp.StatusCode
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	accepted, rejected := 0, 0
+	for status := range results {
+		switch status {
+		case http.StatusOK:
+			accepted++
+		case http.StatusForbidden:
+			rejected++
+		default:
+			t.Fatalf("unexpected registration status %d", status)
+		}
+	}
+	if accepted != 1 || rejected != candidates-1 || len(state.ListNodes()) != 1 {
+		t.Fatalf("capacity admission was not atomic: accepted=%d rejected=%d nodes=%d", accepted, rejected, len(state.ListNodes()))
 	}
 }
 

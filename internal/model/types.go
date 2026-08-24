@@ -67,6 +67,7 @@ type Node struct {
 	Pool          string            `json:"pool"`
 	GPUModel      string            `json:"gpu_model"`
 	GPUCount      int               `json:"gpu_count"`
+	CPUCores      int               `json:"cpu_cores"`
 	VRAMGB        int               `json:"vram_gb"`
 	HourlyPrice   float64           `json:"hourly_price"`
 	Labels        map[string]string `json:"labels,omitempty"`

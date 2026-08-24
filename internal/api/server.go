@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gpuflow/internal/artifact"
@@ -21,12 +22,13 @@ import (
 )
 
 type Server struct {
-	store     *store.Store
-	token     string
-	mux       *http.ServeMux
-	edition   edition.Descriptor
-	images    *ImageBuilder
-	artifacts artifact.Store
+	store      *store.Store
+	token      string
+	mux        *http.ServeMux
+	edition    edition.Descriptor
+	images     *ImageBuilder
+	artifacts  artifact.Store
+	registerMu sync.Mutex
 }
 
 func New(s *store.Store, token string) *Server {
@@ -253,6 +255,12 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	s.registerMu.Lock()
+	defer s.registerMu.Unlock()
+	if status, err := s.validateNodeCapacity(n); err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
 	saved, err := s.store.RegisterNode(n)
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -260,6 +268,49 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 	}
 	s.scheduleBestEffort()
 	writeJSON(w, 200, saved)
+}
+
+func (s *Server) validateNodeCapacity(candidate model.Node) (int, error) {
+	if candidate.GPUCount < 0 || candidate.CPUCores < 0 || candidate.VRAMGB < 0 {
+		return http.StatusBadRequest, errors.New("node resource counts cannot be negative")
+	}
+	limits := s.edition
+	if limits.MaxNodes <= 0 && limits.MaxGPUs <= 0 && limits.MaxCPUCores <= 0 {
+		return 0, nil
+	}
+	if limits.MaxCPUCores > 0 && candidate.CPUCores <= 0 {
+		return http.StatusForbidden, errors.New("enterprise license requires the agent to report a positive logical CPU core count")
+	}
+
+	nodes := s.store.ListNodes()
+	totalGPUs, totalCPUCores := 0, 0
+	var existing *model.Node
+	for _, node := range nodes {
+		totalGPUs += node.GPUCount
+		totalCPUCores += node.CPUCores
+		if node.ID == candidate.ID && candidate.ID != "" {
+			existing = node
+		}
+	}
+	projectedNodes := len(nodes)
+	projectedGPUs := totalGPUs + candidate.GPUCount
+	projectedCPUCores := totalCPUCores + candidate.CPUCores
+	if existing == nil {
+		projectedNodes++
+	} else {
+		projectedGPUs -= existing.GPUCount
+		projectedCPUCores -= existing.CPUCores
+	}
+	if limits.MaxNodes > 0 && projectedNodes > limits.MaxNodes && existing == nil {
+		return http.StatusForbidden, fmt.Errorf("enterprise license node capacity exceeded: %d requested, %d licensed", projectedNodes, limits.MaxNodes)
+	}
+	if limits.MaxGPUs > 0 && projectedGPUs > limits.MaxGPUs && (existing == nil || candidate.GPUCount > existing.GPUCount) {
+		return http.StatusForbidden, fmt.Errorf("enterprise license GPU capacity exceeded: %d requested, %d licensed", projectedGPUs, limits.MaxGPUs)
+	}
+	if limits.MaxCPUCores > 0 && projectedCPUCores > limits.MaxCPUCores && (existing == nil || candidate.CPUCores > existing.CPUCores) {
+		return http.StatusForbidden, fmt.Errorf("enterprise license CPU capacity exceeded: %d logical cores requested, %d licensed", projectedCPUCores, limits.MaxCPUCores)
+	}
+	return 0, nil
 }
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.HeartbeatNode(r.PathValue("id")); err != nil {

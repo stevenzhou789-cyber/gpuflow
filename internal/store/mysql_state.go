@@ -47,6 +47,7 @@ const mysqlNodesSchema = `CREATE TABLE IF NOT EXISTS nodes (
   pool VARCHAR(128) NOT NULL,
   gpu_model VARCHAR(255) NOT NULL,
   gpu_count INT NOT NULL,
+  cpu_cores INT NOT NULL DEFAULT 0,
   vram_gb INT NOT NULL,
   hourly_price DOUBLE NOT NULL,
   labels_json JSON NOT NULL,
@@ -83,6 +84,13 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate job GPU allocations: %w", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE nodes ADD COLUMN cpu_cores INT NOT NULL DEFAULT 0 AFTER gpu_count"); err != nil {
+		var mysqlErr *mysqldriver.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate node CPU capacity: %w", err)
 		}
 	}
 	if err := (&MySQLTaskImageStore{db: db}).migrate(ctx); err != nil {
@@ -140,7 +148,7 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 	}
 	rows.Close()
 
-	const nodesQuery = `SELECT id, name, provider, pool, gpu_model, gpu_count, vram_gb,
+	const nodesQuery = `SELECT id, name, provider, pool, gpu_model, gpu_count, cpu_cores, vram_gb,
   hourly_price, labels_json, busy, current_job, last_heartbeat FROM nodes`
 	rows, err = s.db.QueryContext(ctx, nodesQuery)
 	if err != nil {
@@ -151,7 +159,7 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 		var node model.Node
 		var labelsJSON []byte
 		if err := rows.Scan(&node.ID, &node.Name, &node.Provider, &node.Pool, &node.GPUModel,
-			&node.GPUCount, &node.VRAMGB, &node.HourlyPrice, &labelsJSON, &node.Busy,
+			&node.GPUCount, &node.CPUCores, &node.VRAMGB, &node.HourlyPrice, &labelsJSON, &node.Busy,
 			&node.CurrentJob, &node.LastHeartbeat); err != nil {
 			return fmt.Errorf("scan node: %w", err)
 		}
@@ -195,10 +203,10 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), image=VALUES(image), command_json=VAL
   finished_at=VALUES(finished_at), rerun_of=VALUES(rerun_of)`
 
 const upsertNodeSQL = `INSERT INTO nodes (id, name, provider, pool, gpu_model, gpu_count,
-  vram_gb, hourly_price, labels_json, busy, current_job, last_heartbeat)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  cpu_cores, vram_gb, hourly_price, labels_json, busy, current_job, last_heartbeat)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE name=VALUES(name), provider=VALUES(provider), pool=VALUES(pool),
-  gpu_model=VALUES(gpu_model), gpu_count=VALUES(gpu_count), vram_gb=VALUES(vram_gb),
+  gpu_model=VALUES(gpu_model), gpu_count=VALUES(gpu_count), cpu_cores=VALUES(cpu_cores), vram_gb=VALUES(vram_gb),
   hourly_price=VALUES(hourly_price), labels_json=VALUES(labels_json), busy=VALUES(busy),
   current_job=VALUES(current_job), last_heartbeat=VALUES(last_heartbeat)`
 
@@ -260,7 +268,7 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 			return fmt.Errorf("encode node %s labels: %w", node.ID, err)
 		}
 		if _, err := tx.ExecContext(ctx, upsertNodeSQL, node.ID, node.Name, node.Provider, node.Pool,
-			node.GPUModel, node.GPUCount, node.VRAMGB, node.HourlyPrice, labelsJSON, node.Busy,
+			node.GPUModel, node.GPUCount, node.CPUCores, node.VRAMGB, node.HourlyPrice, labelsJSON, node.Busy,
 			node.CurrentJob, node.LastHeartbeat); err != nil {
 			return fmt.Errorf("insert node %s: %w", node.ID, err)
 		}

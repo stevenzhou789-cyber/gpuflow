@@ -20,7 +20,7 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	}
 	defer s.db.Close()
 
-	nodeInput := model.Node{ID: "mysql-node", Name: "mysql node", Provider: "local", Pool: "default", GPUModel: "RTX 4090", GPUCount: 1, VRAMGB: 24, Labels: map[string]string{"zone": "lab"}}
+	nodeInput := model.Node{ID: "mysql-node", Name: "mysql node", Provider: "local", Pool: "default", GPUModel: "RTX 4090", GPUCount: 1, CPUCores: 16, VRAMGB: 24, Labels: map[string]string{"zone": "lab"}}
 	node, err := s.RegisterNode(nodeInput)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 		t.Fatalf("unexpected persisted job: %+v", persistedJob)
 	}
 	nodes := reopened.ListNodes()
-	if len(nodes) != 1 || nodes[0].CurrentJob != job.ID || !nodes[0].Busy || nodes[0].Labels["zone"] != "lab" {
+	if len(nodes) != 1 || nodes[0].CurrentJob != job.ID || !nodes[0].Busy || nodes[0].CPUCores != 16 || nodes[0].Labels["zone"] != "lab" {
 		t.Fatalf("unexpected persisted nodes: %+v", nodes)
 	}
 	images, err := reopened.ListTaskImages()

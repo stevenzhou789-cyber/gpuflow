@@ -92,7 +92,7 @@ cd /opt/gpuflow-agent
 mv .env.example .env
 ```
 
-编辑 `.env` 中的镜像、控制面地址、Token、唯一节点 ID 和 GPU 信息，然后启动：
+编辑 `.env` 中的镜像、控制面地址、Token、唯一节点 ID 和 GPU 信息，然后启动。Agent 默认自动上报进程可见的逻辑 CPU 核数；仅在容器 CPU 限额或探测结果不符合交付口径时设置 `GPUFLOW_CPU_CORES`：
 
 ```bash
 docker compose up -d

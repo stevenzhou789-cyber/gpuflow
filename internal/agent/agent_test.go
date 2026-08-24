@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,13 @@ import (
 	"gpuflow/internal/model"
 	"gpuflow/internal/store"
 )
+
+func TestAgentDefaultsToAvailableLogicalCPUs(t *testing.T) {
+	agent := New(Config{})
+	if agent.cfg.CPUCores != runtime.NumCPU() || agent.cfg.CPUCores < 1 {
+		t.Fatalf("unexpected reported CPU capacity: %d", agent.cfg.CPUCores)
+	}
+}
 
 func TestArchiveArtifacts(t *testing.T) {
 	dir := t.TempDir()

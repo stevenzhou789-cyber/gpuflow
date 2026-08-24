@@ -34,6 +34,7 @@ type Node = {
   pool: string;
   gpu_model: string;
   gpu_count: number;
+  cpu_cores: number;
   vram_gb: number;
   hourly_price: number;
   busy: boolean;
@@ -49,6 +50,9 @@ type Edition = {
   expires_at?: string;
   agent_image?: string;
   public_url?: string;
+  max_nodes?: number;
+  max_gpus?: number;
+  max_cpu_cores?: number;
   features: Record<string, boolean>;
 };
 
@@ -247,6 +251,11 @@ function App() {
           <span className="eyebrow">CURRENT EDITION</span>
           <strong>{edition.name.toUpperCase()}</strong>
           <p>{edition.licensed_to || "Open-source control plane"}</p>
+          {edition.max_nodes && (
+            <small>
+              授权 {nodes.length}/{edition.max_nodes} 节点 · {nodes.reduce((sum, node) => sum + node.gpu_count, 0)}/{edition.max_gpus} GPU · {nodes.reduce((sum, node) => sum + node.cpu_cores, 0)}/{edition.max_cpu_cores} CPU
+            </small>
+          )}
         </div>
       </aside>
 
@@ -412,7 +421,9 @@ function Overview({
         <Metric
           label="在线节点"
           value={`${metrics.online}/${nodes.length}`}
-          note={`${nodes.reduce((sum, node) => sum + node.gpu_count, 0)} 张 GPU 已接入`}
+          note={edition.max_gpus
+            ? `${nodes.reduce((sum, node) => sum + node.gpu_count, 0)}/${edition.max_gpus} GPU · ${nodes.reduce((sum, node) => sum + node.cpu_cores, 0)}/${edition.max_cpu_cores} CPU`
+            : `${nodes.reduce((sum, node) => sum + node.gpu_count, 0)} 张 GPU 已接入`}
           tone="blue"
         />
         <Metric
@@ -1041,7 +1052,7 @@ function Nodes({
                 <strong>
                   {node.gpu_count} × {node.gpu_model}
                 </strong>
-                <span>{node.vram_gb} GB VRAM</span>
+                <span>{node.vram_gb} GB VRAM · {node.cpu_cores} CPU</span>
               </div>
               <div className="node-footer">
                 <span>
@@ -1336,7 +1347,8 @@ function ConnectNode({
           <strong>当前接入边界</strong>
           <p>
             节点必须已安装 Docker；GPU 容器还需要 NVIDIA 驱动和 NVIDIA Container
-            Toolkit。Agent 会在宿主机执行任务，只应连接可信控制面。
+            Toolkit。Agent 会自动上报宿主机逻辑 CPU 核数用于 Enterprise
+            容量授权，并在宿主机执行任务，只应连接可信控制面。
           </p>
         </div>
       </div>
