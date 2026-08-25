@@ -52,7 +52,6 @@ type Edition = {
   public_url?: string;
   max_nodes?: number;
   max_gpus?: number;
-  max_cpu_cores?: number;
   features: Record<string, boolean>;
 };
 
@@ -253,9 +252,10 @@ function App() {
           <p>{edition.licensed_to || "Open-source control plane"}</p>
           {edition.max_nodes && (
             <small>
-              授权 {nodes.length}/{edition.max_nodes} 节点 · {nodes.reduce((sum, node) => sum + node.gpu_count, 0)}/{edition.max_gpus} GPU · {nodes.reduce((sum, node) => sum + node.cpu_cores, 0)}/{edition.max_cpu_cores} CPU
+              授权 {nodes.length}/{edition.max_nodes} 节点 · {nodes.reduce((sum, node) => sum + node.gpu_count, 0)}/{edition.max_gpus} GPU
             </small>
           )}
+          {edition.expires_at && <small>有效期至 {edition.expires_at}</small>}
         </div>
       </aside>
 
@@ -422,7 +422,7 @@ function Overview({
           label="在线节点"
           value={`${metrics.online}/${nodes.length}`}
           note={edition.max_gpus
-            ? `${nodes.reduce((sum, node) => sum + node.gpu_count, 0)}/${edition.max_gpus} GPU · ${nodes.reduce((sum, node) => sum + node.cpu_cores, 0)}/${edition.max_cpu_cores} CPU`
+            ? `${nodes.reduce((sum, node) => sum + node.gpu_count, 0)}/${edition.max_gpus} GPU`
             : `${nodes.reduce((sum, node) => sum + node.gpu_count, 0)} 张 GPU 已接入`}
           tone="blue"
         />
@@ -1347,8 +1347,8 @@ function ConnectNode({
           <strong>当前接入边界</strong>
           <p>
             节点必须已安装 Docker；GPU 容器还需要 NVIDIA 驱动和 NVIDIA Container
-            Toolkit。Agent 会自动上报宿主机逻辑 CPU 核数用于 Enterprise
-            容量授权，并在宿主机执行任务，只应连接可信控制面。
+            Toolkit。Agent 会自动上报宿主机逻辑 CPU 核数用于调度和资源展示，
+            并在宿主机执行任务，只应连接可信控制面。
           </p>
         </div>
       </div>

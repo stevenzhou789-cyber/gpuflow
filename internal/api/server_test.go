@@ -294,19 +294,16 @@ func TestEnterpriseNodeCapacityOverHTTP(t *testing.T) {
 	descriptor.Name = "enterprise"
 	descriptor.MaxNodes = 2
 	descriptor.MaxGPUs = 2
-	descriptor.MaxCPUCores = 8
+	// A legacy CPU limit may still be present in an older descriptor, but it is ignored.
+	descriptor.MaxCPUCores = 1
 	server := httptest.NewServer(NewWithEdition(state, "test-token", descriptor).Handler())
 	defer server.Close()
 
-	missingCPU := model.Node{ID: "missing-cpu", GPUCount: 1}
-	if status := request(t, server, http.MethodPost, "/v1/nodes/register", missingCPU, nil); status != http.StatusForbidden {
-		t.Fatalf("missing CPU count returned %d", status)
-	}
-	first := model.Node{ID: "first", GPUCount: 1, CPUCores: 4}
+	first := model.Node{ID: "first", GPUCount: 1}
 	if status := request(t, server, http.MethodPost, "/v1/nodes/register", first, &first); status != http.StatusOK {
 		t.Fatalf("first registration returned %d", status)
 	}
-	second := model.Node{ID: "second", GPUCount: 1, CPUCores: 4}
+	second := model.Node{ID: "second", GPUCount: 1, CPUCores: 256}
 	if status := request(t, server, http.MethodPost, "/v1/nodes/register", second, &second); status != http.StatusOK {
 		t.Fatalf("second registration returned %d", status)
 	}
@@ -314,13 +311,9 @@ func TestEnterpriseNodeCapacityOverHTTP(t *testing.T) {
 	if status := request(t, server, http.MethodPost, "/v1/nodes/register", third, nil); status != http.StatusForbidden {
 		t.Fatalf("node overage returned %d", status)
 	}
-	first.CPUCores = 5
-	if status := request(t, server, http.MethodPost, "/v1/nodes/register", first, nil); status != http.StatusForbidden {
-		t.Fatalf("CPU expansion overage returned %d", status)
-	}
-	first.CPUCores = 4
+	first.CPUCores = 512
 	if status := request(t, server, http.MethodPost, "/v1/nodes/register", first, &first); status != http.StatusOK {
-		t.Fatalf("same-capacity reconnect returned %d", status)
+		t.Fatalf("CPU-only reconnect returned %d", status)
 	}
 }
 
@@ -329,7 +322,6 @@ func TestEnterpriseNodeCapacityAdmissionIsAtomic(t *testing.T) {
 	descriptor := edition.Community()
 	descriptor.MaxNodes = 1
 	descriptor.MaxGPUs = 1
-	descriptor.MaxCPUCores = 1
 	server := httptest.NewServer(NewWithEdition(state, "test-token", descriptor).Handler())
 	defer server.Close()
 

@@ -275,40 +275,31 @@ func (s *Server) validateNodeCapacity(candidate model.Node) (int, error) {
 		return http.StatusBadRequest, errors.New("node resource counts cannot be negative")
 	}
 	limits := s.edition
-	if limits.MaxNodes <= 0 && limits.MaxGPUs <= 0 && limits.MaxCPUCores <= 0 {
+	if limits.MaxNodes <= 0 && limits.MaxGPUs <= 0 {
 		return 0, nil
-	}
-	if limits.MaxCPUCores > 0 && candidate.CPUCores <= 0 {
-		return http.StatusForbidden, errors.New("enterprise license requires the agent to report a positive logical CPU core count")
 	}
 
 	nodes := s.store.ListNodes()
-	totalGPUs, totalCPUCores := 0, 0
+	totalGPUs := 0
 	var existing *model.Node
 	for _, node := range nodes {
 		totalGPUs += node.GPUCount
-		totalCPUCores += node.CPUCores
 		if node.ID == candidate.ID && candidate.ID != "" {
 			existing = node
 		}
 	}
 	projectedNodes := len(nodes)
 	projectedGPUs := totalGPUs + candidate.GPUCount
-	projectedCPUCores := totalCPUCores + candidate.CPUCores
 	if existing == nil {
 		projectedNodes++
 	} else {
 		projectedGPUs -= existing.GPUCount
-		projectedCPUCores -= existing.CPUCores
 	}
 	if limits.MaxNodes > 0 && projectedNodes > limits.MaxNodes && existing == nil {
 		return http.StatusForbidden, fmt.Errorf("enterprise license node capacity exceeded: %d requested, %d licensed", projectedNodes, limits.MaxNodes)
 	}
 	if limits.MaxGPUs > 0 && projectedGPUs > limits.MaxGPUs && (existing == nil || candidate.GPUCount > existing.GPUCount) {
 		return http.StatusForbidden, fmt.Errorf("enterprise license GPU capacity exceeded: %d requested, %d licensed", projectedGPUs, limits.MaxGPUs)
-	}
-	if limits.MaxCPUCores > 0 && projectedCPUCores > limits.MaxCPUCores && (existing == nil || candidate.CPUCores > existing.CPUCores) {
-		return http.StatusForbidden, fmt.Errorf("enterprise license CPU capacity exceeded: %d logical cores requested, %d licensed", projectedCPUCores, limits.MaxCPUCores)
 	}
 	return 0, nil
 }
