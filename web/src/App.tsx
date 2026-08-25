@@ -1128,6 +1128,10 @@ function ConnectNode({
       ? ""
       : sessionStorage.getItem("gpuflow_token") || "",
   );
+  const [agentTokenLoading, setAgentTokenLoading] = useState(
+    editionName === "enterprise",
+  );
+  const [agentTokenError, setAgentTokenError] = useState("");
   const [values, setValues] = useState({
     name: "local-gpu-01",
     pool: "default",
@@ -1154,6 +1158,31 @@ function ConnectNode({
     /\n\+\s*/g,
     "\n  ",
   );
+
+  useEffect(() => {
+    if (editionName !== "enterprise") return;
+    let cancelled = false;
+    setAgentTokenLoading(true);
+    setAgentTokenError("");
+    api<{ agent_token: string }>("/enterprise/v1/agent-bootstrap")
+      .then((response) => {
+        if (cancelled) return;
+        setAgentToken(response.agent_token);
+        setAgentTokenLoading(false);
+      })
+      .catch((error: Error) => {
+        if (cancelled) return;
+        setAgentTokenError(
+          error.message === "AUTH_REQUIRED"
+            ? "请使用管理员 Token 登录后重新打开接入窗口。"
+            : "无法自动读取 Agent Token，请确认当前账号具有管理员权限。",
+        );
+        setAgentTokenLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editionName]);
 
   function update(key: keyof typeof values, value: string) {
     setValues((current) => ({ ...current, [key]: value }));
@@ -1219,27 +1248,21 @@ function ConnectNode({
                 : "该地址将写入 Agent 命令，请确认目标 GPU 主机可以访问。"}
             </small>
           </label>
-          <label className="connection-field">
-            Agent Token
-            <input
-              type="password"
-              value={agentToken}
-              onChange={(event) => {
-                setAgentToken(event.target.value);
-                setCopied(false);
-              }}
-              placeholder={
-                editionName === "enterprise"
-                  ? "填写 GPUFLOW_AGENT_TOKEN"
-                  : "与控制端 Token 一致"
-              }
-            />
-            <small>
-              {editionName === "enterprise"
-                ? "使用企业部署生成的 Agent Token，不要把管理员 Token 放到计算节点。"
-                : "Agent 使用该 Token 注册并领取任务。"}
-            </small>
-          </label>
+          {editionName !== "enterprise" && (
+            <label className="connection-field">
+              Agent Token
+              <input
+                type="password"
+                value={agentToken}
+                onChange={(event) => {
+                  setAgentToken(event.target.value);
+                  setCopied(false);
+                }}
+                placeholder="与控制端 Token 一致"
+              />
+              <small>Agent 使用该 Token 注册并领取任务。</small>
+            </label>
+          )}
           {mode === "docker" && (
             <label className="connection-field">
               Agent 镜像
@@ -1258,6 +1281,7 @@ function ConnectNode({
             </label>
           )}
         </div>
+        {agentTokenError && <div className="notice error">{agentTokenError}</div>}
         <div className="form-grid compact">
           <label>
             节点标识（唯一）
@@ -1337,8 +1361,11 @@ function ConnectNode({
         <div className="command-block">
           <div>
             <span>在目标 GPU 主机运行</span>
-            <button onClick={copyCommand}>
-              {copied ? "已复制" : "复制命令"}
+            <button
+              onClick={copyCommand}
+              disabled={editionName === "enterprise" && !agentToken}
+            >
+              {agentTokenLoading ? "正在准备…" : copied ? "已复制" : "复制命令"}
             </button>
           </div>
           <pre>{command}</pre>
