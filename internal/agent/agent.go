@@ -115,6 +115,12 @@ func (a *Agent) tick(ctx context.Context) error {
 		return err
 	}
 	defer os.RemoveAll(artifactDir)
+	logDir, err := os.MkdirTemp(a.cfg.ArtifactDir, "gpuflow-log-"+job.ID+"-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(logDir)
+	logPath := filepath.Join(logDir, "training.log")
 	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
 	heartbeatDone := make(chan struct{})
 	go func() {
@@ -125,7 +131,10 @@ func (a *Agent) tick(ctx context.Context) error {
 		stopHeartbeat()
 		<-heartbeatDone
 	}()
-	output, runErr := a.execute(ctx, &job, artifactDir)
+	output, runErr := a.execute(ctx, &job, artifactDir, logPath)
+	if uploadErr := a.uploadCompleteLog(job.ID, logPath); uploadErr != nil {
+		output = appendOutput(output, "complete log upload warning: "+uploadErr.Error())
+	}
 	if errors.Is(runErr, errJobCanceled) {
 		_, err = a.client.Do(http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+a.cfg.ID, model.JobUpdate{Status: model.JobCanceled, Output: output}, nil)
 		return err
@@ -185,6 +194,13 @@ func (a *Agent) uploadArtifact(parent context.Context, jobID, bundle string) err
 	return err
 }
 
+func (a *Agent) uploadCompleteLog(jobID, logPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.ArtifactUploadTimeout)
+	defer cancel()
+	_, err := a.client.UploadArtifactContext(ctx, "/v1/jobs/"+jobID+"/artifacts?node_id="+a.cfg.ID, logPath)
+	return err
+}
+
 func (a *Agent) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(a.cfg.HeartbeatInterval)
 	defer ticker.Stop()
@@ -198,9 +214,12 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir string) (string, error) {
+func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir, logPath string) (string, error) {
 	if a.cfg.Executor == "mock" {
 		time.Sleep(250 * time.Millisecond)
+		if err := os.WriteFile(logPath, []byte("mock executor completed\n"), 0o600); err != nil {
+			return "", fmt.Errorf("create complete job log: %w", err)
+		}
 		return "mock executor completed", nil
 	}
 	ctx, cancel := context.WithTimeout(parent, time.Duration(job.TimeoutSeconds)*time.Second)
@@ -222,7 +241,12 @@ func (a *Agent) execute(parent context.Context, job *model.Job, artifactDir stri
 	_ = exec.Command("docker", "rm", "-f", containerName).Run()
 	args = append([]string{"run", "--name", containerName}, args[1:]...)
 	cmd := exec.Command("docker", args...)
-	output := &liveJobLog{}
+	logFile, logErr := os.Create(logPath)
+	if logErr != nil {
+		return "", fmt.Errorf("create complete job log: %w", logErr)
+	}
+	defer logFile.Close()
+	output := &liveJobLog{full: logFile}
 	cmd.Stdout = output
 	cmd.Stderr = output
 	if err := cmd.Start(); err != nil {
@@ -290,11 +314,17 @@ func dockerGPUSelector(job *model.Job) string {
 type liveJobLog struct {
 	mu     sync.Mutex
 	output []byte
+	full   io.Writer
 }
 
 func (w *liveJobLog) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.full != nil {
+		if _, err := w.full.Write(p); err != nil {
+			return 0, err
+		}
+	}
 	w.output = append(w.output, p...)
 	if len(w.output) > 64<<10 {
 		w.output = append([]byte(nil), w.output[len(w.output)-(64<<10):]...)

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"io"
@@ -71,12 +72,16 @@ func TestArchiveArtifactsSkipsEmptyDirectory(t *testing.T) {
 }
 
 func TestLiveJobLogKeepsLatestOutput(t *testing.T) {
-	log := &liveJobLog{}
+	var complete bytes.Buffer
+	log := &liveJobLog{full: &complete}
 	_, _ = log.Write([]byte(strings.Repeat("a", 40<<10)))
 	_, _ = log.Write([]byte(strings.Repeat("b", 40<<10)))
 	output := log.String()
 	if len(output) != 64<<10 || !strings.HasSuffix(output, strings.Repeat("b", 40<<10)) {
 		t.Fatalf("unexpected retained output: bytes=%d", len(output))
+	}
+	if complete.Len() != 80<<10 || !strings.HasPrefix(complete.String(), strings.Repeat("a", 40<<10)) {
+		t.Fatalf("complete log was truncated: bytes=%d", complete.Len())
 	}
 }
 

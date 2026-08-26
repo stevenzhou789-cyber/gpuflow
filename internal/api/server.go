@@ -68,6 +68,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/jobs/{id}", s.deleteJob)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/status", s.updateJob)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/logs", s.updateJobLog)
+	s.mux.HandleFunc("GET /v1/jobs/{id}/logs/full", s.downloadFullJobLog)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/artifacts", s.uploadArtifact)
 	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts", s.listArtifacts)
 	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts/{name}", s.downloadArtifact)
@@ -139,6 +140,29 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Length", fmt.Sprint(item.Size))
 	_, _ = io.Copy(w, reader)
+}
+
+func (s *Server) downloadFullJobLog(w http.ResponseWriter, r *http.Request) {
+	job, err := s.store.GetJob(r.PathValue("id"))
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	if s.artifacts.Enabled() {
+		reader, item, openErr := s.artifacts.Open(r.Context(), job.ID, "training.log")
+		if openErr != nil {
+			writeError(w, http.StatusNotFound, "complete job log not found")
+			return
+		}
+		defer reader.Close()
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": item.Name}))
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Length", fmt.Sprint(item.Size))
+		_, _ = io.Copy(w, reader)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, job.Output)
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {

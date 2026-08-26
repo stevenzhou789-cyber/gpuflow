@@ -660,6 +660,9 @@ function Jobs({ nodes, onSelect, onChanged }: { nodes: Node[]; onSelect: (job: J
 function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => void }) {
   const [job, setJob] = useState(initialJob);
   const [copied, setCopied] = useState(false);
+  const [fullLog, setFullLog] = useState<string | null>(null);
+  const [fullLogLoading, setFullLogLoading] = useState(false);
+  const [fullLogError, setFullLogError] = useState("");
   const [artifacts, setArtifacts] = useState<ArtifactResponse | null>(null);
   const [artifactError, setArtifactError] = useState("");
   const [downloading, setDownloading] = useState("");
@@ -668,8 +671,13 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
   const duration = started
     ? Math.max(0, ((finished || new Date()).getTime() - started.getTime()) / 1000)
     : null;
+  const visibleArtifacts = artifacts?.items.filter((item) => item.name !== "training.log") || [];
 
-  useEffect(() => setJob(initialJob), [initialJob]);
+  useEffect(() => {
+    setJob(initialJob);
+    setFullLog(null);
+    setFullLogError("");
+  }, [initialJob]);
 
   useEffect(() => {
     if (!["assigned", "running", "canceling"].includes(job.status)) return;
@@ -694,8 +702,33 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
     return () => { active = false; };
   }, [job.id, job.status]);
 
+  async function loadFullLog() {
+    if (fullLog !== null) return fullLog;
+    setFullLogLoading(true);
+    setFullLogError("");
+    try {
+      const response = await fetch(`/v1/jobs/${job.id}/logs/full`, { headers: requestHeaders() });
+      if (!response.ok) throw new Error(`读取完整日志失败（${response.status}）`);
+      const text = await response.text();
+      setFullLog(text);
+      return text;
+    } catch (error) {
+      setFullLogError((error as Error).message);
+      throw error;
+    } finally {
+      setFullLogLoading(false);
+    }
+  }
+
   async function copyLog() {
-    await navigator.clipboard.writeText(job.output || job.error || "");
+    try {
+      const text = ["succeeded", "failed", "canceled"].includes(job.status)
+        ? await loadFullLog()
+        : job.output || job.error || "";
+      await navigator.clipboard.writeText(text);
+    } catch {
+      return;
+    }
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1500);
   }
@@ -765,12 +798,20 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
         <section className="job-detail-section">
           <div className="job-log-title">
             <h3>执行日志</h3>
-            <button type="button" disabled={!job.output && !job.error} onClick={copyLog}>
-              {copied ? "已复制" : "复制日志"}
-            </button>
+            <div>
+              {["succeeded", "failed", "canceled"].includes(job.status) && fullLog === null ? (
+                <button type="button" disabled={fullLogLoading} onClick={() => void loadFullLog()}>
+                  {fullLogLoading ? "读取中…" : "查看完整日志"}
+                </button>
+              ) : null}
+              <button type="button" disabled={fullLogLoading || (!job.output && !job.error && fullLog === null)} onClick={copyLog}>
+                {copied ? "已复制" : fullLog !== null ? "复制全部" : "复制日志"}
+              </button>
+            </div>
           </div>
-          <pre className="job-log">{job.output || (job.status === "running" ? "任务正在运行，等待日志回传…" : "暂无日志输出")}</pre>
-          <small className="job-log-note">运行日志约每 2 秒同步，最多保留最后 64 KB。</small>
+          {fullLogError ? <div className="artifact-error job-log-error">{fullLogError}</div> : null}
+          <pre className="job-log">{fullLog ?? (job.output || (job.status === "running" ? "任务正在运行，等待日志回传…" : "暂无日志输出"))}</pre>
+          <small className="job-log-note">运行中约每 2 秒同步最后 64 KB；任务结束后可查看和复制对象存储中的完整日志。</small>
         </section>
 
         <section className="job-detail-section artifact-panel">
@@ -781,9 +822,9 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
           {artifactError ? <div className="artifact-error">{artifactError}</div> : null}
           {!artifacts ? <p className="artifact-empty">正在读取产物…</p> : !artifacts.enabled ? (
             <p className="artifact-empty">尚未配置对象存储，当前任务不会保留文件产物。</p>
-          ) : artifacts.items.length === 0 ? (
+          ) : visibleArtifacts.length === 0 ? (
             <p className="artifact-empty">暂无产物。脚本需要将文件写入 $GPUFLOW_ARTIFACT_DIR。</p>
-          ) : <div className="artifact-list">{artifacts.items.map((item) => (
+          ) : <div className="artifact-list">{visibleArtifacts.map((item) => (
             <div className="artifact-row" key={item.name}>
               <div><strong>{item.name}</strong><span>{formatBytes(item.size)} · {new Date(item.last_modified).toLocaleString()}</span></div>
               <button type="button" disabled={downloading === item.name} onClick={() => downloadArtifact(item)}>
@@ -912,7 +953,14 @@ function TaskImages({
               <span className={`status ${image.status}`}>
                 {imageStatusLabel[image.status]}
               </span>
-              <small>{timeAgo(image.created_at)}</small>
+              <div className="image-card-head-meta">
+                {(image.log || image.status === "building") && (
+                  <button className="build-log-button" type="button" onClick={() => setLogImageID(image.id)}>
+                    {image.status === "building" ? "查看实时构建日志" : "查看构建日志"} →
+                  </button>
+                )}
+                <small>{timeAgo(image.created_at)}</small>
+              </div>
             </div>
             <h2>{image.name}</h2>
             <p>{image.base_image}</p>
@@ -921,11 +969,6 @@ function TaskImages({
               <div><dt>入口</dt><dd>{image.command}</dd></div>
             </dl>
             {image.error && <div className="notice error">{image.error}</div>}
-            {(image.log || image.status === "building") && (
-              <button className="build-log-button" type="button" onClick={() => setLogImageID(image.id)}>
-                {image.status === "building" ? "查看实时构建日志" : "查看构建日志"} →
-              </button>
-            )}
             <div className="image-actions">
               <button className="primary" disabled={image.status !== "ready"} onClick={() => onSubmit(image)}>使用此镜像提交任务</button>
               <button className="secondary" disabled={image.status === "building"} onClick={() => onRebuild(image)}>编辑重建</button>

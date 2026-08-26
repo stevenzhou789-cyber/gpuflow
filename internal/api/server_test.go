@@ -461,6 +461,41 @@ type recordingArtifactStore struct {
 	deleteErr error
 }
 
+type staticLogArtifactStore struct {
+	artifact.Store
+	content string
+}
+
+func (s staticLogArtifactStore) Enabled() bool { return true }
+
+func (s staticLogArtifactStore) Open(_ context.Context, _, name string) (io.ReadCloser, artifact.Item, error) {
+	if name != "training.log" {
+		return nil, artifact.Item{}, errors.New("not found")
+	}
+	return io.NopCloser(strings.NewReader(s.content)), artifact.Item{Name: name, Size: int64(len(s.content))}, nil
+}
+
+func TestDownloadFullJobLog(t *testing.T) {
+	state := store.NewMemory()
+	job, _ := state.CreateJob(model.JobCreate{Name: "full-log", Image: "alpine"})
+	handler := New(state, "test-token")
+	handler.artifacts = staticLogArtifactStore{Store: artifact.Disabled(), content: "epoch 1\nepoch 2\n"}
+	server := httptest.NewServer(handler.Handler())
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/jobs/"+job.ID+"/logs/full", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "epoch 1\nepoch 2\n" || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+		t.Fatalf("unexpected full log response: status=%d content-type=%q body=%q", resp.StatusCode, resp.Header.Get("Content-Type"), body)
+	}
+}
+
 func (s *recordingArtifactStore) Delete(context.Context, string) error {
 	s.deleted = true
 	return s.deleteErr
