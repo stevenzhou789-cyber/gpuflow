@@ -659,9 +659,9 @@ function Jobs({ nodes, onSelect, onChanged }: { nodes: Node[]; onSelect: (job: J
 
 function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => void }) {
   const [job, setJob] = useState(initialJob);
-  const [copied, setCopied] = useState(false);
   const [fullLog, setFullLog] = useState<string | null>(null);
   const [fullLogLoading, setFullLogLoading] = useState(false);
+  const [fullLogDownloading, setFullLogDownloading] = useState(false);
   const [fullLogError, setFullLogError] = useState("");
   const [artifacts, setArtifacts] = useState<ArtifactResponse | null>(null);
   const [artifactError, setArtifactError] = useState("");
@@ -671,6 +671,8 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
   const duration = started
     ? Math.max(0, ((finished || new Date()).getTime() - started.getTime()) / 1000)
     : null;
+  const terminal = ["succeeded", "failed", "canceled"].includes(job.status);
+  const logArtifact = artifacts?.items.find((item) => item.name === "training.log");
   const visibleArtifacts = artifacts?.items.filter((item) => item.name !== "training.log") || [];
 
   useEffect(() => {
@@ -702,35 +704,45 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
     return () => { active = false; };
   }, [job.id, job.status]);
 
-  async function loadFullLog() {
-    if (fullLog !== null) return fullLog;
+  useEffect(() => {
+    if (!terminal) return;
+    const controller = new AbortController();
+    let active = true;
     setFullLogLoading(true);
+    setFullLogError("");
+    fetch(`/v1/jobs/${job.id}/logs/full`, { headers: requestHeaders(), signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`完整日志读取失败（${response.status}）`);
+        return response.text();
+      })
+      .then((text) => active && setFullLog(text))
+      .catch((error: Error) => {
+        if (active && error.name !== "AbortError") setFullLogError(error.message);
+      })
+      .finally(() => active && setFullLogLoading(false));
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [job.id, terminal]);
+
+  async function downloadFullLog() {
+    setFullLogDownloading(true);
     setFullLogError("");
     try {
       const response = await fetch(`/v1/jobs/${job.id}/logs/full`, { headers: requestHeaders() });
-      if (!response.ok) throw new Error(`读取完整日志失败（${response.status}）`);
-      const text = await response.text();
-      setFullLog(text);
-      return text;
+      if (!response.ok) throw new Error(`日志下载失败（${response.status}）`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `training-${job.id}.log`;
+      link.click();
+      URL.revokeObjectURL(url);
     } catch (error) {
       setFullLogError((error as Error).message);
-      throw error;
     } finally {
-      setFullLogLoading(false);
+      setFullLogDownloading(false);
     }
-  }
-
-  async function copyLog() {
-    try {
-      const text = ["succeeded", "failed", "canceled"].includes(job.status)
-        ? await loadFullLog()
-        : job.output || job.error || "";
-      await navigator.clipboard.writeText(text);
-    } catch {
-      return;
-    }
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
   }
 
   async function downloadArtifact(item: ArtifactItem) {
@@ -798,20 +810,27 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
         <section className="job-detail-section">
           <div className="job-log-title">
             <h3>执行日志</h3>
-            <div>
-              {["succeeded", "failed", "canceled"].includes(job.status) && fullLog === null ? (
-                <button type="button" disabled={fullLogLoading} onClick={() => void loadFullLog()}>
-                  {fullLogLoading ? "读取中…" : "查看完整日志"}
-                </button>
-              ) : null}
-              <button type="button" disabled={fullLogLoading || (!job.output && !job.error && fullLog === null)} onClick={copyLog}>
-                {copied ? "已复制" : fullLog !== null ? "复制全部" : "复制日志"}
+            {terminal ? (
+              <button type="button" disabled={fullLogDownloading} onClick={downloadFullLog}>
+                {fullLogDownloading ? "下载中…" : "下载日志"}
               </button>
-            </div>
+            ) : null}
           </div>
           {fullLogError ? <div className="artifact-error job-log-error">{fullLogError}</div> : null}
-          <pre className="job-log">{fullLog ?? (job.output || (job.status === "running" ? "任务正在运行，等待日志回传…" : "暂无日志输出"))}</pre>
-          <small className="job-log-note">运行中约每 2 秒同步最后 64 KB；任务结束后可查看和复制对象存储中的完整日志。</small>
+          <pre className={`job-log${fullLog !== null ? " full" : ""}`}>{fullLog ?? (job.output || (job.status === "running" ? "任务正在运行，等待日志回传…" : "暂无日志输出"))}</pre>
+          <small className="job-log-note">
+            {fullLogLoading
+              ? "正在从对象存储读取完整日志…"
+              : fullLog !== null
+                ? `已显示完整日志${logArtifact ? `（${formatBytes(logArtifact.size)}）` : ""}，可在日志框内滚动查看或下载。`
+                : terminal && fullLogError
+                  ? "完整日志暂不可用，当前显示数据库中保留的最后 64 KB。"
+                  : terminal
+                    ? "任务已结束，正在准备完整日志…"
+                    : ["assigned", "running", "canceling"].includes(job.status)
+                      ? "运行日志约每 2 秒同步，当前显示最近 64 KB；任务结束后会自动加载完整日志。"
+                      : "任务开始后会实时显示最近 64 KB，结束后自动加载完整日志。"}
+          </small>
         </section>
 
         <section className="job-detail-section artifact-panel">
