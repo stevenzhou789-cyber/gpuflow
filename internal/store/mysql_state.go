@@ -28,6 +28,9 @@ const mysqlJobsSchema = `CREATE TABLE IF NOT EXISTS jobs (
   recoveries INT NOT NULL,
   status VARCHAR(32) NOT NULL,
   assigned_node VARCHAR(64) NOT NULL,
+  assigned_session VARCHAR(64) NOT NULL DEFAULT '',
+  attempt_token VARCHAR(64) NOT NULL DEFAULT '',
+  lease_expires_at DATETIME(6) NULL,
   allocated_gpus_json JSON NULL,
   output MEDIUMTEXT NOT NULL,
   error_message TEXT NOT NULL,
@@ -51,6 +54,7 @@ const mysqlNodesSchema = `CREATE TABLE IF NOT EXISTS nodes (
   vram_gb INT NOT NULL,
   hourly_price DOUBLE NOT NULL,
   labels_json JSON NOT NULL,
+  details_json JSON NULL,
   busy BOOLEAN NOT NULL,
   current_job VARCHAR(64) NOT NULL,
   last_heartbeat DATETIME(6) NOT NULL,
@@ -86,6 +90,22 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 			return nil, fmt.Errorf("migrate job GPU allocations: %w", err)
 		}
 	}
+	for _, migration := range []struct {
+		statement string
+		name      string
+	}{
+		{"ALTER TABLE jobs ADD COLUMN assigned_session VARCHAR(64) NOT NULL DEFAULT '' AFTER assigned_node", "job assigned session"},
+		{"ALTER TABLE jobs ADD COLUMN attempt_token VARCHAR(64) NOT NULL DEFAULT '' AFTER assigned_session", "job attempt token"},
+		{"ALTER TABLE jobs ADD COLUMN lease_expires_at DATETIME(6) NULL AFTER attempt_token", "job attempt lease"},
+	} {
+		if _, err := db.ExecContext(ctx, migration.statement); err != nil {
+			var mysqlErr *mysqldriver.MySQLError
+			if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
+				_ = db.Close()
+				return nil, fmt.Errorf("migrate %s: %w", migration.name, err)
+			}
+		}
+	}
 	if _, err := db.ExecContext(ctx, "ALTER TABLE nodes ADD COLUMN cpu_cores INT NOT NULL DEFAULT 0 AFTER gpu_count"); err != nil {
 		var mysqlErr *mysqldriver.MySQLError
 		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
@@ -93,11 +113,18 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 			return nil, fmt.Errorf("migrate node CPU capacity: %w", err)
 		}
 	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE nodes ADD COLUMN details_json JSON NULL AFTER labels_json"); err != nil {
+		var mysqlErr *mysqldriver.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate node inventory and health: %w", err)
+		}
+	}
 	if err := (&MySQLTaskImageStore{db: db}).migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	s := &Store{db: db, state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}, claimedJobs: map[string]time.Time{}}
+	s := &Store{db: db, state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}}
 	if err := s.loadMySQL(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -108,7 +135,8 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 func (s *Store) loadMySQL(ctx context.Context) error {
 	const jobsQuery = `SELECT id, name, image, command_json, environment_json, requirements_json,
   strategy, timeout_seconds, max_retries, attempts, recoveries, status, assigned_node,
-  allocated_gpus_json, output, error_message, created_at, updated_at, started_at, finished_at, rerun_of FROM jobs`
+  assigned_session, attempt_token, lease_expires_at, allocated_gpus_json, output, error_message,
+  created_at, updated_at, started_at, finished_at, rerun_of FROM jobs`
 	rows, err := s.db.QueryContext(ctx, jobsQuery)
 	if err != nil {
 		return fmt.Errorf("load jobs: %w", err)
@@ -116,10 +144,11 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 	for rows.Next() {
 		var job model.Job
 		var commandJSON, environmentJSON, requirementsJSON, allocatedGPUsJSON []byte
-		var startedAt, finishedAt sql.NullTime
+		var leaseExpiresAt, startedAt, finishedAt sql.NullTime
 		if err := rows.Scan(&job.ID, &job.Name, &job.Image, &commandJSON, &environmentJSON, &requirementsJSON,
 			&job.Strategy, &job.TimeoutSeconds, &job.MaxRetries, &job.Attempts, &job.Recoveries, &job.Status,
-			&job.AssignedNode, &allocatedGPUsJSON, &job.Output, &job.Error, &job.CreatedAt, &job.UpdatedAt, &startedAt, &finishedAt, &job.RerunOf); err != nil {
+			&job.AssignedNode, &job.AssignedSession, &job.AttemptToken, &leaseExpiresAt, &allocatedGPUsJSON,
+			&job.Output, &job.Error, &job.CreatedAt, &job.UpdatedAt, &startedAt, &finishedAt, &job.RerunOf); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan job: %w", err)
 		}
@@ -136,6 +165,10 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 			value := startedAt.Time
 			job.StartedAt = &value
 		}
+		if leaseExpiresAt.Valid {
+			value := leaseExpiresAt.Time
+			job.LeaseExpiresAt = &value
+		}
 		if finishedAt.Valid {
 			value := finishedAt.Time
 			job.FinishedAt = &value
@@ -149,7 +182,7 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 	rows.Close()
 
 	const nodesQuery = `SELECT id, name, provider, pool, gpu_model, gpu_count, cpu_cores, vram_gb,
-  hourly_price, labels_json, busy, current_job, last_heartbeat FROM nodes`
+  hourly_price, labels_json, details_json, busy, current_job, last_heartbeat FROM nodes`
 	rows, err = s.db.QueryContext(ctx, nodesQuery)
 	if err != nil {
 		return fmt.Errorf("load nodes: %w", err)
@@ -158,13 +191,21 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 	for rows.Next() {
 		var node model.Node
 		var labelsJSON []byte
+		var detailsJSON sql.RawBytes
 		if err := rows.Scan(&node.ID, &node.Name, &node.Provider, &node.Pool, &node.GPUModel,
-			&node.GPUCount, &node.CPUCores, &node.VRAMGB, &node.HourlyPrice, &labelsJSON, &node.Busy,
+			&node.GPUCount, &node.CPUCores, &node.VRAMGB, &node.HourlyPrice, &labelsJSON, &detailsJSON, &node.Busy,
 			&node.CurrentJob, &node.LastHeartbeat); err != nil {
 			return fmt.Errorf("scan node: %w", err)
 		}
 		if err := json.Unmarshal(labelsJSON, &node.Labels); err != nil {
 			return fmt.Errorf("decode node %s labels: %w", node.ID, err)
+		}
+		if len(detailsJSON) > 0 {
+			var details nodeDetails
+			if err := json.Unmarshal(detailsJSON, &details); err != nil {
+				return fmt.Errorf("decode node %s details: %w", node.ID, err)
+			}
+			details.apply(&node)
 		}
 		s.state.Nodes[node.ID] = &node
 	}
@@ -192,23 +233,45 @@ func decodeJobJSON(job *model.Job, commandJSON, environmentJSON, requirementsJSO
 
 const upsertJobSQL = `INSERT INTO jobs (id, name, image, command_json, environment_json,
   requirements_json, strategy, timeout_seconds, max_retries, attempts, recoveries, status,
-  assigned_node, allocated_gpus_json, output, error_message, created_at, updated_at, started_at, finished_at, rerun_of)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  assigned_node, assigned_session, attempt_token, lease_expires_at, allocated_gpus_json,
+  output, error_message, created_at, updated_at, started_at, finished_at, rerun_of)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE name=VALUES(name), image=VALUES(image), command_json=VALUES(command_json),
   environment_json=VALUES(environment_json), requirements_json=VALUES(requirements_json),
   strategy=VALUES(strategy), timeout_seconds=VALUES(timeout_seconds), max_retries=VALUES(max_retries),
   attempts=VALUES(attempts), recoveries=VALUES(recoveries), status=VALUES(status),
-  assigned_node=VALUES(assigned_node), allocated_gpus_json=VALUES(allocated_gpus_json), output=VALUES(output), error_message=VALUES(error_message),
+  assigned_node=VALUES(assigned_node), assigned_session=VALUES(assigned_session), attempt_token=VALUES(attempt_token),
+  lease_expires_at=VALUES(lease_expires_at), allocated_gpus_json=VALUES(allocated_gpus_json), output=VALUES(output), error_message=VALUES(error_message),
   created_at=VALUES(created_at), updated_at=VALUES(updated_at), started_at=VALUES(started_at),
   finished_at=VALUES(finished_at), rerun_of=VALUES(rerun_of)`
 
 const upsertNodeSQL = `INSERT INTO nodes (id, name, provider, pool, gpu_model, gpu_count,
-  cpu_cores, vram_gb, hourly_price, labels_json, busy, current_job, last_heartbeat)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  cpu_cores, vram_gb, hourly_price, labels_json, details_json, busy, current_job, last_heartbeat)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE name=VALUES(name), provider=VALUES(provider), pool=VALUES(pool),
   gpu_model=VALUES(gpu_model), gpu_count=VALUES(gpu_count), cpu_cores=VALUES(cpu_cores), vram_gb=VALUES(vram_gb),
-  hourly_price=VALUES(hourly_price), labels_json=VALUES(labels_json), busy=VALUES(busy),
+  hourly_price=VALUES(hourly_price), labels_json=VALUES(labels_json), details_json=VALUES(details_json), busy=VALUES(busy),
   current_job=VALUES(current_job), last_heartbeat=VALUES(last_heartbeat)`
+
+type nodeDetails struct {
+	Devices         []model.GPUDevice `json:"devices,omitempty"`
+	DriverVersion   string            `json:"driver_version,omitempty"`
+	DockerVersion   string            `json:"docker_version,omitempty"`
+	HealthStatus    string            `json:"health_status,omitempty"`
+	HealthReason    string            `json:"health_reason,omitempty"`
+	LastHealthCheck *time.Time        `json:"last_health_check,omitempty"`
+	SessionEpoch    string            `json:"session_epoch,omitempty"`
+}
+
+func detailsFromNode(node *model.Node) nodeDetails {
+	return nodeDetails{Devices: node.Devices, DriverVersion: node.DriverVersion, DockerVersion: node.DockerVersion, HealthStatus: node.HealthStatus, HealthReason: node.HealthReason, LastHealthCheck: node.LastHealthCheck, SessionEpoch: node.SessionEpoch}
+}
+
+func (details nodeDetails) apply(node *model.Node) {
+	node.Devices, node.DriverVersion, node.DockerVersion = details.Devices, details.DriverVersion, details.DockerVersion
+	node.HealthStatus, node.HealthReason, node.LastHealthCheck = details.HealthStatus, details.HealthReason, details.LastHealthCheck
+	node.SessionEpoch = details.SessionEpoch
+}
 
 func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -254,7 +317,8 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 		}
 		if _, err := tx.ExecContext(ctx, upsertJobSQL, job.ID, job.Name, job.Image, commandJSON,
 			environmentJSON, requirementsJSON, job.Strategy, job.TimeoutSeconds, job.MaxRetries,
-			job.Attempts, job.Recoveries, job.Status, job.AssignedNode, allocatedGPUsJSON, job.Output, job.Error,
+			job.Attempts, job.Recoveries, job.Status, job.AssignedNode, job.AssignedSession, job.AttemptToken,
+			nullableTime(job.LeaseExpiresAt), allocatedGPUsJSON, job.Output, job.Error,
 			job.CreatedAt, job.UpdatedAt, nullableTime(job.StartedAt), nullableTime(job.FinishedAt), job.RerunOf); err != nil {
 			return fmt.Errorf("insert job %s: %w", job.ID, err)
 		}
@@ -267,8 +331,12 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 		if err != nil {
 			return fmt.Errorf("encode node %s labels: %w", node.ID, err)
 		}
+		detailsJSON, err := json.Marshal(detailsFromNode(node))
+		if err != nil {
+			return fmt.Errorf("encode node %s details: %w", node.ID, err)
+		}
 		if _, err := tx.ExecContext(ctx, upsertNodeSQL, node.ID, node.Name, node.Provider, node.Pool,
-			node.GPUModel, node.GPUCount, node.CPUCores, node.VRAMGB, node.HourlyPrice, labelsJSON, node.Busy,
+			node.GPUModel, node.GPUCount, node.CPUCores, node.VRAMGB, node.HourlyPrice, labelsJSON, detailsJSON, node.Busy,
 			node.CurrentJob, node.LastHeartbeat); err != nil {
 			return fmt.Errorf("insert node %s: %w", node.ID, err)
 		}

@@ -23,6 +23,22 @@ func TestProbeNodeDiscoversAggregateGPUCapacity(t *testing.T) {
 	}
 }
 
+func TestProbeNodeDiscoversPerGPUInventory(t *testing.T) {
+	a := New(Config{ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "docker" {
+			return []byte("27.1.0"), nil
+		}
+		return []byte("0, GPU-a, NVIDIA L4, 23034, 550.54\n1, GPU-b, NVIDIA L4, 23034, 550.54\n"), nil
+	}})
+	node, err := a.probeNode(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(node.Devices) != 2 || node.Devices[1].UUID != "GPU-b" || node.DriverVersion != "550.54" || node.DockerVersion != "27.1.0" || node.HealthStatus != "HEALTHY" {
+		t.Fatalf("unexpected inventory: %+v", node)
+	}
+}
+
 func TestProbeNodeAllowsNativeCPUOnlyNode(t *testing.T) {
 	a := New(Config{ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
 		if name == "docker" {

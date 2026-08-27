@@ -56,11 +56,16 @@ func NewHandlerWithConfig(cfg Config) (http.Handler, error) {
 	if strings.TrimSpace(cfg.Artifacts.Endpoint) == "" {
 		return nil, errors.New("GPUFLOW_S3_ENDPOINT is required")
 	}
+	if _, err := edition.ParseExpiration(cfg.Descriptor.ExpiresAt); err != nil {
+		return nil, err
+	}
+	if cfg.Descriptor.MaxNodes < 0 || cfg.Descriptor.MaxGPUs < 0 {
+		return nil, errors.New("enterprise license capacity cannot be negative")
+	}
 	state, err := store.OpenMySQLStateStore(cfg.MySQLDSN)
 	if err != nil {
 		return nil, err
 	}
-	state.SetGPUGranularScheduling(cfg.Descriptor.Features["gpu_granular_scheduling"])
 	artifacts, err := artifact.Open(artifact.Config{
 		Endpoint: cfg.Artifacts.Endpoint, AccessKey: cfg.Artifacts.AccessKey,
 		SecretKey: cfg.Artifacts.SecretKey, Bucket: cfg.Artifacts.Bucket,

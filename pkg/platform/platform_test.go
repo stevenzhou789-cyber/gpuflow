@@ -16,3 +16,12 @@ func TestHandlerRequiresMySQLAndArtifactStorage(t *testing.T) {
 		t.Fatalf("expected required artifact storage error, got %v", err)
 	}
 }
+
+func TestNewHandlerRejectsMalformedLicenseExpiration(t *testing.T) {
+	descriptor := edition.Community()
+	descriptor.ExpiresAt = "tomorrow"
+	_, err := NewHandlerWithConfig(Config{MySQLDSN: "unused-dsn", Descriptor: descriptor, Artifacts: ArtifactConfig{Endpoint: "minio:9000"}})
+	if err == nil || !strings.Contains(err.Error(), "expires_at") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

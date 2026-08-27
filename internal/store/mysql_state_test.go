@@ -38,6 +38,12 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	if _, err := s.RegisterNode(nodeInput); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.UpdateNodeHealth(node.ID, model.NodeHealthUpdate{Status: "HEALTHY", GPUModel: "RTX 4090", GPUCount: 1, VRAMGB: 24, DriverVersion: "550.54", DockerVersion: "27.1", Devices: []model.GPUDevice{{Index: 0, UUID: "GPU-persisted", Model: "RTX 4090", VRAMGB: 24}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := s.db.Exec(`INSERT INTO nodes (id, name, provider, pool, gpu_model, gpu_count,
   vram_gb, hourly_price, labels_json, busy, current_job, last_heartbeat)
@@ -74,7 +80,7 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 		t.Fatalf("unexpected persisted job: %+v", persistedJob)
 	}
 	nodes := reopened.ListNodes()
-	if len(nodes) != 1 || nodes[0].CurrentJob != job.ID || !nodes[0].Busy || nodes[0].CPUCores != 16 || nodes[0].Labels["zone"] != "lab" {
+	if len(nodes) != 1 || nodes[0].CurrentJob != job.ID || !nodes[0].Busy || nodes[0].CPUCores != 16 || nodes[0].Labels["zone"] != "lab" || nodes[0].HealthStatus != "HEALTHY" || len(nodes[0].Devices) != 1 || nodes[0].Devices[0].UUID != "GPU-persisted" || nodes[0].SessionEpoch == "" {
 		t.Fatalf("unexpected persisted nodes: %+v", nodes)
 	}
 	images, err := reopened.ListTaskImages()
@@ -89,13 +95,25 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 		t.Fatalf("deleted task image still persisted: %+v err=%v", images, err)
 	}
 
-	if _, err := reopened.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobRunning}); err != nil {
+	dispatch, err := reopened.NextJobSession(node.ID, nodes[0].SessionEpoch)
+	if err != nil || dispatch == nil || dispatch.AttemptToken == "" {
+		t.Fatalf("persisted assignment could not be claimed: %+v err=%v", dispatch, err)
+	}
+	leaseReopened, err := OpenMySQLStateStore(dsn)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reopened.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobSucceeded}); err != nil {
+	defer leaseReopened.db.Close()
+	if duplicate, err := leaseReopened.NextJobSession(node.ID, nodes[0].SessionEpoch); err != nil || duplicate != nil {
+		t.Fatalf("persisted claim was delivered twice: %+v err=%v", duplicate, err)
+	}
+	if _, err := leaseReopened.UpdateJobLease(job.ID, node.ID, nodes[0].SessionEpoch, dispatch.AttemptToken, model.JobUpdate{Status: model.JobRunning}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.BeginJobDeletion(job.ID); err != nil {
+	if _, err := leaseReopened.UpdateJobLease(job.ID, node.ID, nodes[0].SessionEpoch, dispatch.AttemptToken, model.JobUpdate{Status: model.JobSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaseReopened.BeginJobDeletion(job.ID); err != nil {
 		t.Fatal(err)
 	}
 	deletionReopened, err := OpenMySQLStateStore(dsn)

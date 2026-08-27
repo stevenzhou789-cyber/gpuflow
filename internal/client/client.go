@@ -24,6 +24,14 @@ func (c *Client) UploadArtifact(path, filePath string) (int, error) {
 }
 
 func (c *Client) UploadArtifactContext(ctx context.Context, path, filePath string) (int, error) {
+	return c.UploadArtifactContextWithHeaders(ctx, path, filePath, nil)
+}
+
+func (c *Client) UploadArtifactWithHeaders(path, filePath string, headers http.Header) (int, error) {
+	return c.UploadArtifactContextWithHeaders(context.Background(), path, filePath, headers)
+}
+
+func (c *Client) UploadArtifactContextWithHeaders(ctx context.Context, path, filePath string, headers http.Header) (int, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return 0, err
@@ -45,6 +53,7 @@ func (c *Client) UploadArtifactContext(ctx context.Context, path, filePath strin
 	if err != nil {
 		return 0, err
 	}
+	copyHeaders(req.Header, headers)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
@@ -72,6 +81,14 @@ func (c *Client) Do(method, path string, body, out any) (int, error) {
 }
 
 func (c *Client) DoContext(ctx context.Context, method, path string, body, out any) (int, error) {
+	return c.DoContextWithHeaders(ctx, method, path, body, out, nil)
+}
+
+func (c *Client) DoWithHeaders(method, path string, body, out any, headers http.Header) (int, error) {
+	return c.DoContextWithHeaders(context.Background(), method, path, body, out, headers)
+}
+
+func (c *Client) DoContextWithHeaders(ctx context.Context, method, path string, body, out any, headers http.Header) (int, error) {
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -84,6 +101,7 @@ func (c *Client) DoContext(ctx context.Context, method, path string, body, out a
 	if err != nil {
 		return 0, err
 	}
+	copyHeaders(req.Header, headers)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -105,4 +123,12 @@ func (c *Client) DoContext(ctx context.Context, method, path string, body, out a
 		}
 	}
 	return resp.StatusCode, nil
+}
+
+func copyHeaders(destination, source http.Header) {
+	for key, values := range source {
+		for _, value := range values {
+			destination.Add(key, value)
+		}
+	}
 }

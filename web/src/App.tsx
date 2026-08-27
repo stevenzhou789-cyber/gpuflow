@@ -41,14 +41,22 @@ type Node = {
   current_job?: string;
   active_jobs?: string[];
   allocated_gpu_count: number;
+  devices?: { index: number; uuid: string; model: string; vram_gb: number }[];
+  driver_version?: string;
+  docker_version?: string;
+  health_status?: "HEALTHY" | "DEGRADED";
+  health_reason?: string;
+  last_health_check?: string;
   last_heartbeat: string;
 };
 
 type Edition = {
+  schema_version: number;
   name: string;
   licensed_to?: string;
   expires_at?: string;
   agent_image?: string;
+  agent_binary?: string;
   public_url?: string;
   max_nodes?: number;
   max_gpus?: number;
@@ -147,6 +155,7 @@ function App() {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [taskImages, setTaskImages] = useState<TaskImage[]>([]);
   const [edition, setEdition] = useState<Edition>({
+    schema_version: 1,
     name: "community",
     features: {},
   });
@@ -162,6 +171,20 @@ function App() {
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [submitPreset, setSubmitPreset] = useState<{ image: string } | null>(null);
   const [error, setError] = useState("");
+  const [capabilityError, setCapabilityError] = useState("");
+
+  const refreshCapabilities = useCallback(async () => {
+    try {
+      const nextEdition = await api<Edition>("/v1/capabilities");
+      if (nextEdition.schema_version !== 1 || !nextEdition.features) {
+        throw new Error("Invalid server capability response");
+      }
+      setEdition(nextEdition);
+      setCapabilityError("");
+    } catch (err) {
+      setCapabilityError((err as Error).message);
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -182,13 +205,11 @@ function App() {
   }, []);
 
   useEffect(() => {
-    api<Edition>("/v1/capabilities")
-      .then(setEdition)
-      .catch(() => undefined);
+    refreshCapabilities();
     refresh();
     const timer = window.setInterval(refresh, 5000);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, refreshCapabilities]);
 
   useEffect(() => {
     if (edition.features.cost_analytics && !authRequired) {
@@ -221,6 +242,7 @@ function App() {
   function saveToken(event: FormEvent) {
     event.preventDefault();
     sessionStorage.setItem("gpuflow_token", token);
+    refreshCapabilities();
     refresh();
   }
 
@@ -295,6 +317,7 @@ function App() {
           </div>
         </header>
 
+        {capabilityError && <div className="notice error">无法加载服务能力：{capabilityError}</div>}
         {error && <div className="notice error">无法刷新数据：{error}</div>}
         {page === "overview" && (
           <Overview
@@ -380,7 +403,8 @@ function App() {
       {showConnect && (
         <ConnectNode
           nodes={nodes}
-          editionName={edition.name}
+          features={edition.features}
+          agentBinary={edition.agent_binary || "gpuflow.exe"}
           defaultAgentImage={edition.agent_image || "gpuflow:local"}
           defaultPublicURL={edition.public_url || window.location.origin}
           onClose={() => setShowConnect(false)}
@@ -1089,12 +1113,13 @@ function Nodes({
         {result.items.map((node) => {
           const online =
             Date.now() - new Date(node.last_heartbeat).getTime() < 30_000;
+          const degraded = node.health_status === "DEGRADED";
           const locked = node.busy || Boolean(node.current_job);
           return (
             <article className="node-card" key={node.id}>
               <div className="node-head">
-                <span className={`node-state ${online ? "online" : ""}`}>
-                  {online ? "ONLINE" : "OFFLINE"}
+                <span className={`node-state ${online && !degraded ? "online" : ""}`} title={node.health_reason || ""}>
+                  {degraded ? "DEGRADED" : online ? "ONLINE" : "OFFLINE"}
                 </span>
                 <div>
                   <span>{node.provider}</span>
@@ -1157,28 +1182,31 @@ function PageControls({ page, totalPages, onPage }: { page: number; totalPages: 
 
 function ConnectNode({
   nodes,
-  editionName,
+  features,
+  agentBinary,
   defaultAgentImage,
   defaultPublicURL,
   onClose,
 }: {
   nodes: Node[];
-  editionName: string;
+  features: Record<string, boolean>;
+  agentBinary: string;
   defaultAgentImage: string;
   defaultPublicURL: string;
   onClose: () => void;
 }) {
+  const agentBootstrap = Boolean(features.agent_bootstrap);
   const [mode, setMode] = useState<"windows" | "docker">("windows");
   const [copied, setCopied] = useState(false);
   const [agentImage, setAgentImage] = useState(defaultAgentImage);
   const [serverURL, setServerURL] = useState(defaultPublicURL);
   const [agentToken, setAgentToken] = useState(
-    editionName === "enterprise"
+    agentBootstrap
       ? ""
       : sessionStorage.getItem("gpuflow_token") || "",
   );
   const [agentTokenLoading, setAgentTokenLoading] = useState(
-    editionName === "enterprise",
+    agentBootstrap,
   );
   const [agentTokenError, setAgentTokenError] = useState("");
   const [values, setValues] = useState({
@@ -1196,7 +1224,7 @@ function ConnectNode({
   ];
   const server = (serverURL.trim() || window.location.origin).replace(/\/+$/, "");
   const localOnlyServer = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(server);
-  const binary = editionName === "enterprise" ? "gpuflow-enterprise.exe" : "gpuflow.exe";
+  const binary = agentBinary;
   const token = agentToken;
   const windowsCommand = `.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -hourly-price ${values.price} -executor docker`;
   const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  -e GPUFLOW_PROBE_IMAGE="${agentImage.trim() || "gpuflow:local"}" \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -hourly-price ${values.price}`;
@@ -1206,7 +1234,7 @@ function ConnectNode({
   );
 
   useEffect(() => {
-    if (editionName !== "enterprise") return;
+    if (!agentBootstrap) return;
     let cancelled = false;
     setAgentTokenLoading(true);
     setAgentTokenError("");
@@ -1228,7 +1256,7 @@ function ConnectNode({
     return () => {
       cancelled = true;
     };
-  }, [editionName]);
+  }, [agentBootstrap]);
 
   function update(key: keyof typeof values, value: string) {
     setValues((current) => ({ ...current, [key]: value }));
@@ -1285,7 +1313,7 @@ function ConnectNode({
                 : "该地址将写入 Agent 命令，请确认目标 GPU 主机可以访问。"}
             </small>
           </label>
-          {editionName !== "enterprise" && (
+          {!agentBootstrap && (
             <label className="connection-field">
               Agent Token
               <input
@@ -1361,7 +1389,7 @@ function ConnectNode({
             <span>在目标 GPU 主机运行</span>
             <button
               onClick={copyCommand}
-              disabled={editionName === "enterprise" && !agentToken}
+              disabled={agentBootstrap && !agentToken}
             >
               {agentTokenLoading ? "正在准备…" : copied ? "已复制" : "复制命令"}
             </button>

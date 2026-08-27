@@ -33,6 +33,14 @@ func (testImagePublisher) PublishedImageName(image string) string {
 }
 
 func request(t *testing.T, server *httptest.Server, method, path string, body any, out any) int {
+	return requestAsAgent(t, server, method, path, body, out, "")
+}
+
+func requestAsAgent(t *testing.T, server *httptest.Server, method, path string, body any, out any, attemptToken string) int {
+	return requestWithAgentCredentials(t, server, method, path, body, out, "test-session", attemptToken)
+}
+
+func requestWithAgentCredentials(t *testing.T, server *httptest.Server, method, path string, body any, out any, session, attemptToken string) int {
 	t.Helper()
 	var payload bytes.Buffer
 	if body != nil {
@@ -46,6 +54,12 @@ func request(t *testing.T, server *httptest.Server, method, path string, body an
 	}
 	req.Header.Set("Authorization", "Bearer test-token")
 	req.Header.Set("Content-Type", "application/json")
+	if session != "" {
+		req.Header.Set(model.HeaderAgentSession, session)
+	}
+	if attemptToken != "" {
+		req.Header.Set(model.HeaderAttemptToken, attemptToken)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -347,6 +361,7 @@ func TestEnterpriseNodeCapacityAdmissionIsAtomic(t *testing.T) {
 			}
 			req.Header.Set("Authorization", "Bearer test-token")
 			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(model.HeaderAgentSession, fmt.Sprintf("session-%d", index))
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				errs <- err
@@ -397,23 +412,25 @@ func TestJobLifecycleOverHTTP(t *testing.T) {
 		t.Fatalf("create returned %d", status)
 	}
 
-	if status := request(t, server, http.MethodPost, "/v1/nodes/local-1/next", nil, &job); status != http.StatusOK {
+	var dispatch model.AgentJob
+	if status := request(t, server, http.MethodPost, "/v1/nodes/local-1/next", nil, &dispatch); status != http.StatusOK {
 		t.Fatalf("next returned %d", status)
 	}
+	job = dispatch.Job
 	if job.AssignedNode != "local-1" || job.Status != model.JobAssigned {
 		t.Fatalf("unexpected assignment: %+v", job)
 	}
 
-	if status := request(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id=local-1", model.JobUpdate{Status: model.JobRunning}, &job); status != http.StatusOK {
+	if status := requestAsAgent(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id=local-1", model.JobUpdate{Status: model.JobRunning}, &job, dispatch.AttemptToken); status != http.StatusOK {
 		t.Fatalf("running update returned %d", status)
 	}
-	if status := request(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/logs?node_id=local-1", model.JobLogUpdate{Output: "epoch 1/10"}, &job); status != http.StatusOK {
+	if status := requestAsAgent(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/logs?node_id=local-1", model.JobLogUpdate{Output: "epoch 1/10"}, &job, dispatch.AttemptToken); status != http.StatusOK {
 		t.Fatalf("live log update returned %d", status)
 	}
 	if job.Status != model.JobRunning || job.Output != "epoch 1/10" {
 		t.Fatalf("live log changed job incorrectly: %+v", job)
 	}
-	if status := request(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id=local-1", model.JobUpdate{Status: model.JobSucceeded, Output: "done"}, &job); status != http.StatusOK {
+	if status := requestAsAgent(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id=local-1", model.JobUpdate{Status: model.JobSucceeded, Output: "done"}, &job, dispatch.AttemptToken); status != http.StatusOK {
 		t.Fatalf("success update returned %d", status)
 	}
 	if job.Status != model.JobSucceeded || job.Output != "done" {
@@ -581,5 +598,118 @@ func TestImageBuildPersistenceFailureIsVisible(t *testing.T) {
 	got := builder.List()[0]
 	if got.Status != "failed" || !strings.Contains(got.Error, "storage unavailable") {
 		t.Fatalf("persistence failure was hidden: %+v", got)
+	}
+}
+
+func TestExpiredLicenseAllowsReconnectButRejectsNewCapacityAndScheduling(t *testing.T) {
+	state := store.NewMemory()
+	existing := model.Node{ID: "licensed-node", GPUCount: 1, VRAMGB: 24}
+	if _, err := state.RegisterNodeSession(existing, "test-session"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor := edition.Community()
+	descriptor.Name = "enterprise"
+	descriptor.ExpiresAt = time.Now().Add(-time.Minute).Format(time.RFC3339)
+	descriptor.MaxNodes, descriptor.MaxGPUs = 0, 0
+	server := httptest.NewServer(NewWithEdition(state, "test-token", descriptor).Handler())
+	defer server.Close()
+
+	if status := request(t, server, http.MethodPost, "/v1/nodes/register", existing, &existing); status != http.StatusOK {
+		t.Fatalf("existing node reconnect returned %d", status)
+	}
+	if status := request(t, server, http.MethodPost, "/v1/nodes/register", model.Node{ID: "new-node", GPUCount: 0}, nil); status != http.StatusForbidden {
+		t.Fatalf("new capacity under expired license returned %d", status)
+	}
+	var job model.Job
+	request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "expired-job", Image: "work", Requirements: model.Requirements{GPUCount: 1}}, &job)
+	stored, _ := state.GetJob(job.ID)
+	if stored.Status != model.JobQueued {
+		t.Fatalf("expired license scheduled a new job: %+v", stored)
+	}
+}
+
+func TestHealthInventoryCannotBypassLicenseOverHTTP(t *testing.T) {
+	state := store.NewMemory()
+	descriptor := edition.Community()
+	descriptor.Name = "enterprise"
+	descriptor.MaxGPUs = 1
+	descriptor.Features[edition.FeatureNodeHealth] = true
+	descriptor.Features[edition.FeaturePerGPUInventory] = true
+	server := httptest.NewServer(NewWithEdition(state, "test-token", descriptor).Handler())
+	defer server.Close()
+
+	for _, id := range []string{"health-a", "health-b"} {
+		node := model.Node{ID: id, GPUModel: "none", HealthStatus: "HEALTHY"}
+		if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/register", node, &node, "session-"+id, ""); status != http.StatusOK {
+			t.Fatalf("register %s returned %d", id, status)
+		}
+	}
+	update := model.NodeHealthUpdate{Status: "HEALTHY", GPUModel: "L4", GPUCount: 1, VRAMGB: 24, Devices: []model.GPUDevice{{Index: 0, UUID: "GPU-one", Model: "L4", VRAMGB: 24}}}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/health-a/health", update, nil, "session-health-a", ""); status != http.StatusOK {
+		t.Fatalf("first health expansion returned %d", status)
+	}
+	update.Devices[0].UUID = "GPU-two"
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/health-b/health", update, nil, "session-health-b", ""); status != http.StatusForbidden {
+		t.Fatalf("health expansion over license returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/health-b/health", model.NodeHealthUpdate{Status: "DEGRADED", GPUCount: -1}, nil, "session-health-b", ""); status != http.StatusBadRequest {
+		t.Fatalf("negative health inventory returned %d", status)
+	}
+}
+
+func TestAgentSessionAndAttemptHeadersAreEnforcedOverHTTP(t *testing.T) {
+	state := store.NewMemory()
+	server := httptest.NewServer(New(state, "test-token").Handler())
+	defer server.Close()
+
+	node := model.Node{ID: "fenced-http", GPUCount: 1, VRAMGB: 24}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/register", node, &node, "session-one", ""); status != http.StatusOK {
+		t.Fatalf("register returned %d", status)
+	}
+	var job model.Job
+	request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "fenced", Image: "work", Requirements: model.Requirements{GPUCount: 1}}, &job)
+	var dispatch model.AgentJob
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/fenced-http/next", nil, &dispatch, "session-one", ""); status != http.StatusOK {
+		t.Fatalf("dispatch returned %d", status)
+	}
+	statusPath := "/v1/jobs/" + job.ID + "/status?node_id=fenced-http"
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, statusPath, model.JobUpdate{Status: model.JobRunning}, nil, "session-one", ""); status != http.StatusPreconditionFailed {
+		t.Fatalf("missing attempt token returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, statusPath, model.JobUpdate{Status: model.JobRunning}, nil, "session-two", dispatch.AttemptToken); status != http.StatusPreconditionFailed {
+		t.Fatalf("stale session returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, statusPath, model.JobUpdate{Status: model.JobRunning}, &job, "session-one", dispatch.AttemptToken); status != http.StatusOK {
+		t.Fatalf("valid attempt returned %d", status)
+	}
+	logPath := "/v1/jobs/" + job.ID + "/logs?node_id=fenced-http"
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, logPath, model.JobLogUpdate{Output: "late"}, nil, "session-one", "wrong"); status != http.StatusPreconditionFailed {
+		t.Fatalf("wrong log attempt returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, logPath, model.JobLogUpdate{Output: "current"}, &job, "session-one", dispatch.AttemptToken); status != http.StatusOK || job.Output != "current" {
+		t.Fatalf("valid log update returned %d job=%+v", status, job)
+	}
+}
+
+func TestCapabilitiesHideCommercialLicenseWithoutAuthentication(t *testing.T) {
+	descriptor := edition.Community()
+	descriptor.Name, descriptor.LicensedTo = "enterprise", "commercial-customer"
+	descriptor.ExpiresAt, descriptor.MaxNodes, descriptor.MaxGPUs = "2030-01-01T00:00:00+08:00", 10, 80
+	server := httptest.NewServer(NewWithEdition(store.NewMemory(), "test-token", descriptor).Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/v1/capabilities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var public map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&public); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"licensed_to", "expires_at", "max_nodes", "max_gpus", "max_cpu_cores"} {
+		if _, exposed := public[field]; exposed {
+			t.Fatalf("public capabilities exposed %s: %+v", field, public)
+		}
 	}
 }

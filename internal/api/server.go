@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"gpuflow/internal/artifact"
@@ -22,13 +21,12 @@ import (
 )
 
 type Server struct {
-	store      *store.Store
-	token      string
-	mux        *http.ServeMux
-	edition    edition.Descriptor
-	images     *ImageBuilder
-	artifacts  artifact.Store
-	registerMu sync.Mutex
+	store     *store.Store
+	token     string
+	mux       *http.ServeMux
+	edition   edition.Descriptor
+	images    *ImageBuilder
+	artifacts artifact.Store
 }
 
 func New(s *store.Store, token string) *Server {
@@ -48,6 +46,10 @@ func NewWithStores(s *store.Store, taskImages store.TaskImageStore, artifacts ar
 }
 
 func NewWithStoresAndPublisher(s *store.Store, taskImages store.TaskImageStore, artifacts artifact.Store, token string, descriptor edition.Descriptor, publisher ImagePublisher) *Server {
+	s.SetGPUGranularScheduling(descriptor.Features[edition.FeatureGPUGranularScheduling])
+	s.SetSchedulingLimits(descriptor.MaxNodes, descriptor.MaxGPUs, descriptor.ExpiresAt)
+	s.SetNodeHealthPolicy(descriptor.Features[edition.FeatureNodeHealth], 3*time.Minute)
+	s.SetPerGPUInventory(descriptor.Features[edition.FeaturePerGPUInventory])
 	server := &Server{store: s, token: token, mux: http.NewServeMux(), edition: descriptor, images: NewImageBuilderWithPublisher(taskImages, publisher), artifacts: artifacts}
 	server.routes()
 	return server
@@ -59,7 +61,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
-	s.mux.HandleFunc("GET /v1/capabilities", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.edition) })
+	s.mux.HandleFunc("GET /v1/capabilities", s.capabilities)
 	s.mux.HandleFunc("POST /v1/jobs", s.createJob)
 	s.mux.HandleFunc("GET /v1/jobs", s.listJobs)
 	s.mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
@@ -74,6 +76,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts/{name}", s.downloadArtifact)
 	s.mux.HandleFunc("POST /v1/nodes/register", s.registerNode)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/heartbeat", s.heartbeat)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/health", s.updateNodeHealth)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/next", s.nextJob)
 	s.mux.HandleFunc("GET /v1/nodes", s.listNodes)
 	s.mux.HandleFunc("DELETE /v1/nodes/{id}", s.deleteNode)
@@ -83,18 +86,26 @@ func (s *Server) routes() {
 	s.mux.Handle("/", webui.Handler())
 }
 
+func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
+	descriptor := s.edition.Public()
+	if s.token != "" && r.Header.Get("Authorization") == "Bearer "+s.token {
+		descriptor = s.edition
+	}
+	writeJSON(w, http.StatusOK, descriptor)
+}
+
 func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	if !s.artifacts.Enabled() {
 		writeError(w, http.StatusServiceUnavailable, artifact.ErrDisabled.Error())
 		return
 	}
-	job, err := s.store.GetJob(r.PathValue("id"))
-	if err != nil {
-		handleStoreError(w, err)
+	nodeID := r.URL.Query().Get("node_id")
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, "node_id is required")
 		return
 	}
-	if nodeID := r.URL.Query().Get("node_id"); nodeID == "" || nodeID != job.AssignedNode {
-		writeError(w, http.StatusForbidden, "artifact upload is only allowed from the assigned node")
+	if err := s.store.ValidateJobAttempt(r.PathValue("id"), nodeID, r.Header.Get(model.HeaderAgentSession), r.Header.Get(model.HeaderAttemptToken)); err != nil {
+		handleStoreError(w, err)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
@@ -105,7 +116,7 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	name := filepath.Base(header.Filename)
-	if err := s.artifacts.Put(r.Context(), job.ID, name, file, header.Size); err != nil {
+	if err := s.artifacts.Put(r.Context(), r.PathValue("id"), name, file, header.Size); err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -183,6 +194,9 @@ func logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
+		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/nodes/") && (strings.HasSuffix(r.URL.Path, "/heartbeat") || strings.HasSuffix(r.URL.Path, "/next")) {
+			return
+		}
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
 	})
 }
@@ -254,6 +268,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		handleStoreError(w, err)
 		return
 	}
+	s.scheduleBestEffort()
 	writeJSON(w, http.StatusOK, j)
 }
 func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
@@ -279,61 +294,35 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
-	s.registerMu.Lock()
-	defer s.registerMu.Unlock()
-	if status, err := s.validateNodeCapacity(n); err != nil {
-		writeError(w, status, err.Error())
-		return
-	}
-	saved, err := s.store.RegisterNode(n)
+	saved, err := s.store.RegisterNodeSession(n, r.Header.Get(model.HeaderAgentSession))
 	if err != nil {
-		writeError(w, 500, err.Error())
+		handleStoreError(w, err)
 		return
 	}
 	s.scheduleBestEffort()
 	writeJSON(w, 200, saved)
 }
-
-func (s *Server) validateNodeCapacity(candidate model.Node) (int, error) {
-	if candidate.GPUCount < 0 || candidate.CPUCores < 0 || candidate.VRAMGB < 0 {
-		return http.StatusBadRequest, errors.New("node resource counts cannot be negative")
-	}
-	limits := s.edition
-	if limits.MaxNodes <= 0 && limits.MaxGPUs <= 0 {
-		return 0, nil
-	}
-
-	nodes := s.store.ListNodes()
-	totalGPUs := 0
-	var existing *model.Node
-	for _, node := range nodes {
-		totalGPUs += node.GPUCount
-		if node.ID == candidate.ID && candidate.ID != "" {
-			existing = node
-		}
-	}
-	projectedNodes := len(nodes)
-	projectedGPUs := totalGPUs + candidate.GPUCount
-	if existing == nil {
-		projectedNodes++
-	} else {
-		projectedGPUs -= existing.GPUCount
-	}
-	if limits.MaxNodes > 0 && projectedNodes > limits.MaxNodes && existing == nil {
-		return http.StatusForbidden, fmt.Errorf("enterprise license node capacity exceeded: %d requested, %d licensed", projectedNodes, limits.MaxNodes)
-	}
-	if limits.MaxGPUs > 0 && projectedGPUs > limits.MaxGPUs && (existing == nil || candidate.GPUCount > existing.GPUCount) {
-		return http.StatusForbidden, fmt.Errorf("enterprise license GPU capacity exceeded: %d requested, %d licensed", projectedGPUs, limits.MaxGPUs)
-	}
-	return 0, nil
-}
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.HeartbeatNode(r.PathValue("id")); err != nil {
+	if err := s.store.HeartbeatNodeSession(r.PathValue("id"), r.Header.Get(model.HeaderAgentSession)); err != nil {
 		handleStoreError(w, err)
 		return
 	}
 	s.scheduleBestEffort()
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+func (s *Server) updateNodeHealth(w http.ResponseWriter, r *http.Request) {
+	var update model.NodeHealthUpdate
+	if err := decode(w, r, &update); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	node, err := s.store.UpdateNodeHealthSession(r.PathValue("id"), r.Header.Get(model.HeaderAgentSession), update)
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	s.scheduleBestEffort()
+	writeJSON(w, http.StatusOK, node)
 }
 func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery == "" {
@@ -356,7 +345,7 @@ func (s *Server) nextJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "schedule jobs: "+err.Error())
 		return
 	}
-	j, err := s.store.NextJob(r.PathValue("id"))
+	j, err := s.store.NextJobSession(r.PathValue("id"), r.Header.Get(model.HeaderAgentSession))
 	if err != nil {
 		handleStoreError(w, err)
 		return
@@ -378,7 +367,7 @@ func (s *Server) updateJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "node_id is required")
 		return
 	}
-	j, err := s.store.UpdateJob(r.PathValue("id"), nodeID, in)
+	j, err := s.store.UpdateJobLease(r.PathValue("id"), nodeID, r.Header.Get(model.HeaderAgentSession), r.Header.Get(model.HeaderAttemptToken), in)
 	if err != nil {
 		handleStoreError(w, err)
 		return
@@ -398,7 +387,7 @@ func (s *Server) updateJobLog(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "node_id is required")
 		return
 	}
-	job, err := s.store.UpdateJobOutput(r.PathValue("id"), nodeID, in.Output)
+	job, err := s.store.UpdateJobOutputLease(r.PathValue("id"), nodeID, r.Header.Get(model.HeaderAgentSession), r.Header.Get(model.HeaderAttemptToken), in.Output)
 	if err != nil {
 		handleStoreError(w, err)
 		return
@@ -418,6 +407,22 @@ func handleStoreError(w http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, 404, "not found")
+		return
+	}
+	if errors.Is(err, store.ErrInvalidResources) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrLicenseExpired) || errors.Is(err, store.ErrLicenseCapacity) {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrAttemptLease) {
+		writeError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrAgentSession) || errors.Is(err, store.ErrAgentSessionActive) || errors.Is(err, store.ErrNodeUnavailable) {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	if errors.Is(err, store.ErrNodeBusy) {
