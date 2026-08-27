@@ -1155,19 +1155,6 @@ function PageControls({ page, totalPages, onPage }: { page: number; totalPages: 
   );
 }
 
-const gpuProfiles = [
-  { value: "RTX-3050-Laptop", label: "RTX 3050 Laptop · 4GB", vram: "4" },
-  { value: "RTX-3060", label: "RTX 3060 · 12GB", vram: "12" },
-  { value: "RTX-3090", label: "RTX 3090 · 24GB", vram: "24" },
-  { value: "RTX-4090", label: "RTX 4090 · 24GB", vram: "24" },
-  { value: "NVIDIA-L4", label: "NVIDIA L4 · 24GB", vram: "24" },
-  { value: "NVIDIA-L40S", label: "NVIDIA L40S · 48GB", vram: "48" },
-  { value: "NVIDIA-A10", label: "NVIDIA A10 · 24GB", vram: "24" },
-  { value: "NVIDIA-A100-40GB", label: "NVIDIA A100 · 40GB", vram: "40" },
-  { value: "NVIDIA-A100-80GB", label: "NVIDIA A100 · 80GB", vram: "80" },
-  { value: "NVIDIA-H100-80GB", label: "NVIDIA H100 · 80GB", vram: "80" },
-];
-
 function ConnectNode({
   nodes,
   editionName,
@@ -1197,9 +1184,6 @@ function ConnectNode({
   const [values, setValues] = useState({
     name: "local-gpu-01",
     pool: "default",
-    model: "RTX-4090",
-    count: "1",
-    vram: "24",
     price: "0",
   });
   const pools = [
@@ -1214,8 +1198,8 @@ function ConnectNode({
   const localOnlyServer = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(server);
   const binary = editionName === "enterprise" ? "gpuflow-enterprise.exe" : "gpuflow.exe";
   const token = agentToken;
-  const windowsCommand = `.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price} -executor docker`;
-  const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -gpu-model "${values.model}" -gpu-count ${values.count} -vram ${values.vram} -hourly-price ${values.price}`;
+  const windowsCommand = `.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -hourly-price ${values.price} -executor docker`;
+  const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  -e GPUFLOW_PROBE_IMAGE="${agentImage.trim() || "gpuflow:local"}" \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -hourly-price ${values.price}`;
   const command = (mode === "windows" ? windowsCommand : dockerCommand).replace(
     /\n\+\s*/g,
     "\n  ",
@@ -1248,15 +1232,6 @@ function ConnectNode({
 
   function update(key: keyof typeof values, value: string) {
     setValues((current) => ({ ...current, [key]: value }));
-    setCopied(false);
-  }
-  function updateModel(value: string) {
-    const profile = gpuProfiles.find((item) => item.value === value);
-    setValues((current) => ({
-      ...current,
-      model: value,
-      vram: profile?.vram || current.vram,
-    }));
     setCopied(false);
   }
   async function copyCommand() {
@@ -1364,45 +1339,6 @@ function ConnectNode({
               {pools.map((pool) => (
                 <option key={pool}>{pool}</option>
               ))}
-            </select>
-          </label>
-          <label>
-            GPU 型号
-            <select
-              value={values.model}
-              onChange={(event) => updateModel(event.target.value)}
-            >
-              {gpuProfiles.map((profile) => (
-                <option key={profile.value} value={profile.value}>
-                  {profile.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            GPU 数量
-            <select
-              value={values.count}
-              onChange={(event) => update("count", event.target.value)}
-            >
-              {["1", "2", "4", "8"].map((count) => (
-                <option key={count}>{count}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            显存容量
-            <select
-              value={values.vram}
-              onChange={(event) => update("vram", event.target.value)}
-            >
-              {["4", "8", "12", "16", "24", "32", "40", "48", "80"].map(
-                (vram) => (
-                  <option key={vram} value={vram}>
-                    {vram} GB
-                  </option>
-                ),
-              )}
             </select>
           </label>
           <label>

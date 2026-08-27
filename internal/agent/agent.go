@@ -22,10 +22,11 @@ import (
 )
 
 type Config struct {
-	Server, Token, ID, Name, Provider, Pool, GPUModel, Executor, ArtifactDir string
-	GPUCount, CPUCores, VRAMGB                                               int
-	HourlyPrice                                                              float64
-	PollInterval, HeartbeatInterval, ArtifactUploadTimeout                   time.Duration
+	Server, Token, ID, Name, Provider, Pool, Executor, ArtifactDir, ProbeImage string
+	CPUCores                                                                   int
+	HourlyPrice                                                                float64
+	PollInterval, HeartbeatInterval, ArtifactUploadTimeout                     time.Duration
+	ProbeCommand                                                               func(context.Context, string, ...string) ([]byte, error)
 }
 type Agent struct {
 	cfg    Config
@@ -51,12 +52,15 @@ func New(cfg Config) *Agent {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	n := model.Node{ID: a.cfg.ID, Name: a.cfg.Name, Provider: a.cfg.Provider, Pool: a.cfg.Pool, GPUModel: a.cfg.GPUModel, GPUCount: a.cfg.GPUCount, CPUCores: a.cfg.CPUCores, VRAMGB: a.cfg.VRAMGB, HourlyPrice: a.cfg.HourlyPrice}
+	n, err := a.probeNode(ctx)
+	if err != nil {
+		return fmt.Errorf("discover node resources: %w", err)
+	}
 	if _, err := a.client.Do(http.MethodPost, "/v1/nodes/register", n, &n); err != nil {
 		return fmt.Errorf("register node: %w", err)
 	}
 	a.cfg.ID = n.ID
-	workers := a.cfg.GPUCount
+	workers := n.GPUCount
 	if workers < 1 {
 		workers = 1
 	}

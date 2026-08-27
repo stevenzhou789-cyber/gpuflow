@@ -242,9 +242,6 @@ Windows Agent 的启动方式如下；实际使用时，应优先复制控制台
   -name "local-gpu-01" `
   -provider local `
   -pool local `
-  -gpu-model "RTX-3050-Laptop" `
-  -gpu-count 1 `
-  -vram 4 `
   -hourly-price 0 `
   -executor docker
 ```
@@ -316,6 +313,7 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts \
   -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \
+  -e GPUFLOW_PROBE_IMAGE=ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 \
   ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 agent \
   -server "http://control-plane.example.com:8080" \
   -token "replace-with-your-token" \
@@ -323,9 +321,6 @@ docker run -d \
   -name "lab-gpu-01" \
   -provider local \
   -pool default \
-  -gpu-model "RTX-4090" \
-  -gpu-count 1 \
-  -vram 24 \
   -hourly-price 0 \
   -executor docker
 ```
@@ -432,15 +427,13 @@ docker compose up --build -d
 | `GPUFLOW_NODE_NAME` | 节点显示名称 |
 | `GPUFLOW_PROVIDER` | 提供方，当前使用 `local` |
 | `GPUFLOW_POOL` | 资源池名称 |
-| `GPUFLOW_GPU_MODEL` | GPU 型号 |
-| `GPUFLOW_GPU_COUNT` | GPU 数量 |
-| `GPUFLOW_VRAM_GB` | 单卡显存容量（GB） |
+| `GPUFLOW_PROBE_IMAGE` | 容器化 Agent 用于启动时验证 NVIDIA Runtime 的同版本镜像 |
 | `GPUFLOW_CPU_CORES` | 可选；节点逻辑 CPU 核数，默认自动读取 Agent 进程可见的 CPU 数量 |
 | `GPUFLOW_HOURLY_PRICE` | 调度参考单价（人民币元/GPU/小时） |
 | `GPUFLOW_EXECUTOR` | `docker` 或 `mock` |
 | `GPUFLOW_ARTIFACT_WORKDIR` | 可选；容器化 Agent 必须设置为宿主机与 Agent 容器共享的同路径目录 |
 
-命令行参数会覆盖对应的环境变量。Agent 会自动上报逻辑 CPU 核数；仅当容器 CPU 限额或宿主机探测结果不符合交付口径时，才使用 `-cpu-cores` 或 `GPUFLOW_CPU_CORES` 显式覆盖。
+命令行参数会覆盖对应的环境变量。Agent 启动时自动识别 GPU 型号、数量和单卡显存汇总信息，并自动上报逻辑 CPU 核数；仅当容器 CPU 限额或宿主机探测结果不符合交付口径时，才使用 `-cpu-cores` 或 `GPUFLOW_CPU_CORES` 显式覆盖。
 
 ## 自动构建与发布
 

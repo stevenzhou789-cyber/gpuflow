@@ -126,13 +126,11 @@ func runAgent(args []string) error {
 	fs.StringVar(&cfg.Name, "name", env("GPUFLOW_NODE_NAME", "local-agent"), "node name")
 	fs.StringVar(&cfg.Provider, "provider", env("GPUFLOW_PROVIDER", "local"), "provider")
 	fs.StringVar(&cfg.Pool, "pool", env("GPUFLOW_POOL", "default"), "pool")
-	fs.StringVar(&cfg.GPUModel, "gpu-model", env("GPUFLOW_GPU_MODEL", "generic"), "GPU model")
-	fs.IntVar(&cfg.GPUCount, "gpu-count", envInt("GPUFLOW_GPU_COUNT", 1), "GPU count")
 	fs.IntVar(&cfg.CPUCores, "cpu-cores", envInt("GPUFLOW_CPU_CORES", runtime.NumCPU()), "logical CPU core count reported for scheduling and resource visibility")
-	fs.IntVar(&cfg.VRAMGB, "vram", envInt("GPUFLOW_VRAM_GB", 24), "VRAM in GB")
 	fs.Float64Var(&cfg.HourlyPrice, "hourly-price", envFloat("GPUFLOW_HOURLY_PRICE", 0), "estimated hourly price")
 	fs.StringVar(&cfg.Executor, "executor", env("GPUFLOW_EXECUTOR", "docker"), "docker or mock")
 	fs.StringVar(&cfg.ArtifactDir, "artifact-dir", env("GPUFLOW_ARTIFACT_WORKDIR", ""), "host-visible artifact work directory")
+	fs.StringVar(&cfg.ProbeImage, "probe-image", env("GPUFLOW_PROBE_IMAGE", ""), "agent image used to validate NVIDIA container runtime")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
