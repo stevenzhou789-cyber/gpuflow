@@ -4,7 +4,7 @@
 
 GPUFlow 把分散在本地工作站、实验室服务器和自建机房中的 GPU 节点接入同一个控制面，统一完成任务提交、资源匹配、执行监控、失败重试与日志查看。算力仍由使用者自己提供，GPUFlow 不转售算力，也不介入云厂商计费。
 
-> 当前状态：社区预览版。现阶段重点支持可信网络中的本地 Docker 节点；MySQL 保存任务、节点和任务镜像记录，MinIO/S3 保存任务产物，适合个人、实验室和小型团队验证批任务调度流程。
+> 当前状态：社区稳定维护版。节点接入、批任务调度、日志、重试、产物和持久化已形成完整闭环；后续以小步维护、可靠性修复和必要底层能力为主，企业治理能力不会下放到本仓库。
 
 > **从一台机器跑通，到一组 GPU 高效协作：** Community 负责把批任务闭环交到你手里；当节点增多、团队开始共用算力时，[GPUFlow Enterprise](#从开源验证到企业落地) 可进一步提供 GPU 粒度并发调度、内置镜像分发、角色权限与审计能力。
 
@@ -31,6 +31,7 @@ flowchart LR
 - 运行任务中的节点禁止删除
 - `lowest_cost`、`most_vram` 调度策略
 - GPU 数量、最低显存和资源池约束
+- Agent 启动时自动识别 GPU 型号、数量和单卡显存汇总，不保留手工 GPU 容量覆盖
 - Docker 容器执行、超时控制和失败重试
 - 任务状态、输出与日志查看
 - 任务停止、重跑、删除、搜索、过滤与分页
@@ -76,7 +77,7 @@ docker compose ps
 
 在 Web 控制台进入 **节点 → 接入算力节点**，填写节点信息，并在目标机器执行页面生成的 Agent 命令。节点开始持续发送心跳后，页面才会显示 `ONLINE`；仅启动控制面不会产生在线节点。
 
-只验证 CPU 流程时，节点的 GPU 数量和显存可以填写 `0`。运行 GPU 任务时，应按目标机器的实际 GPU 数量、型号和显存填写，否则任务会因为找不到匹配节点而一直排队。
+Agent 启动时自动读取节点的 GPU 型号、数量和单卡显存汇总；未检测到 NVIDIA GPU 的原生 Agent 会按 CPU 节点注册。创建任务时仍需按任务实际需要填写 GPU 数量和最低显存，否则任务可能无法匹配节点。
 
 ### 3. 构建并提交第一个任务
 
@@ -147,7 +148,7 @@ sudo cp deploy/agent/compose.yaml deploy/agent/.env.example /opt/gpuflow-agent/
 sudo chown -R "$USER":"$USER" /opt/gpuflow-agent
 cd /opt/gpuflow-agent
 sudo mv .env.example .env
-# 编辑 .env 中的控制面地址、Token、节点 ID 和 GPU 信息
+# 编辑 .env 中的控制面地址、Token 和节点 ID；GPU 容量由 Agent 自动识别
 docker compose up -d
 ```
 
@@ -176,7 +177,7 @@ SSH 密钥、堡垒机和 `ProxyJump` 应配置在控制面服务器的 `~/.ssh/
 程序版本回滚同样从控制面执行：
 
 ```bash
-./scripts/rollback.sh v1.0.0
+./scripts/rollback.sh v1.0.11
 ```
 
 回滚脚本只切换控制面和 Agent 镜像，不恢复 MySQL 或 MinIO 数据。跨越不兼容数据库迁移之前，应先根据对应版本的升级说明判断旧程序是否能够读取当前数据库；需要恢复数据库备份时必须单独安排维护窗口，并接受备份时间点之后的数据会丢失。
@@ -255,8 +256,8 @@ Windows Agent 的启动方式如下；实际使用时，应优先复制控制台
 | 部署环境 | 推荐获取方式 | 使用的程序或镜像 |
 | --- | --- | --- |
 | 本机源码体验 | 执行 `docker compose up --build -d`，由 Compose 从当前源码构建 | `gpuflow:local` |
-| 可访问互联网的 Linux 节点 | 从 GHCR 拉取明确的版本镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0` |
-| 多节点或企业内网 | 将同一版本的 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:v1.0.0` |
+| 可访问互联网的 Linux 节点 | 从 GHCR 拉取明确的版本镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11` |
+| 多节点或企业内网 | 将同一版本的 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:v1.0.11` |
 | 无法访问外网的离线节点 | 在联网机器拉取对应架构镜像，使用 `docker save` 导出后传入离线环境并执行 `docker load` | 导入后的本地镜像标签 |
 | Windows 原生 Agent | 下载对应 `v*` Release 中的 Windows 压缩包，或使用 Go 从源码构建 | `gpuflow.exe`，不需要 Agent 镜像 |
 | 修改源码后的自定义部署 | 在仓库根目录执行 `docker build` | 自定义镜像标签 |
@@ -264,34 +265,34 @@ Windows Agent 的启动方式如下；实际使用时，应优先复制控制台
 可联网的 Linux/Docker 环境直接拉取：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
 ```
 
 同步到私有仓库：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
-docker tag ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 \
-  harbor.example.com/gpuflow/gpuflow:v1.0.0
-docker push harbor.example.com/gpuflow/gpuflow:v1.0.0
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
+docker tag ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11 \
+  harbor.example.com/gpuflow/gpuflow:v1.0.11
+docker push harbor.example.com/gpuflow/gpuflow:v1.0.11
 ```
 
 同步完成后，在控制端 `.env` 中设置镜像地址，Web 控制台生成的 Docker Agent 命令就会使用该地址：
 
 ```env
-GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:v1.0.0
+GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:v1.0.11
 ```
 
 离线环境应明确选择目标 CPU 架构。以下示例导出 Linux amd64 镜像：
 
 ```bash
 # 在可联网机器执行
-docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
-docker save -o gpuflow-v1.0.0-linux-amd64.tar \
-  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
+docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
+docker save -o gpuflow-v1.0.11-linux-amd64.tar \
+  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
 
 # 将 tar 文件复制到离线节点后执行
-docker load -i gpuflow-v1.0.0-linux-amd64.tar
+docker load -i gpuflow-v1.0.11-linux-amd64.tar
 ```
 
 ARM64 节点将 `linux/amd64` 改为 `linux/arm64`。如果修改过源码，可以在仓库根目录构建本地镜像：
@@ -313,8 +314,8 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts \
   -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \
-  -e GPUFLOW_PROBE_IMAGE=ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 \
-  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 agent \
+  -e GPUFLOW_PROBE_IMAGE=ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11 \
+  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11 agent \
   -server "http://control-plane.example.com:8080" \
   -token "replace-with-your-token" \
   -id "lab-gpu-01" \
@@ -450,7 +451,7 @@ docker compose up --build -d
 推送完成后可以直接拉取：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
 ```
 
 工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release，不需要额外创建个人访问令牌。生产部署建议记录镜像 Digest，获得比版本标签更严格的产物固定。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置。
@@ -527,6 +528,8 @@ GPUFlow Community 不是只能观看的演示版：它完整覆盖节点接入�
 | 对比维度 | Community 社区版 | Enterprise 企业版 |
 | --- | --- | --- |
 | **调度粒度** | **按节点调度；一个任务运行时独占整台节点** | **按 GPU 调度；任务绑定具体物理 GPU 索引** |
+| GPU 资源识别 | 启动时识别型号、数量和单卡显存汇总 | 识别 GPU UUID、索引、型号、显存、驱动和 Docker 环境 |
+| 节点健康治理 | 启动阶段基础校验，不做周期健康状态治理 | 周期复检；异常节点标记 `DEGRADED`，持久化原因并停止接收新任务 |
 | 多卡利用率 | 多卡节点同一时间只运行一个任务 | 按任务申请的 GPU 数分配，同一节点可并发运行多个任务 |
 | 设备隔离 | 不区分节点内部的 GPU 索引 | 通过 `CUDA_VISIBLE_DEVICES` 向容器暴露已分配的 GPU |
 | 任务镜像 | 对接外部共享 Registry，由管理员配置凭据 | 内置轻量 OCI Registry，自动完成构建、推送、凭据下发与节点拉取 |
