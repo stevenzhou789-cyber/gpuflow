@@ -177,7 +177,7 @@ SSH 密钥、堡垒机和 `ProxyJump` 应配置在控制面服务器的 `~/.ssh/
 程序版本回滚同样从控制面执行：
 
 ```bash
-./scripts/rollback.sh v1.0.11
+./scripts/rollback.sh stable
 ```
 
 回滚脚本只切换控制面和 Agent 镜像，不恢复 MySQL 或 MinIO 数据。跨越不兼容数据库迁移之前，应先根据对应版本的升级说明判断旧程序是否能够读取当前数据库；需要恢复数据库备份时必须单独安排维护窗口，并接受备份时间点之后的数据会丢失。
@@ -256,8 +256,8 @@ Windows Agent 的启动方式如下；实际使用时，应优先复制控制台
 | 部署环境 | 推荐获取方式 | 使用的程序或镜像 |
 | --- | --- | --- |
 | 本机源码体验 | 执行 `docker compose up --build -d`，由 Compose 从当前源码构建 | `gpuflow:local` |
-| 可访问互联网的 Linux 节点 | 从 GHCR 拉取明确的版本镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11` |
-| 多节点或企业内网 | 将同一版本的 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:v1.0.11` |
+| 可访问互联网的 Linux 节点 | 从 GHCR 拉取明确的版本镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:stable` |
+| 多节点或企业内网 | 将同一版本的 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:stable` |
 | 无法访问外网的离线节点 | 在联网机器拉取对应架构镜像，使用 `docker save` 导出后传入离线环境并执行 `docker load` | 导入后的本地镜像标签 |
 | Windows 原生 Agent | 下载对应 `v*` Release 中的 Windows 压缩包，或使用 Go 从源码构建 | `gpuflow.exe`，不需要 Agent 镜像 |
 | 修改源码后的自定义部署 | 在仓库根目录执行 `docker build` | 自定义镜像标签 |
@@ -265,34 +265,34 @@ Windows Agent 的启动方式如下；实际使用时，应优先复制控制台
 可联网的 Linux/Docker 环境直接拉取：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
 ```
 
 同步到私有仓库：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
-docker tag ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11 \
-  harbor.example.com/gpuflow/gpuflow:v1.0.11
-docker push harbor.example.com/gpuflow/gpuflow:v1.0.11
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker tag ghcr.io/stevenzhou789-cyber/gpuflow:stable \
+  harbor.example.com/gpuflow/gpuflow:stable
+docker push harbor.example.com/gpuflow/gpuflow:stable
 ```
 
 同步完成后，在控制端 `.env` 中设置镜像地址，Web 控制台生成的 Docker Agent 命令就会使用该地址：
 
 ```env
-GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:v1.0.11
+GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:stable
 ```
 
 离线环境应明确选择目标 CPU 架构。以下示例导出 Linux amd64 镜像：
 
 ```bash
 # 在可联网机器执行
-docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
-docker save -o gpuflow-v1.0.11-linux-amd64.tar \
-  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
+docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker save -o gpuflow-stable-linux-amd64.tar \
+  ghcr.io/stevenzhou789-cyber/gpuflow:stable
 
 # 将 tar 文件复制到离线节点后执行
-docker load -i gpuflow-v1.0.11-linux-amd64.tar
+docker load -i gpuflow-stable-linux-amd64.tar
 ```
 
 ARM64 节点将 `linux/amd64` 改为 `linux/arm64`。如果修改过源码，可以在仓库根目录构建本地镜像：
@@ -314,8 +314,8 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts \
   -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \
-  -e GPUFLOW_PROBE_IMAGE=ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11 \
-  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11 agent \
+  -e GPUFLOW_PROBE_IMAGE=ghcr.io/stevenzhou789-cyber/gpuflow:stable \
+  ghcr.io/stevenzhou789-cyber/gpuflow:stable agent \
   -server "http://control-plane.example.com:8080" \
   -token "replace-with-your-token" \
   -id "lab-gpu-01" \
@@ -442,16 +442,16 @@ docker compose up --build -d
 
 - Pull Request 会运行 Go 测试、构建 Web，并验证 Docker 镜像能够构建，但不会发布。
 - 推送到 `main` 会发布 `linux/amd64`、`linux/arm64` 的 `sha-<commit>` 镜像。
-- 推送 `v*` Git 标签会额外发布同名镜像，并创建或更新对应的 GitHub Release。
-- 版本化 Release 提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`。
-- 版本化 Release 还会生成 `gpuflow-deployment-v*.tar.gz`，其中包含面向客户运维的独立 `README.md`、Compose、升级/回滚脚本和 Agent 部署模板。
+- 更新 `stable` Git 标签会发布 `stable` 镜像，并创建或更新唯一的 Community Stable GitHub Release。
+- Stable Release 提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`。
+- Stable Release 还会生成 `gpuflow-deployment-stable.tar.gz`，其中包含面向客户运维的独立 `README.md`、Compose、升级/回滚脚本和 Agent 部署模板。
 - 发布镜像会按不可变 Digest 进行 Cosign 签名；Release 中的程序包和 `checksums.txt` 会附带 `.sigstore.json` 签名 bundle，并提供 `cosign.pub` 公钥。
-- 已发布的版本镜像保留在 GHCR，便于回滚和审计。
+- Community 只维护 `stable` 发布标识；日常 main 构建保留 `sha-*` 镜像用于定位和审计。
 
 推送完成后可以直接拉取：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.11
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
 ```
 
 工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release，不需要额外创建个人访问令牌。生产部署建议记录镜像 Digest，获得比版本标签更严格的产物固定。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置。

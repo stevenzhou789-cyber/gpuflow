@@ -5,7 +5,7 @@ on:
     branches:
       - main
     tags:
-      - "v*"
+      - stable
   pull_request:
     paths:
       - ".github/workflows/container-image.yml"
@@ -95,7 +95,7 @@ jobs:
             "${IMAGE_NAME}@${IMAGE_DIGEST}"
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/tags/stable'
     needs: build
     runs-on: ubuntu-latest
     permissions:
