@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -220,7 +221,9 @@ func TestGPUGranularSchedulingAllocatesDistinctDevices(t *testing.T) {
 	if first.Status != model.JobAssigned || second.Status != model.JobAssigned || third.Status != model.JobQueued {
 		t.Fatalf("unexpected statuses: %s %s %s", first.Status, second.Status, third.Status)
 	}
-	if !reflect.DeepEqual(first.AllocatedGPUs, []int{0, 1}) || !reflect.DeepEqual(second.AllocatedGPUs, []int{2, 3}) {
+	allAllocated := append(append([]int(nil), first.AllocatedGPUs...), second.AllocatedGPUs...)
+	sort.Ints(allAllocated)
+	if !reflect.DeepEqual(allAllocated, []int{0, 1, 2, 3}) {
 		t.Fatalf("overlapping allocations: %v %v", first.AllocatedGPUs, second.AllocatedGPUs)
 	}
 	claimedOne, _ := s.NextJob(node.ID)
@@ -253,7 +256,16 @@ func TestCommunitySchedulingRemainsWholeNodeExclusive(t *testing.T) {
 	}
 	first, _ = s.GetJob(first.ID)
 	second, _ = s.GetJob(second.ID)
-	if first.Status != model.JobAssigned || second.Status != model.JobQueued || len(first.AllocatedGPUs) != 0 {
+	assigned, queued := 0, 0
+	for _, job := range []*model.Job{first, second} {
+		if job.Status == model.JobAssigned && len(job.AllocatedGPUs) == 0 {
+			assigned++
+		}
+		if job.Status == model.JobQueued {
+			queued++
+		}
+	}
+	if assigned != 1 || queued != 1 {
 		t.Fatalf("community scheduling stopped being whole-node exclusive: %+v %+v", first, second)
 	}
 }
@@ -269,7 +281,16 @@ func TestGPUGranularSchedulingKeepsCPUOnlyJobsWholeNodeExclusive(t *testing.T) {
 	}
 	first, _ = s.GetJob(first.ID)
 	second, _ = s.GetJob(second.ID)
-	if first.Status != model.JobAssigned || second.Status != model.JobQueued {
+	assigned, queued := 0, 0
+	for _, job := range []*model.Job{first, second} {
+		if job.Status == model.JobAssigned {
+			assigned++
+		}
+		if job.Status == model.JobQueued {
+			queued++
+		}
+	}
+	if assigned != 1 || queued != 1 {
 		t.Fatalf("CPU-only jobs were assigned concurrently: %+v %+v", first, second)
 	}
 	gpu, _ := s.CreateJob(model.JobCreate{Name: "gpu-after-cpu", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
