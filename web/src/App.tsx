@@ -48,6 +48,7 @@ type Node = {
   health_reason?: string;
   last_health_check?: string;
   last_heartbeat: string;
+  cleanup_pending?: boolean;
 };
 
 type Edition = {
@@ -233,7 +234,7 @@ function App() {
           )
         : 0,
       online: nodes.filter(
-        (node) => Date.now() - new Date(node.last_heartbeat).getTime() < 30_000,
+        (node) => !node.cleanup_pending && Date.now() - new Date(node.last_heartbeat).getTime() < 30_000,
       ).length,
     }),
     [jobs, nodes],
@@ -1112,7 +1113,7 @@ function Nodes({
       <section className="node-grid">
         {result.items.map((node) => {
           const online =
-            Date.now() - new Date(node.last_heartbeat).getTime() < 30_000;
+            !node.cleanup_pending && Date.now() - new Date(node.last_heartbeat).getTime() < 30_000;
           const degraded = node.health_status === "DEGRADED";
           const locked = node.busy || Boolean(node.current_job);
           return (
@@ -1550,6 +1551,8 @@ function SubmitJob({
     initialImage || readyImages[0]?.name || "node:22-alpine",
   );
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [gpuCount, setGPUCount] = useState("1");
+  const [minVRAM, setMinVRAM] = useState("4");
   const pools = [...new Set(nodes.map((node) => node.pool))];
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1647,7 +1650,19 @@ function SubmitJob({
           </div>
           <label>
             GPU数量
-            <select name="gpu_count" defaultValue="1">
+            <select
+              name="gpu_count"
+              value={gpuCount}
+              onChange={(event) => {
+                const next = event.target.value;
+                setGPUCount(next);
+                if (next === "0") {
+                  setMinVRAM("0");
+                } else if (gpuCount === "0" && minVRAM === "0") {
+                  setMinVRAM("4");
+                }
+              }}
+            >
               <option value="0">不使用GPU</option>
               {["1", "2", "4", "8"].map((count) => (
                 <option key={count}>{count}</option>
@@ -1656,7 +1671,12 @@ function SubmitJob({
           </label>
           <label>
             最低显存
-            <select name="vram" defaultValue="4">
+            <select
+              name="vram"
+              value={minVRAM}
+              disabled={gpuCount === "0"}
+              onChange={(event) => setMinVRAM(event.target.value)}
+            >
               <option value="0">不限制</option>
               {["4", "8", "12", "16", "24", "32", "40", "48", "80"].map(
                 (vram) => (
@@ -1700,7 +1720,7 @@ function SubmitJob({
           </label>
           <label>
             失败重试
-            <select name="retries" defaultValue="1">
+            <select name="retries" defaultValue="0">
               <option value="0">不重试</option>
               <option value="1">1次</option>
               <option value="2">2次</option>

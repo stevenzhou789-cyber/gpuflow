@@ -93,6 +93,7 @@ type Node struct {
 	HealthReason    string            `json:"health_reason,omitempty"`
 	LastHealthCheck *time.Time        `json:"last_health_check,omitempty"`
 	LastHeartbeat   time.Time         `json:"last_heartbeat"`
+	CleanupPending  bool              `json:"cleanup_pending,omitempty"`
 	SessionEpoch    string            `json:"-"`
 }
 

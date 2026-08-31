@@ -73,6 +73,13 @@ func requestWithAgentCredentials(t *testing.T, server *httptest.Server, method, 
 	return resp.StatusCode
 }
 
+func confirmNodeReady(t *testing.T, server *httptest.Server, nodeID, session string) {
+	t.Helper()
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/"+nodeID+"/cleanup-complete", nil, nil, session, ""); status != http.StatusOK {
+		t.Fatalf("confirm cleanup for %s returned %d", nodeID, status)
+	}
+}
+
 func TestBuildTaskImageOverHTTP(t *testing.T) {
 	state := store.NewMemory()
 	handler := New(state, "test-token")
@@ -405,6 +412,7 @@ func TestJobLifecycleOverHTTP(t *testing.T) {
 	if status := request(t, server, http.MethodPost, "/v1/nodes/register", node, &node); status != http.StatusOK {
 		t.Fatalf("register returned %d", status)
 	}
+	confirmNodeReady(t, server, node.ID, "test-session")
 
 	var job model.Job
 	create := model.JobCreate{Name: "smoke", Image: "alpine", Requirements: model.Requirements{GPUCount: 1, MinVRAMGB: 20}}
@@ -459,12 +467,65 @@ func TestJobLifecycleOverHTTP(t *testing.T) {
 	}
 }
 
+func TestAgentCleanupGateOverHTTP(t *testing.T) {
+	state := store.NewMemory()
+	server := httptest.NewServer(New(state, "test-token").Handler())
+	defer server.Close()
+
+	node := model.Node{ID: "cleanup-http", GPUCount: 1, VRAMGB: 24}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/register", node, &node, "session-one", ""); status != http.StatusOK || !node.CleanupPending {
+		t.Fatalf("registration did not enter cleanup gate: status=%d node=%+v", status, node)
+	}
+	var job model.Job
+	if status := request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "gated", Image: "work", Requirements: model.Requirements{GPUCount: 1}}, &job); status != http.StatusCreated {
+		t.Fatalf("create returned %d", status)
+	}
+	stored, _ := state.GetJob(job.ID)
+	if stored.Status != model.JobQueued {
+		t.Fatalf("job crossed cleanup gate: %+v", stored)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/cleanup-http/heartbeat", nil, nil, "session-one", ""); status != http.StatusConflict {
+		t.Fatalf("heartbeat bypass returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/cleanup-http/next", nil, nil, "session-one", ""); status != http.StatusConflict {
+		t.Fatalf("poll bypass returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/cleanup-http/cleanup-complete", nil, nil, "wrong-session", ""); status != http.StatusConflict {
+		t.Fatalf("wrong cleanup confirmation returned %d", status)
+	}
+	confirmNodeReady(t, server, node.ID, "session-one")
+	var dispatch model.AgentJob
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/cleanup-http/next", nil, &dispatch, "session-one", ""); status != http.StatusOK || dispatch.ID != job.ID {
+		t.Fatalf("ready node did not receive job: status=%d dispatch=%+v", status, dispatch)
+	}
+}
+
+func TestCreateJobValidationOverHTTP(t *testing.T) {
+	server := httptest.NewServer(New(store.NewMemory(), "test-token").Handler())
+	defer server.Close()
+	invalid := []model.JobCreate{
+		{Name: "negative GPU", Image: "work", Requirements: model.Requirements{GPUCount: -1}},
+		{Name: "too many GPUs", Image: "work", Requirements: model.Requirements{GPUCount: 1025}},
+		{Name: "negative VRAM", Image: "work", Requirements: model.Requirements{MinVRAMGB: -1}},
+		{Name: "negative price", Image: "work", Requirements: model.Requirements{MaxHourly: -1}},
+		{Name: "negative timeout", Image: "work", TimeoutSeconds: -1},
+		{Name: "timeout overflow", Image: "work", TimeoutSeconds: int(int64(1) << 31)},
+		{Name: "negative retry", Image: "work", MaxRetries: -1},
+	}
+	for _, input := range invalid {
+		if status := request(t, server, http.MethodPost, "/v1/jobs", input, nil); status != http.StatusBadRequest {
+			t.Fatalf("invalid job %q returned %d", input.Name, status)
+		}
+	}
+}
+
 func TestDeleteBusyNodeReturnsConflict(t *testing.T) {
 	state := store.NewMemory()
 	server := httptest.NewServer(New(state, "test-token").Handler())
 	defer server.Close()
 	node := model.Node{ID: "busy-node", GPUCount: 1, VRAMGB: 24}
 	request(t, server, http.MethodPost, "/v1/nodes/register", node, &node)
+	confirmNodeReady(t, server, node.ID, "test-session")
 	var job model.Job
 	request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "active", Image: "alpine", Requirements: model.Requirements{GPUCount: 1}}, &job)
 	if status := request(t, server, http.MethodDelete, "/v1/nodes/busy-node", nil, nil); status != http.StatusConflict {
@@ -478,9 +539,152 @@ type recordingArtifactStore struct {
 	deleteErr error
 }
 
+type blockingStagedArtifactStore struct {
+	artifact.Store
+	mu           sync.Mutex
+	canonical    []byte
+	staged       []byte
+	stageReady   chan struct{}
+	releaseStage chan struct{}
+	commits      int
+	discards     int
+}
+
+func (s *blockingStagedArtifactStore) Enabled() bool { return true }
+
+func (s *blockingStagedArtifactStore) Stage(ctx context.Context, _, _ string, input io.Reader, _ int64) (artifact.Staged, error) {
+	payload, err := io.ReadAll(input)
+	if err != nil {
+		return artifact.Staged{}, err
+	}
+	s.mu.Lock()
+	s.staged = append([]byte(nil), payload...)
+	s.mu.Unlock()
+	close(s.stageReady)
+	select {
+	case <-s.releaseStage:
+		return artifact.Staged{}, nil
+	case <-ctx.Done():
+		return artifact.Staged{}, ctx.Err()
+	}
+}
+
+func (s *blockingStagedArtifactStore) Commit(context.Context, artifact.Staged) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commits++
+	s.canonical = append([]byte(nil), s.staged...)
+	return nil
+}
+
+func (s *blockingStagedArtifactStore) Discard(context.Context, artifact.Staged) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discards++
+	s.staged = nil
+	return nil
+}
+
+func (s *blockingStagedArtifactStore) snapshot() (canonical, staged []byte, commits, discards int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.canonical...), append([]byte(nil), s.staged...), s.commits, s.discards
+}
+
 type staticLogArtifactStore struct {
 	artifact.Store
 	content string
+}
+
+func TestArtifactUploadTakeoverBeforeCommitKeepsCanonicalObject(t *testing.T) {
+	state := store.NewMemory()
+	artifacts := &blockingStagedArtifactStore{
+		Store:        artifact.Disabled(),
+		canonical:    []byte("existing artifact"),
+		stageReady:   make(chan struct{}),
+		releaseStage: make(chan struct{}),
+	}
+	server := httptest.NewServer(NewWithStores(state, state, artifacts, "test-token", edition.Community()).Handler())
+	defer server.Close()
+
+	node := model.Node{ID: "artifact-fence", GPUCount: 1, VRAMGB: 24}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/register", node, &node, "session-one", ""); status != http.StatusOK {
+		t.Fatalf("register returned %d", status)
+	}
+	confirmNodeReady(t, server, node.ID, "session-one")
+	var job model.Job
+	if status := request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "artifact fence", Image: "work", Requirements: model.Requirements{GPUCount: 1}}, &job); status != http.StatusCreated {
+		t.Fatalf("create job returned %d", status)
+	}
+	var dispatch model.AgentJob
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/"+node.ID+"/next", nil, &dispatch, "session-one", ""); status != http.StatusOK {
+		t.Fatalf("next returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/jobs/"+job.ID+"/status?node_id="+node.ID, model.JobUpdate{Status: model.JobRunning}, nil, "session-one", dispatch.AttemptToken); status != http.StatusOK {
+		t.Fatalf("start job returned %d", status)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	file, err := writer.CreateFormFile("file", "artifacts.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("stale replacement")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs/"+job.ID+"/artifacts?node_id="+node.ID, &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set(model.HeaderAgentSession, "session-one")
+	req.Header.Set(model.HeaderAttemptToken, dispatch.AttemptToken)
+	type result struct {
+		response *http.Response
+		err      error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(req)
+		resultCh <- result{response: response, err: requestErr}
+	}()
+
+	select {
+	case <-artifacts.stageReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("artifact upload did not reach staging")
+	}
+	if _, err := state.RegisterNode(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24}); err != nil {
+		t.Fatalf("take over node during staging: %v", err)
+	}
+	close(artifacts.releaseStage)
+
+	var upload result
+	select {
+	case upload = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("artifact upload did not finish")
+	}
+	if upload.err != nil {
+		t.Fatal(upload.err)
+	}
+	defer upload.response.Body.Close()
+	if upload.response.StatusCode != http.StatusConflict {
+		responseBody, _ := io.ReadAll(upload.response.Body)
+		t.Fatalf("fenced upload returned %d: %s", upload.response.StatusCode, responseBody)
+	}
+	canonical, staged, commits, discards := artifacts.snapshot()
+	if string(canonical) != "existing artifact" || commits != 0 {
+		t.Fatalf("fenced upload changed canonical object: canonical=%q commits=%d", canonical, commits)
+	}
+	if len(staged) != 0 || discards != 1 {
+		t.Fatalf("fenced upload was not cleaned up: staged=%q discards=%d", staged, discards)
+	}
 }
 
 func (s staticLogArtifactStore) Enabled() bool { return true }
@@ -617,6 +821,7 @@ func TestExpiredLicenseAllowsReconnectButRejectsNewCapacityAndScheduling(t *test
 	if status := request(t, server, http.MethodPost, "/v1/nodes/register", existing, &existing); status != http.StatusOK {
 		t.Fatalf("existing node reconnect returned %d", status)
 	}
+	confirmNodeReady(t, server, existing.ID, "test-session")
 	if status := request(t, server, http.MethodPost, "/v1/nodes/register", model.Node{ID: "new-node", GPUCount: 0}, nil); status != http.StatusForbidden {
 		t.Fatalf("new capacity under expired license returned %d", status)
 	}
@@ -643,6 +848,7 @@ func TestHealthInventoryCannotBypassLicenseOverHTTP(t *testing.T) {
 		if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/register", node, &node, "session-"+id, ""); status != http.StatusOK {
 			t.Fatalf("register %s returned %d", id, status)
 		}
+		confirmNodeReady(t, server, id, "session-"+id)
 	}
 	update := model.NodeHealthUpdate{Status: "HEALTHY", GPUModel: "L4", GPUCount: 1, VRAMGB: 24, Devices: []model.GPUDevice{{Index: 0, UUID: "GPU-one", Model: "L4", VRAMGB: 24}}}
 	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/health-a/health", update, nil, "session-health-a", ""); status != http.StatusOK {
@@ -666,6 +872,7 @@ func TestAgentSessionAndAttemptHeadersAreEnforcedOverHTTP(t *testing.T) {
 	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/register", node, &node, "session-one", ""); status != http.StatusOK {
 		t.Fatalf("register returned %d", status)
 	}
+	confirmNodeReady(t, server, node.ID, "session-one")
 	var job model.Job
 	request(t, server, http.MethodPost, "/v1/jobs", model.JobCreate{Name: "fenced", Image: "work", Requirements: model.Requirements{GPUCount: 1}}, &job)
 	var dispatch model.AgentJob
@@ -676,11 +883,21 @@ func TestAgentSessionAndAttemptHeadersAreEnforcedOverHTTP(t *testing.T) {
 	if status := requestWithAgentCredentials(t, server, http.MethodPost, statusPath, model.JobUpdate{Status: model.JobRunning}, nil, "session-one", ""); status != http.StatusPreconditionFailed {
 		t.Fatalf("missing attempt token returned %d", status)
 	}
-	if status := requestWithAgentCredentials(t, server, http.MethodPost, statusPath, model.JobUpdate{Status: model.JobRunning}, nil, "session-two", dispatch.AttemptToken); status != http.StatusPreconditionFailed {
+	if status := requestWithAgentCredentials(t, server, http.MethodPost, statusPath, model.JobUpdate{Status: model.JobRunning}, nil, "session-two", dispatch.AttemptToken); status != http.StatusConflict {
 		t.Fatalf("stale session returned %d", status)
 	}
 	if status := requestWithAgentCredentials(t, server, http.MethodPost, statusPath, model.JobUpdate{Status: model.JobRunning}, &job, "session-one", dispatch.AttemptToken); status != http.StatusOK {
 		t.Fatalf("valid attempt returned %d", status)
+	}
+	attemptPath := "/v1/jobs/" + job.ID + "/attempt?node_id=fenced-http"
+	if status := requestWithAgentCredentials(t, server, http.MethodGet, attemptPath, nil, nil, "session-one", dispatch.AttemptToken); status != http.StatusNoContent {
+		t.Fatalf("valid attempt validation returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodGet, attemptPath, nil, nil, "session-one", "wrong"); status != http.StatusPreconditionFailed {
+		t.Fatalf("wrong attempt validation returned %d", status)
+	}
+	if status := requestWithAgentCredentials(t, server, http.MethodGet, attemptPath, nil, nil, "session-two", dispatch.AttemptToken); status != http.StatusConflict {
+		t.Fatalf("stale session validation returned %d", status)
 	}
 	logPath := "/v1/jobs/" + job.ID + "/logs?node_id=fenced-http"
 	if status := requestWithAgentCredentials(t, server, http.MethodPost, logPath, model.JobLogUpdate{Output: "late"}, nil, "session-one", "wrong"); status != http.StatusPreconditionFailed {

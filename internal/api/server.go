@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,6 +66,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/jobs", s.createJob)
 	s.mux.HandleFunc("GET /v1/jobs", s.listJobs)
 	s.mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
+	s.mux.HandleFunc("GET /v1/jobs/{id}/attempt", s.validateJobAttempt)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/rerun", s.rerunJob)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancelJob)
 	s.mux.HandleFunc("DELETE /v1/jobs/{id}", s.deleteJob)
@@ -75,6 +77,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts", s.listArtifacts)
 	s.mux.HandleFunc("GET /v1/jobs/{id}/artifacts/{name}", s.downloadArtifact)
 	s.mux.HandleFunc("POST /v1/nodes/register", s.registerNode)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/cleanup-complete", s.confirmNodeCleanup)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/heartbeat", s.heartbeat)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/health", s.updateNodeHealth)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/next", s.nextJob)
@@ -84,6 +87,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/task-images", s.listTaskImages)
 	s.mux.HandleFunc("DELETE /v1/task-images/{id}", s.deleteTaskImage)
 	s.mux.Handle("/", webui.Handler())
+}
+
+func (s *Server) validateJobAttempt(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, "node_id is required")
+		return
+	}
+	if err := s.store.ValidateJobAttempt(r.PathValue("id"), nodeID, r.Header.Get(model.HeaderAgentSession), r.Header.Get(model.HeaderAttemptToken)); err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
@@ -104,7 +120,10 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "node_id is required")
 		return
 	}
-	if err := s.store.ValidateJobAttempt(r.PathValue("id"), nodeID, r.Header.Get(model.HeaderAgentSession), r.Header.Get(model.HeaderAttemptToken)); err != nil {
+	jobID := r.PathValue("id")
+	session := r.Header.Get(model.HeaderAgentSession)
+	attemptToken := r.Header.Get(model.HeaderAttemptToken)
+	if err := s.store.ValidateJobAttempt(jobID, nodeID, session, attemptToken); err != nil {
 		handleStoreError(w, err)
 		return
 	}
@@ -116,11 +135,36 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	name := filepath.Base(header.Filename)
-	if err := s.artifacts.Put(r.Context(), r.PathValue("id"), name, file, header.Size); err != nil {
+	staged, err := s.artifacts.Stage(r.Context(), jobID, name, file, header.Size)
+	if err != nil {
+		s.discardArtifact(staged)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	defer s.discardArtifact(staged)
+
+	var promoteErr error
+	err = s.store.CommitJobAttempt(jobID, nodeID, session, attemptToken, func() error {
+		promoteErr = s.artifacts.Commit(r.Context(), staged)
+		return promoteErr
+	})
+	if err != nil {
+		if promoteErr != nil {
+			writeError(w, http.StatusBadGateway, promoteErr.Error())
+		} else {
+			handleStoreError(w, err)
+		}
+		return
+	}
 	writeJSON(w, http.StatusCreated, artifact.Item{Name: name, Size: header.Size, LastModified: time.Now().UTC()})
+}
+
+func (s *Server) discardArtifact(staged artifact.Staged) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := s.artifacts.Discard(ctx, staged); err != nil {
+		log.Printf("discard staged artifact: %v", err)
+	}
 }
 
 func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
@@ -224,19 +268,16 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "name and image are required")
 		return
 	}
-	if in.MaxRetries < 0 || in.TimeoutSeconds < 0 || in.Requirements.GPUCount < 0 {
-		writeError(w, 400, "numeric fields cannot be negative")
-		return
-	}
 	j, err := s.store.CreateJob(in)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		handleStoreError(w, err)
 		return
 	}
 	s.scheduleBestEffort()
 	writeJSON(w, 201, j)
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	s.scheduleBestEffort()
 	if r.URL.RawQuery == "" {
 		writeJSON(w, 200, s.store.ListJobs())
 		return
@@ -246,6 +287,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.store.QueryJobs(store.JobQuery{Search: r.URL.Query().Get("q"), Status: r.URL.Query().Get("status"), Pool: r.URL.Query().Get("pool"), Node: r.URL.Query().Get("node"), Sort: r.URL.Query().Get("sort"), Order: r.URL.Query().Get("order"), Page: page, PageSize: pageSize}))
 }
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
+	s.scheduleBestEffort()
 	j, err := s.store.GetJob(r.PathValue("id"))
 	if err != nil {
 		handleStoreError(w, err)
@@ -272,6 +314,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, j)
 }
 func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
+	s.scheduleBestEffort()
 	if err := s.store.BeginJobDeletion(r.PathValue("id")); err != nil {
 		handleStoreError(w, err)
 		return
@@ -302,6 +345,15 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 	s.scheduleBestEffort()
 	writeJSON(w, 200, saved)
 }
+func (s *Server) confirmNodeCleanup(w http.ResponseWriter, r *http.Request) {
+	saved, err := s.store.ConfirmNodeCleanupSession(r.PathValue("id"), r.Header.Get(model.HeaderAgentSession))
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	s.scheduleBestEffort()
+	writeJSON(w, http.StatusOK, saved)
+}
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.HeartbeatNodeSession(r.PathValue("id"), r.Header.Get(model.HeaderAgentSession)); err != nil {
 		handleStoreError(w, err)
@@ -325,6 +377,7 @@ func (s *Server) updateNodeHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, node)
 }
 func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
+	s.scheduleBestEffort()
 	if r.URL.RawQuery == "" {
 		writeJSON(w, 200, s.store.ListNodes())
 		return
@@ -334,6 +387,7 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.store.QueryNodes(store.NodeQuery{Search: r.URL.Query().Get("q"), Page: page, PageSize: pageSize}))
 }
 func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) {
+	s.scheduleBestEffort()
 	if err := s.store.DeleteNode(r.PathValue("id")); err != nil {
 		handleStoreError(w, err)
 		return

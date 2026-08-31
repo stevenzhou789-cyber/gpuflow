@@ -2,6 +2,8 @@ package artifact
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -26,9 +28,19 @@ type Item struct {
 	LastModified time.Time `json:"last_modified"`
 }
 
+// Staged identifies an upload that is not visible through the artifact API.
+// Its fields are intentionally private so only an artifact Store can create a
+// promotable handle.
+type Staged struct {
+	sourceKey      string
+	destinationKey string
+}
+
 type Store interface {
 	Enabled() bool
-	Put(context.Context, string, string, io.Reader, int64) error
+	Stage(context.Context, string, string, io.Reader, int64) (Staged, error)
+	Commit(context.Context, Staged) error
+	Discard(context.Context, Staged) error
 	List(context.Context, string) ([]Item, error)
 	Open(context.Context, string, string) (io.ReadCloser, Item, error)
 	Delete(context.Context, string) error
@@ -36,10 +48,14 @@ type Store interface {
 
 type disabledStore struct{}
 
-func Disabled() Store                                                             { return disabledStore{} }
-func (disabledStore) Enabled() bool                                               { return false }
-func (disabledStore) Put(context.Context, string, string, io.Reader, int64) error { return ErrDisabled }
-func (disabledStore) List(context.Context, string) ([]Item, error)                { return nil, nil }
+func Disabled() Store               { return disabledStore{} }
+func (disabledStore) Enabled() bool { return false }
+func (disabledStore) Stage(context.Context, string, string, io.Reader, int64) (Staged, error) {
+	return Staged{}, ErrDisabled
+}
+func (disabledStore) Commit(context.Context, Staged) error         { return ErrDisabled }
+func (disabledStore) Discard(context.Context, Staged) error        { return nil }
+func (disabledStore) List(context.Context, string) ([]Item, error) { return nil, nil }
 func (disabledStore) Open(context.Context, string, string) (io.ReadCloser, Item, error) {
 	return nil, Item{}, ErrDisabled
 }
@@ -92,13 +108,51 @@ func objectName(jobID, name string) (string, error) {
 	return jobID + "/" + name, nil
 }
 
-func (s *minioStore) Put(ctx context.Context, jobID, name string, r io.Reader, size int64) error {
-	key, err := objectName(jobID, name)
+const stagingDirectory = ".gpuflow-staging"
+
+func stagedObjectName(jobID, name string) (Staged, error) {
+	destinationKey, err := objectName(jobID, name)
 	if err != nil {
-		return err
+		return Staged{}, err
 	}
-	_, err = s.client.PutObject(ctx, s.bucket, key, r, size, minio.PutObjectOptions{ContentType: "application/gzip"})
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return Staged{}, fmt.Errorf("create artifact staging key: %w", err)
+	}
+	return Staged{
+		sourceKey:      jobID + "/" + stagingDirectory + "/" + hex.EncodeToString(random),
+		destinationKey: destinationKey,
+	}, nil
+}
+
+func (s *minioStore) Stage(ctx context.Context, jobID, name string, r io.Reader, size int64) (Staged, error) {
+	staged, err := stagedObjectName(jobID, name)
+	if err != nil {
+		return Staged{}, err
+	}
+	_, err = s.client.PutObject(ctx, s.bucket, staged.sourceKey, r, size, minio.PutObjectOptions{ContentType: "application/gzip"})
+	return staged, err
+}
+
+// Commit promotes a fully uploaded staging object with a single S3 CopyObject
+// operation. S3-compatible stores replace the destination object atomically,
+// so a failed or fenced upload never partially overwrites the prior artifact.
+func (s *minioStore) Commit(ctx context.Context, staged Staged) error {
+	if staged.sourceKey == "" || staged.destinationKey == "" {
+		return errors.New("invalid staged artifact")
+	}
+	_, err := s.client.CopyObject(ctx,
+		minio.CopyDestOptions{Bucket: s.bucket, Object: staged.destinationKey},
+		minio.CopySrcOptions{Bucket: s.bucket, Object: staged.sourceKey},
+	)
 	return err
+}
+
+func (s *minioStore) Discard(ctx context.Context, staged Staged) error {
+	if staged.sourceKey == "" {
+		return nil
+	}
+	return s.client.RemoveObject(ctx, s.bucket, staged.sourceKey, minio.RemoveObjectOptions{})
 }
 
 func (s *minioStore) List(ctx context.Context, jobID string) ([]Item, error) {
@@ -107,7 +161,11 @@ func (s *minioStore) List(ctx context.Context, jobID string) ([]Item, error) {
 		if obj.Err != nil {
 			return nil, obj.Err
 		}
-		items = append(items, Item{Name: strings.TrimPrefix(obj.Key, jobID+"/"), Size: obj.Size, LastModified: obj.LastModified})
+		name := strings.TrimPrefix(obj.Key, jobID+"/")
+		if strings.HasPrefix(name, stagingDirectory+"/") {
+			continue
+		}
+		items = append(items, Item{Name: name, Size: obj.Size, LastModified: obj.LastModified})
 	}
 	return items, nil
 }

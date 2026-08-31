@@ -7,13 +7,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -107,6 +110,453 @@ func TestJobContainerNameIsAttemptScoped(t *testing.T) {
 	}
 }
 
+type fakeAttemptDocker struct {
+	mu               sync.Mutex
+	name             string
+	containerID      string
+	createID         string
+	stateFile        string
+	createCalls      int
+	removed          []string
+	blockFirstCreate bool
+	createEntered    chan struct{}
+	releaseCreate    chan struct{}
+	blockOnce        sync.Once
+}
+
+func (d *fakeAttemptDocker) command(ctx context.Context, _ string, args ...string) ([]byte, error) {
+	if len(args) == 0 {
+		return nil, errors.New("missing Docker command")
+	}
+	switch args[0] {
+	case "create":
+		if d.blockFirstCreate {
+			d.blockOnce.Do(func() {
+				close(d.createEntered)
+				select {
+				case <-d.releaseCreate:
+				case <-ctx.Done():
+				}
+			})
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		name := argumentAfter(args, "--name")
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		d.createCalls++
+		if d.containerID != "" {
+			return []byte(fmt.Sprintf("Conflict. The container name %q is already in use by container %q", name, d.containerID)), errors.New("name conflict")
+		}
+		d.name, d.containerID = name, d.createID
+		d.syncStateFileLocked()
+		return []byte(d.containerID + "\n"), nil
+	case "ps":
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.containerID == "" {
+			return nil, nil
+		}
+		return []byte(d.containerID + "\n"), nil
+	case "inspect":
+		target := args[len(args)-1]
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.containerID == "" || (target != d.containerID && target != d.name) {
+			return []byte("No such object"), errors.New("not found")
+		}
+		return []byte(d.containerID + "\n"), nil
+	case "rm":
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, target := range args[2:] {
+			if d.containerID != "" && (target == d.containerID || target == d.name) {
+				d.removed = append(d.removed, d.containerID)
+				d.containerID = ""
+				d.syncStateFileLocked()
+				return []byte(target + "\n"), nil
+			}
+		}
+		return []byte("No such container"), errors.New("not found")
+	case "stop":
+		target := args[len(args)-1]
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.containerID == "" || target != d.containerID {
+			return []byte("No such container"), errors.New("not found")
+		}
+		return []byte(target + "\n"), nil
+	default:
+		return nil, fmt.Errorf("unexpected Docker command %q", strings.Join(args, " "))
+	}
+}
+
+func (d *fakeAttemptDocker) put(name, containerID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.name, d.containerID = name, containerID
+	d.syncStateFileLocked()
+}
+
+func (d *fakeAttemptDocker) state() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.containerID
+}
+
+func (d *fakeAttemptDocker) wasRemoved(containerID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, removed := range d.removed {
+		if removed == containerID {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *fakeAttemptDocker) syncStateFileLocked() {
+	if d.stateFile == "" {
+		return
+	}
+	if d.containerID == "" {
+		_ = os.Remove(d.stateFile)
+		return
+	}
+	_ = os.WriteFile(d.stateFile, []byte(d.containerID), 0o600)
+}
+
+func argumentAfter(args []string, option string) string {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == option {
+			return args[index+1]
+		}
+	}
+	return ""
+}
+
+func newAttemptServer(t *testing.T, currentSession, currentToken *atomic.Value, jobID string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/jobs/"+jobID+"/attempt" || r.URL.Query().Get("node_id") != "node" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get(model.HeaderAgentSession) != currentSession.Load().(string) || r.Header.Get(model.HeaderAttemptToken) != currentToken.Load().(string) {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid agent session"})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+}
+
+func newFenceTestAgent(serverURL, session string, docker *fakeAttemptDocker, execute func(context.Context, string, ...string) *exec.Cmd) *Agent {
+	agent := New(Config{Server: serverURL, ID: "node", Executor: "docker", CleanupCommand: docker.command, ExecuteCommand: execute})
+	agent.session = session
+	agent.sessionTTL = time.Minute
+	agent.setSessionLeaseDeadline(time.Now().Add(time.Minute))
+	return agent
+}
+
+func fenceTestJob(id string) model.Job {
+	return model.Job{ID: id, Image: "work", Attempts: 1, TimeoutSeconds: 30, Requirements: model.Requirements{GPUCount: 1}}
+}
+
+func TestDelayedOldCreateAfterTakeoverCleanupNeverStarts(t *testing.T) {
+	const jobID, attemptToken = "late-create", "old-attempt"
+	oldID := strings.Repeat("a", 64)
+	var current, currentToken atomic.Value
+	current.Store("old-session")
+	currentToken.Store(attemptToken)
+	server := newAttemptServer(t, &current, &currentToken, jobID)
+	defer server.Close()
+	docker := &fakeAttemptDocker{
+		createID: oldID, blockFirstCreate: true,
+		createEntered: make(chan struct{}), releaseCreate: make(chan struct{}),
+	}
+	var startCalled atomic.Bool
+	oldAgent := newFenceTestAgent(server.URL, "old-session", docker, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		startCalled.Store(true)
+		return exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+	})
+	dir := t.TempDir()
+	job := fenceTestJob(jobID)
+	done := make(chan error, 1)
+	go func() {
+		_, err := oldAgent.execute(context.Background(), &job, attemptToken, dir, filepath.Join(dir, "job.log"))
+		done <- err
+	}()
+	<-docker.createEntered
+
+	// Registration has fenced the old session, but takeover cleanup observes
+	// no container because the old daemon request is still in flight.
+	current.Store("new-session")
+	currentToken.Store("new-attempt")
+	newAgent := newFenceTestAgent(server.URL, "new-session", docker, nil)
+	if err := newAgent.cleanupManagedContainers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(docker.releaseCreate)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "validate Docker attempt ownership") {
+		t.Fatalf("late stale create was not fenced: %v", err)
+	}
+	if startCalled.Load() {
+		t.Fatal("old Agent started a container created after replacement cleanup")
+	}
+	if state := docker.state(); state != "" {
+		t.Fatalf("stopped stale container was not removed by immutable ID: %s", state)
+	}
+}
+
+func TestDelayedOldCreateConflictCannotDeleteNewSessionContainer(t *testing.T) {
+	const jobID, attemptToken = "late-conflict", "old-attempt"
+	oldID, newID := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	var current, currentToken atomic.Value
+	current.Store("old-session")
+	currentToken.Store(attemptToken)
+	server := newAttemptServer(t, &current, &currentToken, jobID)
+	defer server.Close()
+	docker := &fakeAttemptDocker{
+		createID: oldID, blockFirstCreate: true,
+		createEntered: make(chan struct{}), releaseCreate: make(chan struct{}),
+	}
+	oldAgent := newFenceTestAgent(server.URL, "old-session", docker, nil)
+	dir := t.TempDir()
+	job := fenceTestJob(jobID)
+	done := make(chan error, 1)
+	go func() {
+		_, err := oldAgent.execute(context.Background(), &job, attemptToken, dir, filepath.Join(dir, "job.log"))
+		done <- err
+	}()
+	<-docker.createEntered
+
+	current.Store("new-session")
+	currentToken.Store("new-attempt")
+	docker.put(jobContainerName(jobID, 1), newID)
+	close(docker.releaseCreate)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "validate Docker attempt ownership") {
+		t.Fatalf("stale conflict was not rejected: %v", err)
+	}
+	if state := docker.state(); state != newID {
+		t.Fatalf("stale Agent altered replacement container: got %q want %q", state, newID)
+	}
+	if docker.wasRemoved(newID) {
+		t.Fatal("stale Agent removed the replacement session container")
+	}
+}
+
+func TestCurrentSessionReclaimsConflictingAttemptByImmutableID(t *testing.T) {
+	const jobID, attemptToken = "reclaim-conflict", "new-attempt"
+	oldID, newID := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	var current, currentToken atomic.Value
+	current.Store("new-session")
+	currentToken.Store(attemptToken)
+	server := newAttemptServer(t, &current, &currentToken, jobID)
+	defer server.Close()
+	docker := &fakeAttemptDocker{createID: newID}
+	docker.put(jobContainerName(jobID, 1), oldID)
+	var startID atomic.Value
+	agent := newFenceTestAgent(server.URL, "new-session", docker, func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if name == "docker" && len(args) == 3 && args[0] == "start" && args[1] == "--attach" {
+			startID.Store(args[2])
+		}
+		return exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+	})
+	dir := t.TempDir()
+	job := fenceTestJob(jobID)
+	if _, err := agent.execute(context.Background(), &job, attemptToken, dir, filepath.Join(dir, "job.log")); err != nil {
+		t.Fatal(err)
+	}
+	if docker.createCalls != 2 || !docker.wasRemoved(oldID) {
+		t.Fatalf("conflict was not reclaimed and retried: creates=%d removed_old=%v", docker.createCalls, docker.wasRemoved(oldID))
+	}
+	if got, _ := startID.Load().(string); got != newID {
+		t.Fatalf("start did not use new immutable ID: got %q want %q", got, newID)
+	}
+	if state := docker.state(); state != "" {
+		t.Fatalf("completed container was not cleaned: %s", state)
+	}
+}
+
+func TestCreateThenTakeoverBeforeStartCannotRunRemovedContainer(t *testing.T) {
+	const jobID, attemptToken = "takeover-before-start", "old-attempt"
+	oldID := strings.Repeat("a", 64)
+	dir := t.TempDir()
+	stateFile, ranFile := filepath.Join(dir, "container.state"), filepath.Join(dir, "workload.ran")
+	var current, currentToken atomic.Value
+	current.Store("old-session")
+	currentToken.Store(attemptToken)
+	server := newAttemptServer(t, &current, &currentToken, jobID)
+	defer server.Close()
+	docker := &fakeAttemptDocker{createID: oldID, stateFile: stateFile}
+	startReady, releaseStart := make(chan struct{}), make(chan struct{})
+	oldAgent := newFenceTestAgent(server.URL, "old-session", docker, func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if name != "docker" || len(args) != 3 || args[0] != "start" || args[1] != "--attach" || args[2] != oldID {
+			return exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+		}
+		close(startReady)
+		<-releaseStart
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAgentDockerStartHelper$")
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_AGENT_DOCKER_START_HELPER=1",
+			"GPUFLOW_TEST_CONTAINER_STATE="+stateFile,
+			"GPUFLOW_TEST_EXPECTED_CONTAINER="+oldID,
+			"GPUFLOW_TEST_WORKLOAD_RAN="+ranFile,
+		)
+		return cmd
+	})
+	job := fenceTestJob(jobID)
+	done := make(chan error, 1)
+	go func() {
+		_, err := oldAgent.execute(context.Background(), &job, attemptToken, dir, filepath.Join(dir, "job.log"))
+		done <- err
+	}()
+	<-startReady
+
+	// The old container exists and passed the exact attempt check. A new Agent
+	// now fences the session and removes that ID before the paused start call.
+	current.Store("new-session")
+	currentToken.Store("new-attempt")
+	newAgent := newFenceTestAgent(server.URL, "new-session", docker, nil)
+	if err := newAgent.cleanupManagedContainers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseStart)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "docker start failed") {
+		t.Fatalf("start of removed immutable ID did not fail: %v", err)
+	}
+	if _, err := os.Stat(ranFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed stale workload unexpectedly ran: %v", err)
+	}
+}
+
+func TestAgentDockerStartHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_AGENT_DOCKER_START_HELPER") != "1" {
+		return
+	}
+	state, err := os.ReadFile(os.Getenv("GPUFLOW_TEST_CONTAINER_STATE"))
+	if err == nil && string(state) == os.Getenv("GPUFLOW_TEST_EXPECTED_CONTAINER") {
+		_ = os.WriteFile(os.Getenv("GPUFLOW_TEST_WORKLOAD_RAN"), []byte("ran"), 0o600)
+		os.Exit(0)
+	}
+	os.Exit(42)
+}
+
+func TestCleanupManagedContainersUsesGPUFlowLabelAndVerifiesEmpty(t *testing.T) {
+	var calls []string
+	listCalls := 0
+	agent := New(Config{
+		Executor: "docker",
+		CleanupCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			call := name + " " + strings.Join(args, " ")
+			calls = append(calls, call)
+			if len(args) > 0 && args[0] == "ps" {
+				listCalls++
+				if listCalls == 1 {
+					return []byte("old-a\nold-b\n"), nil
+				}
+				return nil, nil
+			}
+			return []byte("old-a\nold-b\n"), nil
+		},
+	})
+	if err := agent.cleanupManagedContainers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(calls, "\n")
+	if len(calls) != 3 || !strings.Contains(calls[0], "ps -aq --filter label=gpuflow.job") || !strings.Contains(calls[1], "rm -f old-a old-b") || !strings.Contains(calls[2], "ps -aq --filter label=gpuflow.job") {
+		t.Fatalf("unexpected cleanup commands:\n%s", joined)
+	}
+}
+
+func TestExecuteDoesNotStartDockerAfterLeaseExpiresDuringCleanup(t *testing.T) {
+	var commandCreated atomic.Bool
+	agent := New(Config{
+		Executor: "docker",
+		CleanupCommand: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			time.Sleep(75 * time.Millisecond)
+			if len(args) > 0 && args[0] == "inspect" {
+				return []byte("No such object"), errors.New("not found")
+			}
+			return nil, nil
+		},
+		ExecuteCommand: func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			commandCreated.Store(true)
+			return exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+		},
+	})
+	agent.sessionTTL = 25 * time.Millisecond
+	agent.setSessionLeaseDeadline(time.Now().Add(agent.sessionTTL))
+	dir := t.TempDir()
+	job := model.Job{ID: "paused-before-start", Image: "work", Attempts: 1, TimeoutSeconds: 60, Requirements: model.Requirements{GPUCount: 1}}
+	if _, err := agent.execute(context.Background(), &job, "attempt", dir, filepath.Join(dir, "job.log")); !errors.Is(err, errAgentSessionLeaseExpired) {
+		t.Fatalf("expired worker did not fail closed: %v", err)
+	}
+	if commandCreated.Load() {
+		t.Fatal("Docker command was created after the local session lease expired")
+	}
+}
+
+func TestRunConfirmsCleanupBeforeHeartbeatAndWorkers(t *testing.T) {
+	descriptor := edition.Community()
+	var cleanupConfirmed atomic.Bool
+	heartbeat := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/capabilities":
+			_ = json.NewEncoder(w).Encode(descriptor)
+		case "/v1/nodes/register":
+			var node model.Node
+			_ = json.NewDecoder(r.Body).Decode(&node)
+			node.CleanupPending = true
+			_ = json.NewEncoder(w).Encode(node)
+		case "/v1/nodes/cleanup-order/cleanup-complete":
+			cleanupConfirmed.Store(true)
+			w.WriteHeader(http.StatusOK)
+		case "/v1/nodes/cleanup-order/heartbeat":
+			if !cleanupConfirmed.Load() {
+				t.Error("Agent heartbeated before cleanup confirmation")
+			}
+			select {
+			case heartbeat <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		case "/v1/nodes/cleanup-order/next":
+			if !cleanupConfirmed.Load() {
+				t.Error("Agent worker polled before cleanup confirmation")
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- New(Config{Server: server.URL, ID: "cleanup-order", Executor: "mock", PollInterval: time.Hour, HeartbeatInterval: time.Hour}).Run(ctx)
+	}()
+	select {
+	case <-heartbeat:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("Agent did not reach post-cleanup heartbeat")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected Run result: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Agent did not stop")
+	}
+}
+
 func TestRunFailsClosedOnUnavailableOrMalformedCapabilities(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -183,6 +633,7 @@ func TestRunUsesCapabilityProbeImageAndSession(t *testing.T) {
 	var probeImageUsed atomic.Bool
 	agent := New(Config{
 		Server: server.URL, ID: "probe-node", Executor: "docker", PollInterval: time.Hour,
+		CleanupCommand: func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
 		ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			if name != "docker" {
 				return nil, errors.New("unexpected native GPU probe")
@@ -292,6 +743,8 @@ func TestRunFailStopsWhenControlPlaneRejectsSession(t *testing.T) {
 			heartbeats.Add(1)
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid agent session"})
+		case "/v1/nodes/session-node/cleanup-complete":
+			w.WriteHeader(http.StatusOK)
 		case "/v1/nodes/session-node/next":
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -328,6 +781,8 @@ func TestRunFailStopsWhenHeartbeatLeaseExpires(t *testing.T) {
 				return
 			}
 			http.Error(w, "control plane unavailable", http.StatusServiceUnavailable)
+		case "/v1/nodes/partitioned-node/cleanup-complete":
+			w.WriteHeader(http.StatusOK)
 		case "/v1/nodes/partitioned-node/next":
 			w.WriteHeader(http.StatusNoContent)
 		default:

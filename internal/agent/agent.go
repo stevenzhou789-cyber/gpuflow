@@ -30,6 +30,8 @@ type Config struct {
 	HourlyPrice                                                                float64
 	PollInterval, HeartbeatInterval, HealthInterval, ArtifactUploadTimeout     time.Duration
 	ProbeCommand                                                               func(context.Context, string, ...string) ([]byte, error)
+	CleanupCommand                                                             func(context.Context, string, ...string) ([]byte, error)
+	ExecuteCommand                                                             func(context.Context, string, ...string) *exec.Cmd
 }
 type Agent struct {
 	cfg           Config
@@ -39,7 +41,8 @@ type Agent struct {
 	workerTargets chan int
 	failStop      context.CancelCauseFunc
 	sessionTTL    time.Duration
-	leaseStarted  time.Time
+	leaseMu       sync.RWMutex
+	leaseDeadline time.Time
 }
 
 var (
@@ -105,19 +108,45 @@ func (a *Agent) Run(ctx context.Context) error {
 	if !descriptor.Features[edition.FeatureNodeHealth] {
 		n.HealthStatus, n.HealthReason, n.LastHealthCheck = "", "", nil
 	}
-	a.leaseStarted = time.Now()
+	a.setSessionLeaseDeadline(time.Now().Add(a.sessionTTL))
 	if _, err := a.doContext(runCtx, http.MethodPost, "/v1/nodes/register", n, &n, a.sessionHeaders()); err != nil {
 		return fmt.Errorf("register node: %w", err)
 	}
 	a.cfg.ID = n.ID
+	// A successful registration fences the previous Agent session but leaves
+	// this node unavailable for dispatch. Remove every container carrying the
+	// GPUFlow job label, then durably confirm cleanup before heartbeats or any
+	// worker are allowed to start.
+	cleanupCtx, cleanupCancel := context.WithDeadline(runCtx, a.sessionLeaseDeadline())
+	if err := a.cleanupManagedContainers(cleanupCtx); err != nil {
+		cleanupCancel()
+		if cause := context.Cause(runCtx); cause != nil {
+			return cause
+		}
+		return fmt.Errorf("clean managed containers before session takeover: %w", err)
+	}
+	if _, err := a.doContext(cleanupCtx, http.MethodPost, "/v1/nodes/"+a.cfg.ID+"/cleanup-complete", nil, nil, a.sessionHeaders()); err != nil {
+		cleanupCancel()
+		if cause := context.Cause(runCtx); cause != nil {
+			return cause
+		}
+		return fmt.Errorf("confirm managed container cleanup: %w", err)
+	}
+	cleanupCancel()
+	n.CleanupPending = false
 	a.baseline = n
 	// Confirm a fresh server-side lease before any worker can start. This also
 	// closes the window where a slow registration response consumes most of the
 	// lease before the Agent begins its heartbeat loop.
+	remaining := time.Until(a.sessionLeaseDeadline())
+	if remaining <= 0 {
+		a.stopExpiredSession(a.sessionTTL)
+		return fmt.Errorf("%w before initial heartbeat", errAgentSessionLeaseExpired)
+	}
 	requestStarted := time.Now()
 	requestTimeout := a.cfg.HeartbeatInterval
-	if requestTimeout <= 0 || requestTimeout > a.sessionTTL {
-		requestTimeout = a.sessionTTL
+	if requestTimeout <= 0 || requestTimeout > remaining {
+		requestTimeout = remaining
 	}
 	heartbeatCtx, heartbeatCancel := context.WithTimeout(runCtx, requestTimeout)
 	_, heartbeatErr := a.doContext(heartbeatCtx, http.MethodPost, "/v1/nodes/"+a.cfg.ID+"/heartbeat", nil, nil, a.sessionHeaders())
@@ -128,7 +157,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		return fmt.Errorf("confirm agent session heartbeat: %w", heartbeatErr)
 	}
-	a.leaseStarted = requestStarted
+	a.setSessionLeaseDeadline(requestStarted.Add(a.sessionTTL))
 	workers := n.GPUCount
 	if workers < 1 {
 		workers = 1
@@ -254,6 +283,38 @@ func (a *Agent) failStopIfSessionRejected(status int, err error) {
 	}
 }
 
+func (a *Agent) setSessionLeaseDeadline(deadline time.Time) {
+	a.leaseMu.Lock()
+	a.leaseDeadline = deadline
+	a.leaseMu.Unlock()
+}
+
+func (a *Agent) sessionLeaseDeadline() time.Time {
+	a.leaseMu.RLock()
+	defer a.leaseMu.RUnlock()
+	return a.leaseDeadline
+}
+
+// requireLiveSession performs a synchronous wall-clock lease check in the
+// worker that is about to start Docker. This remains effective when the whole
+// process was paused long enough that the heartbeat goroutine has not yet had
+// a chance to observe its timer.
+func (a *Agent) requireLiveSession(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := a.sessionLeaseDeadline()
+	if !deadline.IsZero() && time.Now().Before(deadline) {
+		return nil
+	}
+	ttl := a.sessionTTL
+	if ttl <= 0 {
+		ttl = model.AgentSessionFailStopTTL
+	}
+	a.stopExpiredSession(ttl)
+	return fmt.Errorf("%w after %s without a successful heartbeat", errAgentSessionLeaseExpired, ttl)
+}
+
 func (a *Agent) runWorker(ctx context.Context) {
 	ticker := time.NewTicker(a.cfg.PollInterval)
 	defer ticker.Stop()
@@ -311,9 +372,6 @@ func (a *Agent) tick(ctx context.Context) error {
 	defer os.RemoveAll(logDir)
 	logPath := filepath.Join(logDir, "training.log")
 	output, runErr := a.execute(ctx, &job, attemptToken, artifactDir, logPath)
-	if cleanupErr := a.cleanupJobContainersUntilDone(ctx, job.ID, job.Attempts); cleanupErr != nil {
-		return cleanupErr
-	}
 	if errors.Is(runErr, errJobCanceled) {
 		// The container is already stopped and waited. Release its GPU lease
 		// immediately; a slow object store must not hold cancellation open.
@@ -348,9 +406,6 @@ func (a *Agent) tick(ctx context.Context) error {
 }
 
 func (a *Agent) failStartedJob(ctx context.Context, job *model.Job, attemptToken string, cause error) error {
-	if err := a.cleanupJobContainersUntilDone(ctx, job.ID, job.Attempts); err != nil {
-		return fmt.Errorf("%v; cleanup before failed status: %w", cause, err)
-	}
 	update := model.JobUpdate{Status: model.JobFailed, Error: cause.Error()}
 	if err := a.updateJobStatusUntilAccepted(ctx, job, attemptToken, update); err != nil {
 		return fmt.Errorf("%v; persist failed status: %w", cause, err)
@@ -375,12 +430,10 @@ func (a *Agent) updateJobStatusUntilAccepted(ctx context.Context, job *model.Job
 				return fmt.Errorf("job %s is no longer startable (status %s): %w", job.ID, latest.Status, err)
 			}
 			if update.Status != model.JobRunning && latest.Status == model.JobCanceling {
-				// Cancellation won the race with this terminal write. The current
-				// attempt still owns cleanup and must release the lease with a
-				// CANCELED acknowledgement instead of retrying the old terminal state.
-				if cleanupErr := a.cleanupJobContainer(job.ID, job.Attempts); cleanupErr != nil {
-					err = fmt.Errorf("clean concurrently canceled job container: %w", cleanupErr)
-				} else if update.Status != model.JobCanceled {
+				// execute removes the exact immutable container ID before returning.
+				// Do not clean by attempt name here: after takeover that name may
+				// already belong to the replacement Agent.
+				if update.Status != model.JobCanceled {
 					update.Status, update.Error = model.JobCanceled, ""
 					continue
 				}
@@ -432,36 +485,8 @@ func (a *Agent) getJob(ctx context.Context, jobID, attemptToken string, out *mod
 }
 
 func (a *Agent) ackCanceled(ctx context.Context, jobID string, attempts int, attemptToken, output string) error {
-	if err := a.cleanupJobContainersUntilDone(ctx, jobID, attempts); err != nil {
-		return err
-	}
 	job := model.Job{ID: jobID, Attempts: attempts}
 	return a.updateJobStatusUntilAccepted(ctx, &job, attemptToken, model.JobUpdate{Status: model.JobCanceled, Output: output})
-}
-
-func (a *Agent) cleanupJobContainersUntilDone(ctx context.Context, jobID string, attempts int) error {
-	deadline := time.Now().Add(model.AgentSessionTTL)
-	for {
-		if err := a.cleanupJobAttemptContainers(jobID, attempts); err == nil {
-			break
-		} else if !time.Now().Before(deadline) {
-			cleanupErr := fmt.Errorf("clean job containers within %s: %w", model.AgentSessionTTL, err)
-			if a.failStop != nil {
-				a.failStop(cleanupErr)
-			}
-			return cleanupErr
-		} else {
-			fmt.Printf("agent canceled container cleanup warning: %v\n", err)
-		}
-		timer := time.NewTimer(time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return nil
 }
 
 func (a *Agent) uploadArtifact(parent context.Context, jobID, attemptToken, bundle string) error {
@@ -502,9 +527,10 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 	if ttl <= 0 {
 		ttl = model.AgentSessionFailStopTTL
 	}
-	leaseDeadline := a.leaseStarted.Add(ttl)
-	if a.leaseStarted.IsZero() {
+	leaseDeadline := a.sessionLeaseDeadline()
+	if leaseDeadline.IsZero() {
 		leaseDeadline = time.Now().Add(ttl)
+		a.setSessionLeaseDeadline(leaseDeadline)
 	}
 	initialLease := time.Until(leaseDeadline)
 	if initialLease <= 0 {
@@ -536,6 +562,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 			cancel()
 			if err == nil {
 				leaseDeadline = requestStarted.Add(ttl)
+				a.setSessionLeaseDeadline(leaseDeadline)
 				remaining = time.Until(leaseDeadline)
 				if remaining <= 0 {
 					a.stopExpiredSession(ttl)
@@ -565,7 +592,7 @@ func (a *Agent) stopExpiredSession(ttl time.Duration) {
 	}
 }
 
-func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, artifactDir, logPath string) (string, error) {
+func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, artifactDir, logPath string) (result string, resultErr error) {
 	if a.cfg.Executor == "mock" {
 		timer := time.NewTimer(250 * time.Millisecond)
 		defer timer.Stop()
@@ -579,47 +606,82 @@ func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, ar
 		}
 		return "mock executor completed", nil
 	}
+	if err := a.requireLiveSession(parent); err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(parent, time.Duration(job.TimeoutSeconds)*time.Second)
 	defer cancel()
-	args := []string{"run", "--rm", "--label", "gpuflow.job=" + job.ID}
-	args = append(args, "--mount", "type=bind,source="+artifactDir+",target=/gpuflow/artifacts", "-e", "GPUFLOW_ARTIFACT_DIR=/gpuflow/artifacts")
-	args = append(args, "-e", "PYTHONUNBUFFERED=1")
+	createArgs := []string{
+		"create", "--name", jobContainerName(job.ID, job.Attempts), "--rm",
+		"--label", "gpuflow.job=" + job.ID,
+		"--label", "gpuflow.session=" + a.session,
+	}
+	createArgs = append(createArgs, "--mount", "type=bind,source="+artifactDir+",target=/gpuflow/artifacts", "-e", "GPUFLOW_ARTIFACT_DIR=/gpuflow/artifacts")
+	createArgs = append(createArgs, "-e", "PYTHONUNBUFFERED=1")
 	if job.Requirements.GPUCount > 0 {
-		args = append(args, "--gpus", dockerGPUSelector(job))
+		createArgs = append(createArgs, "--gpus", dockerGPUSelector(job))
 	}
 	for k, v := range job.Environment {
-		args = append(args, "-e", k+"="+v)
+		createArgs = append(createArgs, "-e", k+"="+v)
 	}
-	args = append(args, job.Image)
-	args = append(args, job.Command...)
-	containerName := jobContainerName(job.ID, job.Attempts)
+	createArgs = append(createArgs, job.Image)
+	createArgs = append(createArgs, job.Command...)
 	// A previous agent process may have exited while Docker kept the job
 	// container alive. Recovered attempts use a new name, but still remove the
 	// legacy name and the immediately preceding attempt before starting.
-	if err := a.cleanupBeforeAttempt(job); err != nil {
+	if err := a.cleanupBeforeAttempt(ctx, job); err != nil {
 		return "", fmt.Errorf("clean recovered job containers: %w", err)
 	}
-	args = append([]string{"run", "--name", containerName}, args[1:]...)
-	cmd := exec.Command("docker", args...)
 	logFile, logErr := os.Create(logPath)
 	if logErr != nil {
 		return "", fmt.Errorf("create complete job log: %w", logErr)
 	}
 	defer logFile.Close()
+
+	// docker create is deliberately synchronous. The daemon atomically owns the
+	// deterministic attempt name before any workload can run. A delayed create
+	// from an old Agent can therefore only win the name or conflict with the
+	// replacement attempt; the two workloads can never start concurrently.
+	containerID, createErr := a.createAttemptContainer(ctx, job, attemptToken, createArgs)
+	if createErr != nil {
+		return "", createErr
+	}
+	// From this point onward cleanup must use the immutable ID. Cleaning by name
+	// could remove a replacement container if this process resumes after a
+	// takeover removed and reused the deterministic name.
+	defer func() {
+		if cleanupErr := a.cleanupContainerUntilDone(containerID); cleanupErr != nil {
+			if resultErr == nil {
+				resultErr = cleanupErr
+			} else {
+				resultErr = fmt.Errorf("%v; cleanup container %s: %w", resultErr, containerID, cleanupErr)
+			}
+		}
+	}()
+
+	// This server-side check closes the daemon-latency window: if create was
+	// accepted only after another session completed cleanup, the old attempt is
+	// rejected and its stopped container is removed without ever being started.
+	if err := a.validateAttemptOwnership(ctx, job.ID, attemptToken); err != nil {
+		return "", err
+	}
+	if err := a.requireLiveSession(parent); err != nil {
+		return "", err
+	}
+	command := a.cfg.ExecuteCommand
+	if command == nil {
+		command = exec.CommandContext
+	}
+	cmd := command(ctx, "docker", "start", "--attach", containerID)
 	output := &liveJobLog{full: logFile}
 	cmd.Stdout = output
 	cmd.Stderr = output
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("docker run failed: %w", err)
+	if err := a.requireLiveSession(parent); err != nil {
+		return "", err
 	}
-	// Docker keeps containers alive if its client disappears. This cleanup is
-	// therefore registered immediately after Start so panic/unwind cannot leave
-	// an unfenced workload consuming the GPU.
-	defer func() {
-		if cleanupErr := cleanupContainer(containerName); cleanupErr != nil {
-			fmt.Printf("agent container cleanup warning: %v\n", cleanupErr)
-		}
-	}()
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("docker start failed: %w", err)
+	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	ticker := time.NewTicker(time.Second)
@@ -633,7 +695,7 @@ func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, ar
 			goto finished
 		case <-ctx.Done():
 			immediate := errors.Is(context.Cause(parent), errAgentSessionLeaseExpired)
-			if terminateErr := terminateContainer(containerName, !immediate); terminateErr != nil {
+			if terminateErr := a.terminateContainer(containerID, !immediate); terminateErr != nil {
 				err = terminateErr
 			} else {
 				err = waitDockerCommand(cmd, done)
@@ -650,7 +712,7 @@ func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, ar
 			}
 			var latest model.Job
 			if pollErr := a.getJob(parent, job.ID, attemptToken, &latest); pollErr == nil && (latest.Status == model.JobCanceling || latest.Status == model.JobCanceled) {
-				if terminateErr := terminateContainer(containerName, true); terminateErr != nil {
+				if terminateErr := a.terminateContainer(containerID, true); terminateErr != nil {
 					text := strings.TrimSpace(output.String())
 					return text, fmt.Errorf("terminate canceled job container: %w", terminateErr)
 				}
@@ -672,7 +734,7 @@ finished:
 		return text, fmt.Errorf("job exceeded timeout of %d seconds", job.TimeoutSeconds)
 	}
 	if err != nil {
-		return text, fmt.Errorf("docker run failed: %w", err)
+		return text, fmt.Errorf("docker start failed: %w", err)
 	}
 	return strings.TrimSpace(text), nil
 }
@@ -696,58 +758,205 @@ func legacyJobContainerName(jobID string) string {
 	return "gpuflow-job-" + jobID
 }
 
-func (a *Agent) cleanupBeforeAttempt(job *model.Job) error {
+func (a *Agent) validateAttemptOwnership(ctx context.Context, jobID, attemptToken string) error {
+	path := "/v1/jobs/" + jobID + "/attempt?node_id=" + a.cfg.ID
+	if _, err := a.doContext(ctx, http.MethodGet, path, nil, nil, a.jobHeaders(attemptToken)); err != nil {
+		return fmt.Errorf("validate Docker attempt ownership: %w", err)
+	}
+	return nil
+}
+
+func (a *Agent) createAttemptContainer(ctx context.Context, job *model.Job, attemptToken string, args []string) (string, error) {
+	containerName := jobContainerName(job.ID, job.Attempts)
+	for {
+		if err := a.requireLiveSession(ctx); err != nil {
+			return "", err
+		}
+		// Validate with the control plane before every daemon request, including
+		// retries after a deterministic-name conflict. A superseded Agent must
+		// never reclaim a container owned by the replacement session.
+		if err := a.validateAttemptOwnership(ctx, job.ID, attemptToken); err != nil {
+			return "", err
+		}
+		output, err := a.runCleanupCommand(ctx, "docker", args...)
+		if err == nil {
+			containerID, parseErr := dockerContainerID(output)
+			if parseErr != nil {
+				return "", fmt.Errorf("docker create %s returned no container ID: %w", containerName, parseErr)
+			}
+			return containerID, nil
+		}
+		if !containerNameConflict(output) {
+			return "", fmt.Errorf("docker create %s: %s: %w", containerName, strings.TrimSpace(string(output)), err)
+		}
+
+		// Capture the immutable ID that caused this conflict before validating
+		// and deleting it. If another takeover reuses the name while this Agent
+		// is paused, cleanup of the captured ID cannot touch the new container.
+		conflictingID, found, inspectErr := a.inspectContainerID(ctx, containerName)
+		if inspectErr != nil {
+			return "", inspectErr
+		}
+		if !found {
+			continue
+		}
+		if err := a.validateAttemptOwnership(ctx, job.ID, attemptToken); err != nil {
+			return "", err
+		}
+		if err := a.requireLiveSession(ctx); err != nil {
+			return "", err
+		}
+		if err := a.cleanupNamedContainer(ctx, conflictingID); err != nil {
+			return "", fmt.Errorf("remove conflicting attempt container %s: %w", conflictingID, err)
+		}
+	}
+}
+
+func (a *Agent) inspectContainerID(ctx context.Context, name string) (string, bool, error) {
+	output, err := a.runCleanupCommand(ctx, "docker", "inspect", "--format", "{{.Id}}", name)
+	if err != nil {
+		if containerMissing(output) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("inspect conflicting container %s: %s: %w", name, strings.TrimSpace(string(output)), err)
+	}
+	containerID, parseErr := dockerContainerID(output)
+	if parseErr != nil {
+		return "", false, fmt.Errorf("inspect conflicting container %s: %w", name, parseErr)
+	}
+	return containerID, true, nil
+}
+
+func dockerContainerID(output []byte) (string, error) {
+	fields := strings.Fields(string(output))
+	for index := len(fields) - 1; index >= 0; index-- {
+		candidate := strings.TrimSpace(fields[index])
+		if len(candidate) < 12 || len(candidate) > 64 {
+			continue
+		}
+		valid := true
+		for _, character := range candidate {
+			if !strings.ContainsRune("0123456789abcdefABCDEF", character) {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("missing hexadecimal container ID")
+}
+
+func containerNameConflict(output []byte) bool {
+	message := strings.ToLower(string(output))
+	return strings.Contains(message, "container name") && strings.Contains(message, "already in use")
+}
+
+func (a *Agent) cleanupBeforeAttempt(ctx context.Context, job *model.Job) error {
 	if a.cfg.Executor == "mock" {
 		return nil
 	}
-	if err := cleanupContainer(legacyJobContainerName(job.ID)); err != nil {
+	if err := a.cleanupNamedContainer(ctx, legacyJobContainerName(job.ID)); err != nil {
 		return err
 	}
 	if job.Attempts > 1 {
-		if err := cleanupContainer(jobContainerName(job.ID, job.Attempts-1)); err != nil {
+		if err := a.cleanupNamedContainer(ctx, jobContainerName(job.ID, job.Attempts-1)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (a *Agent) cleanupJobContainer(jobID string, attempts int) error {
+func (a *Agent) cleanupManagedContainers(ctx context.Context) error {
 	if a.cfg.Executor == "mock" {
 		return nil
 	}
-	if err := cleanupContainer(jobContainerName(jobID, attempts)); err != nil {
-		return err
+	output, err := a.runCleanupCommand(ctx, "docker", "ps", "-aq", "--filter", "label=gpuflow.job")
+	if err != nil {
+		return fmt.Errorf("list GPUFlow containers: %s: %w", strings.TrimSpace(string(output)), err)
 	}
-	return cleanupContainer(legacyJobContainerName(jobID))
-}
-
-func (a *Agent) cleanupJobAttemptContainers(jobID string, attempts int) error {
-	if err := a.cleanupJobContainer(jobID, attempts); err != nil {
-		return err
+	containers := strings.Fields(string(output))
+	if len(containers) == 0 {
+		return nil
 	}
-	if a.cfg.Executor != "mock" && attempts > 1 {
-		return cleanupContainer(jobContainerName(jobID, attempts-1))
+	args := append([]string{"rm", "-f"}, containers...)
+	removeOutput, removeErr := a.runCleanupCommand(ctx, "docker", args...)
+	remainingOutput, verifyErr := a.runCleanupCommand(ctx, "docker", "ps", "-aq", "--filter", "label=gpuflow.job")
+	if verifyErr != nil {
+		return fmt.Errorf("verify GPUFlow container cleanup: %s: %w", strings.TrimSpace(string(remainingOutput)), verifyErr)
 	}
+	if remaining := strings.Fields(string(remainingOutput)); len(remaining) > 0 {
+		if removeErr != nil {
+			return fmt.Errorf("remove GPUFlow containers: %s: %w; still present: %s", strings.TrimSpace(string(removeOutput)), removeErr, strings.Join(remaining, ","))
+		}
+		return fmt.Errorf("GPUFlow containers still present after cleanup: %s", strings.Join(remaining, ","))
+	}
+	// Docker may report a raced/missing container while the verification above
+	// proves that no GPUFlow-managed task container remains.
 	return nil
 }
 
-func terminateContainer(containerName string, graceful bool) error {
+func (a *Agent) runCleanupCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if a.cfg.CleanupCommand != nil {
+		return a.cfg.CleanupCommand(ctx, name, args...)
+	}
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+func (a *Agent) cleanupNamedContainer(ctx context.Context, name string) error {
+	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	output, err := a.runCleanupCommand(cleanupCtx, "docker", "rm", "-f", name)
+	if err != nil && !containerMissing(output) {
+		return fmt.Errorf("docker rm %s: %s: %w", name, strings.TrimSpace(string(output)), err)
+	}
+	output, err = a.runCleanupCommand(cleanupCtx, "docker", "inspect", name)
+	if err == nil {
+		return fmt.Errorf("container %s still exists after docker rm -f", name)
+	}
+	if containerMissing(output) {
+		return nil
+	}
+	return fmt.Errorf("cannot confirm removal of %s: %s: %w", name, strings.TrimSpace(string(output)), err)
+}
+
+func (a *Agent) terminateContainer(containerID string, graceful bool) error {
 	var stopErr error
 	if graceful {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		output, err := exec.CommandContext(ctx, "docker", "stop", "--time", "10", containerName).CombinedOutput()
+		output, err := a.runCleanupCommand(ctx, "docker", "stop", "--time", "10", containerID)
 		cancel()
 		if err != nil && !containerMissing(output) {
-			stopErr = fmt.Errorf("docker stop %s: %s: %w", containerName, strings.TrimSpace(string(output)), err)
+			stopErr = fmt.Errorf("docker stop %s: %s: %w", containerID, strings.TrimSpace(string(output)), err)
 		}
 	}
-	if cleanupErr := cleanupContainer(containerName); cleanupErr != nil {
+	if cleanupErr := a.cleanupNamedContainer(context.Background(), containerID); cleanupErr != nil {
 		if stopErr != nil {
 			return fmt.Errorf("%v; force cleanup: %w", stopErr, cleanupErr)
 		}
 		return cleanupErr
 	}
 	return nil
+}
+
+func (a *Agent) cleanupContainerUntilDone(containerID string) error {
+	deadline := time.Now().Add(model.AgentSessionTTL)
+	for {
+		if err := a.cleanupNamedContainer(context.Background(), containerID); err == nil {
+			return nil
+		} else if !time.Now().Before(deadline) {
+			cleanupErr := fmt.Errorf("clean container %s within %s: %w", containerID, model.AgentSessionTTL, err)
+			if a.failStop != nil {
+				a.failStop(cleanupErr)
+			}
+			return cleanupErr
+		} else {
+			fmt.Printf("agent container cleanup warning: %v\n", err)
+		}
+		timer := time.NewTimer(time.Second)
+		<-timer.C
+	}
 }
 
 func waitDockerCommand(cmd *exec.Cmd, done <-chan error) error {
@@ -768,26 +977,6 @@ func waitDockerCommand(cmd *exec.Cmd, done <-chan error) error {
 	case <-timer.C:
 		return errors.New("docker client did not exit after container cleanup")
 	}
-}
-
-func cleanupContainer(containerName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(ctx, "docker", "rm", "-f", containerName).CombinedOutput()
-	if err != nil {
-		if containerMissing(output) {
-			return nil
-		}
-		return fmt.Errorf("docker rm -f %s: %s: %w", containerName, strings.TrimSpace(string(output)), err)
-	}
-	output, err = exec.CommandContext(ctx, "docker", "inspect", containerName).CombinedOutput()
-	if err == nil {
-		return fmt.Errorf("container %s still exists after docker rm -f", containerName)
-	}
-	if containerMissing(output) {
-		return nil
-	}
-	return fmt.Errorf("cannot confirm removal of %s: %s: %w", containerName, strings.TrimSpace(string(output)), err)
 }
 
 func containerMissing(output []byte) bool {

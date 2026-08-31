@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -11,6 +12,13 @@ import (
 
 	"gpuflow/internal/model"
 )
+
+func confirmAgentSession(t *testing.T, s *Store, nodeID, session string) {
+	t.Helper()
+	if _, err := s.ConfirmNodeCleanupSession(nodeID, session); err != nil {
+		t.Fatalf("confirm node cleanup for %s: %v", nodeID, err)
+	}
+}
 
 func TestScheduleChoosesCheapestEligibleNode(t *testing.T) {
 	s := NewMemory()
@@ -26,6 +34,206 @@ func TestScheduleChoosesCheapestEligibleNode(t *testing.T) {
 	got, _ := s.GetJob(j.ID)
 	if got.AssignedNode != "cheap" {
 		t.Fatalf("expected cheap node, got %q", got.AssignedNode)
+	}
+}
+
+func TestAgentSessionCleanupGateBlocksDispatchUntilConfirmed(t *testing.T) {
+	s := NewMemory()
+	node, err := s.RegisterNodeSession(model.Node{ID: "cleanup-gated", GPUCount: 1, VRAMGB: 24}, "session-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !node.CleanupPending {
+		t.Fatal("new Agent session was schedulable before orphan cleanup")
+	}
+	job, err := s.CreateJob(model.JobCreate{Name: "wait for cleanup", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := s.GetJob(job.ID)
+	if stored.Status != model.JobQueued {
+		t.Fatalf("pending cleanup session received work: %+v", stored)
+	}
+	if err := s.HeartbeatNodeSession(node.ID, "session-one"); !errors.Is(err, ErrNodeUnavailable) {
+		t.Fatalf("pending session bypassed cleanup through heartbeat: %v", err)
+	}
+	if _, err := s.NextJobSession(node.ID, "session-one"); !errors.Is(err, ErrNodeUnavailable) {
+		t.Fatalf("pending session polled work before cleanup: %v", err)
+	}
+	if _, err := s.ConfirmNodeCleanupSession(node.ID, "wrong-session"); !errors.Is(err, ErrAgentSession) {
+		t.Fatalf("wrong session confirmed cleanup: %v", err)
+	}
+	ready, err := s.ConfirmNodeCleanupSession(node.ID, "session-one")
+	if err != nil || ready.CleanupPending {
+		t.Fatalf("current session could not confirm cleanup: %+v %v", ready, err)
+	}
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ = s.GetJob(job.ID)
+	if stored.Status != model.JobAssigned || stored.AssignedSession != "session-one" {
+		t.Fatalf("ready session did not receive work: %+v", stored)
+	}
+
+	s.mu.Lock()
+	s.state.Nodes[node.ID].LastHeartbeat = time.Now().Add(-time.Minute)
+	s.mu.Unlock()
+	if _, err := s.RegisterNodeSession(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24}, "session-two"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ConfirmNodeCleanupSession(node.ID, "session-one"); !errors.Is(err, ErrAgentSession) {
+		t.Fatalf("old session confirmed a new takeover: %v", err)
+	}
+}
+
+func TestExpiredAgentSessionIsPersistentlyFencedBeforeItCanRevive(t *testing.T) {
+	s := NewMemory()
+	node, err := s.RegisterNodeSession(model.Node{ID: "expired-session", GPUCount: 1, VRAMGB: 24}, "old-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmAgentSession(t, s, node.ID, "old-session")
+	s.mu.Lock()
+	s.state.Nodes[node.ID].LastHeartbeat = time.Now().Add(-agentSessionActiveFor - time.Second)
+	s.mu.Unlock()
+
+	if err := s.HeartbeatNodeSession(node.ID, "old-session"); !errors.Is(err, ErrAgentSession) {
+		t.Fatalf("expired heartbeat revived its session: %v", err)
+	}
+	s.mu.Lock()
+	fenced := *s.state.Nodes[node.ID]
+	s.mu.Unlock()
+	if fenced.SessionEpoch != "" || !fenced.CleanupPending {
+		t.Fatalf("expired session fence was not retained: %+v", fenced)
+	}
+	if _, err := s.ConfirmNodeCleanupSession(node.ID, "old-session"); !errors.Is(err, ErrAgentSession) {
+		t.Fatalf("expired session confirmed cleanup: %v", err)
+	}
+
+	pending, err := s.RegisterNodeSession(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24}, "new-session")
+	if err != nil || !pending.CleanupPending {
+		t.Fatalf("replacement did not enter cleanup gate: %+v %v", pending, err)
+	}
+	s.mu.Lock()
+	s.state.Nodes[node.ID].LastHeartbeat = time.Now().Add(-agentSessionActiveFor - time.Second)
+	s.mu.Unlock()
+	if _, err := s.ConfirmNodeCleanupSession(node.ID, "new-session"); !errors.Is(err, ErrAgentSession) {
+		t.Fatalf("cleanup confirmation revived an expired registration: %v", err)
+	}
+}
+
+func TestCleanupPendingRejectsEveryUntrustedAttemptWrite(t *testing.T) {
+	s := NewMemory()
+	node, _ := s.RegisterNodeSession(model.Node{ID: "pending-writes", GPUCount: 1, VRAMGB: 24}, "session")
+	confirmAgentSession(t, s, node.ID, "session")
+	job, _ := s.CreateJob(model.JobCreate{Name: "pending writes", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
+	_ = s.Schedule(time.Minute)
+	dispatch, _ := s.NextJobSession(node.ID, "session")
+	if _, err := s.UpdateJobLease(job.ID, node.ID, "session", dispatch.AttemptToken, model.JobUpdate{Status: model.JobRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterNodeSession(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24}, "session"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UpdateJobLease(job.ID, node.ID, "session", dispatch.AttemptToken, model.JobUpdate{Status: model.JobSucceeded}); !errors.Is(err, ErrNodeUnavailable) {
+		t.Fatalf("terminal status crossed cleanup gate: %v", err)
+	}
+	if _, err := s.UpdateJobOutputLease(job.ID, node.ID, "session", dispatch.AttemptToken, "late"); !errors.Is(err, ErrNodeUnavailable) {
+		t.Fatalf("log write crossed cleanup gate: %v", err)
+	}
+	if err := s.ValidateJobAttempt(job.ID, node.ID, "session", dispatch.AttemptToken); !errors.Is(err, ErrNodeUnavailable) {
+		t.Fatalf("artifact attempt crossed cleanup gate: %v", err)
+	}
+	stored, _ := s.GetJob(job.ID)
+	if stored.Status != model.JobRunning || stored.AssignedNode != node.ID {
+		t.Fatalf("pending write released the job: %+v", stored)
+	}
+}
+
+func TestCreateJobValidatesAndNormalizesCPUOnlyRequirements(t *testing.T) {
+	s := NewMemory()
+	_, _ = s.RegisterNode(model.Node{ID: "cpu-node", GPUModel: "none", CPUCores: 8})
+	job, err := s.CreateJob(model.JobCreate{
+		Name:  "cpu",
+		Image: "work",
+		Requirements: model.Requirements{
+			GPUCount: 0, MinVRAMGB: 80, GPUModels: []string{"H100"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Requirements.MinVRAMGB != 0 || len(job.Requirements.GPUModels) != 0 || job.TimeoutSeconds != 3600 {
+		t.Fatalf("CPU-only requirements were not normalized: %+v", job)
+	}
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	job, _ = s.GetJob(job.ID)
+	if job.Status != model.JobAssigned || job.AssignedNode != "cpu-node" {
+		t.Fatalf("normalized CPU-only job was not schedulable: %+v", job)
+	}
+
+	overflow := maxPersistedJobInt + 1
+	invalid := []model.JobCreate{
+		{Name: "negative gpu", Image: "work", Requirements: model.Requirements{GPUCount: -1}},
+		{Name: "too many gpus", Image: "work", Requirements: model.Requirements{GPUCount: maxGPUsPerNodeOrJob + 1}},
+		{Name: "negative vram", Image: "work", Requirements: model.Requirements{MinVRAMGB: -1}},
+		{Name: "negative price", Image: "work", Requirements: model.Requirements{MaxHourly: -1}},
+		{Name: "nan price", Image: "work", Requirements: model.Requirements{MaxHourly: math.NaN()}},
+		{Name: "negative timeout", Image: "work", TimeoutSeconds: -1},
+		{Name: "timeout overflow", Image: "work", TimeoutSeconds: int(overflow)},
+		{Name: "negative retries", Image: "work", MaxRetries: -1},
+		{Name: "retry overflow", Image: "work", MaxRetries: int(overflow)},
+	}
+	for _, input := range invalid {
+		if _, err := s.CreateJob(input); !errors.Is(err, ErrInvalidResources) {
+			t.Fatalf("invalid job %q was accepted: %v", input.Name, err)
+		}
+	}
+
+	legacy := NewMemory()
+	_, _ = legacy.RegisterNode(model.Node{ID: "legacy-cpu-node", CPUCores: 8})
+	now := time.Now().UTC()
+	legacyJob := &model.Job{ID: "legacy-cpu", Name: "legacy CPU", Image: "work", Requirements: model.Requirements{GPUCount: 0, MinVRAMGB: 80, GPUModels: []string{"H100"}}, Status: model.JobQueued, CreatedAt: now, UpdatedAt: now}
+	legacy.mu.Lock()
+	legacy.state.Jobs[legacyJob.ID] = legacyJob
+	legacy.mu.Unlock()
+	if err := legacy.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	legacyJob, _ = legacy.GetJob(legacyJob.ID)
+	if legacyJob.Status != model.JobAssigned || legacyJob.AssignedNode != "legacy-cpu-node" {
+		t.Fatalf("persisted CPU-only GPU filters still blocked scheduling: %+v", legacyJob)
+	}
+}
+
+func TestGranularSchedulingDoesNotAllocateFromOversizedGPUCount(t *testing.T) {
+	s := NewMemory()
+	s.SetGPUGranularScheduling(true)
+	_, _ = s.RegisterNode(model.Node{ID: "small", GPUCount: 1, VRAMGB: 24})
+	if _, err := s.CreateJob(model.JobCreate{Name: "oversized", Image: "work", Requirements: model.Requirements{GPUCount: math.MaxInt}}); !errors.Is(err, ErrInvalidResources) {
+		t.Fatalf("oversized request was accepted: %v", err)
+	}
+	now := time.Now().UTC()
+	job := &model.Job{ID: "legacy-oversized", Name: "legacy oversized", Image: "work", Requirements: model.Requirements{GPUCount: math.MaxInt}, Status: model.JobQueued, CreatedAt: now, UpdatedAt: now}
+	s.mu.Lock()
+	s.state.Jobs[job.ID] = job
+	s.mu.Unlock()
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	job, _ = s.GetJob(job.ID)
+	if job.Status != model.JobQueued {
+		t.Fatalf("oversized GPU request was assigned: %+v", job)
+	}
+	legacyNode := &model.Node{ID: "legacy-huge-node", GPUCount: math.MaxInt}
+	if available := s.availableGPUsLocked(legacyNode, math.MaxInt); len(available) != maxGPUsPerNodeOrJob {
+		t.Fatalf("defensive GPU enumeration returned %d devices", len(available))
 	}
 }
 
@@ -107,6 +315,193 @@ func TestRegisterNodeRecoversRunningJob(t *testing.T) {
 	if exhausted.Status != model.JobFailed || exhaustedNode.Busy || exhaustedNode.CurrentJob != "" {
 		t.Fatalf("expected cleanup acknowledgement to fail and release exhausted recovery: job=%+v node=%+v", exhausted, exhaustedNode)
 	}
+}
+
+func TestScheduleReconcilesOfflineActiveJobs(t *testing.T) {
+	t.Run("running job waits for takeover cleanup before retry", func(t *testing.T) {
+		s := NewMemory()
+		offline, err := s.RegisterNodeSession(model.Node{ID: "offline", GPUCount: 1, VRAMGB: 24, HourlyPrice: 1}, "old-session")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.RegisterNodeSession(model.Node{ID: "replacement", GPUCount: 1, VRAMGB: 24, HourlyPrice: 2}, "replacement-session"); err != nil {
+			t.Fatal(err)
+		}
+		confirmAgentSession(t, s, offline.ID, "old-session")
+		confirmAgentSession(t, s, "replacement", "replacement-session")
+		job, _ := s.CreateJob(model.JobCreate{Name: "retry offline", Image: "work", MaxRetries: 1, Requirements: model.Requirements{GPUCount: 1}})
+		if err := s.Schedule(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		dispatch, err := s.NextJobSession(offline.ID, "old-session")
+		if err != nil || dispatch == nil {
+			t.Fatalf("dispatch offline attempt: %+v %v", dispatch, err)
+		}
+		if _, err := s.UpdateJobLease(job.ID, offline.ID, "old-session", dispatch.AttemptToken, model.JobUpdate{Status: model.JobRunning, Output: "partial"}); err != nil {
+			t.Fatal(err)
+		}
+
+		s.mu.Lock()
+		s.state.Nodes[offline.ID].LastHeartbeat = time.Now().Add(-2 * time.Minute)
+		s.mu.Unlock()
+		if err := s.Schedule(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		held, _ := s.GetJob(job.ID)
+		offlineState := s.state.Nodes[offline.ID]
+		if held.Status != model.JobRunning || held.AssignedNode != offline.ID || held.Attempts != 1 || held.Recoveries != 0 || !offlineState.CleanupPending || offlineState.SessionEpoch != "" || !offlineState.Busy {
+			t.Fatalf("offline attempt was released before cleanup: job=%+v node=%+v", held, offlineState)
+		}
+		if replacement := s.state.Nodes["replacement"]; replacement.Busy {
+			t.Fatalf("replacement received uncleared work: %+v", replacement)
+		}
+		if _, err := s.NextJobSession("replacement", "replacement-session"); err != nil {
+			t.Fatalf("replacement poll failed: %v", err)
+		}
+		if _, err := s.UpdateJobLease(job.ID, offline.ID, "old-session", dispatch.AttemptToken, model.JobUpdate{Status: model.JobSucceeded}); !errors.Is(err, ErrAgentSession) {
+			t.Fatalf("offline attempt was not fenced: %v", err)
+		}
+		if err := s.HeartbeatNodeSession(offline.ID, "old-session"); !errors.Is(err, ErrAgentSession) {
+			t.Fatalf("offline session remained valid: %v", err)
+		}
+		if err := s.DeleteNode(offline.ID); !errors.Is(err, ErrNodeBusy) {
+			t.Fatalf("uncleared offline node was deletable: %v", err)
+		}
+
+		returned, err := s.RegisterNodeSession(model.Node{ID: offline.ID, GPUCount: 1, VRAMGB: 24, HourlyPrice: 1}, "new-session")
+		if err != nil || !returned.CleanupPending {
+			t.Fatalf("returning node did not enter cleanup gate: %+v %v", returned, err)
+		}
+		if _, err := s.NextJobSession(offline.ID, "new-session"); !errors.Is(err, ErrNodeUnavailable) {
+			t.Fatalf("cleanup dispatch escaped pending gate: %v", err)
+		}
+		confirmAgentSession(t, s, offline.ID, "new-session")
+		cleanup, err := s.NextJobSession(offline.ID, "new-session")
+		if err != nil || cleanup == nil || cleanup.Status != model.JobCanceling || cleanup.AttemptToken == "" {
+			t.Fatalf("recovery cleanup was not dispatched: %+v %v", cleanup, err)
+		}
+		if _, err := s.UpdateJobLease(job.ID, offline.ID, "new-session", cleanup.AttemptToken, model.JobUpdate{Status: model.JobCanceled}); err != nil {
+			t.Fatal(err)
+		}
+		queued, _ := s.GetJob(job.ID)
+		if queued.Status != model.JobQueued || queued.AssignedNode != "" || queued.Recoveries != 1 || queued.Attempts != 1 {
+			t.Fatalf("cleanup acknowledgement did not open retry: %+v", queued)
+		}
+		if err := s.DeleteNode(offline.ID); err != nil {
+			t.Fatalf("cleaned node could not be deleted: %v", err)
+		}
+		if err := s.Schedule(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		retried, _ := s.GetJob(job.ID)
+		if retried.Status != model.JobAssigned || retried.AssignedNode != "replacement" || retried.Attempts != 2 {
+			t.Fatalf("cleaned attempt did not retry on replacement: %+v", retried)
+		}
+	})
+
+	t.Run("exhausted running job fails only after cleanup acknowledgement", func(t *testing.T) {
+		s := NewMemory()
+		node, _ := s.RegisterNodeSession(model.Node{ID: "exhausted", GPUCount: 1, VRAMGB: 24}, "old-session")
+		confirmAgentSession(t, s, node.ID, "old-session")
+		job, _ := s.CreateJob(model.JobCreate{Name: "fail offline", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
+		_ = s.Schedule(time.Minute)
+		dispatch, _ := s.NextJobSession(node.ID, "old-session")
+		_, _ = s.UpdateJobLease(job.ID, node.ID, "old-session", dispatch.AttemptToken, model.JobUpdate{Status: model.JobRunning, Output: "partial"})
+		s.mu.Lock()
+		s.state.Nodes[node.ID].LastHeartbeat = time.Now().Add(-2 * time.Minute)
+		s.mu.Unlock()
+		if err := s.Schedule(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		held, _ := s.GetJob(job.ID)
+		if held.Status != model.JobRunning || held.FinishedAt != nil || !s.ListNodes()[0].Busy {
+			t.Fatalf("exhausted attempt closed without cleanup: %+v", held)
+		}
+		if _, err := s.RegisterNodeSession(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24}, "new-session"); err != nil {
+			t.Fatal(err)
+		}
+		confirmAgentSession(t, s, node.ID, "new-session")
+		cleanup, err := s.NextJobSession(node.ID, "new-session")
+		if err != nil || cleanup == nil || cleanup.Status != model.JobCanceling {
+			t.Fatalf("exhausted cleanup was not dispatched: %+v %v", cleanup, err)
+		}
+		if _, err := s.UpdateJobLease(job.ID, node.ID, "new-session", cleanup.AttemptToken, model.JobUpdate{Status: model.JobCanceled}); err != nil {
+			t.Fatal(err)
+		}
+		failed, _ := s.GetJob(job.ID)
+		if failed.Status != model.JobFailed || failed.FinishedAt == nil || s.ListNodes()[0].Busy {
+			t.Fatalf("cleanup acknowledgement did not fail exhausted attempt: %+v", failed)
+		}
+	})
+
+	t.Run("canceling job waits for cleanup acknowledgement", func(t *testing.T) {
+		s := NewMemory()
+		node, _ := s.RegisterNodeSession(model.Node{ID: "canceling", GPUCount: 1, VRAMGB: 24}, "old-session")
+		confirmAgentSession(t, s, node.ID, "old-session")
+		job, _ := s.CreateJob(model.JobCreate{Name: "cancel offline", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
+		_ = s.Schedule(time.Minute)
+		dispatch, _ := s.NextJobSession(node.ID, "old-session")
+		_, _ = s.UpdateJobLease(job.ID, node.ID, "old-session", dispatch.AttemptToken, model.JobUpdate{Status: model.JobRunning})
+		_, _ = s.CancelJob(job.ID)
+		s.mu.Lock()
+		s.state.Nodes[node.ID].LastHeartbeat = time.Now().Add(-2 * time.Minute)
+		s.mu.Unlock()
+		if err := s.Schedule(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		held, _ := s.GetJob(job.ID)
+		if held.Status != model.JobCanceling || !s.ListNodes()[0].Busy {
+			t.Fatalf("offline cancellation closed without cleanup: %+v", held)
+		}
+		if _, err := s.RegisterNodeSession(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24}, "new-session"); err != nil {
+			t.Fatal(err)
+		}
+		confirmAgentSession(t, s, node.ID, "new-session")
+		cleanup, err := s.NextJobSession(node.ID, "new-session")
+		if err != nil || cleanup == nil || cleanup.Status != model.JobCanceling {
+			t.Fatalf("cancel cleanup was not dispatched: %+v %v", cleanup, err)
+		}
+		if _, err := s.UpdateJobLease(job.ID, node.ID, "new-session", cleanup.AttemptToken, model.JobUpdate{Status: model.JobCanceled}); err != nil {
+			t.Fatal(err)
+		}
+		canceled, _ := s.GetJob(job.ID)
+		if canceled.Status != model.JobCanceled || canceled.FinishedAt == nil || s.ListNodes()[0].Busy {
+			t.Fatalf("cleanup acknowledgement did not cancel job: %+v", canceled)
+		}
+	})
+
+	t.Run("unstarted assignment is fenced and redelivered only after cleanup", func(t *testing.T) {
+		s := NewMemory()
+		node, _ := s.RegisterNodeSession(model.Node{ID: "assigned", GPUCount: 1, VRAMGB: 24}, "old-session")
+		confirmAgentSession(t, s, node.ID, "old-session")
+		job, _ := s.CreateJob(model.JobCreate{Name: "assigned offline", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
+		_ = s.Schedule(time.Minute)
+		first, _ := s.NextJobSession(node.ID, "old-session")
+		s.mu.Lock()
+		s.state.Nodes[node.ID].LastHeartbeat = time.Now().Add(-2 * time.Minute)
+		s.mu.Unlock()
+		if err := s.Schedule(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		held, _ := s.GetJob(job.ID)
+		if held.Status != model.JobAssigned || held.AssignedNode != node.ID || held.Attempts != 1 || !s.ListNodes()[0].Busy {
+			t.Fatalf("unstarted assignment was released before cleanup: %+v", held)
+		}
+		if _, err := s.UpdateJobLease(job.ID, node.ID, "old-session", first.AttemptToken, model.JobUpdate{Status: model.JobRunning}); !errors.Is(err, ErrAgentSession) {
+			t.Fatalf("old assignment was not fenced: %v", err)
+		}
+		if _, err := s.RegisterNodeSession(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24}, "new-session"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.NextJobSession(node.ID, "new-session"); !errors.Is(err, ErrNodeUnavailable) {
+			t.Fatalf("assignment escaped cleanup gate: %v", err)
+		}
+		confirmAgentSession(t, s, node.ID, "new-session")
+		second, err := s.NextJobSession(node.ID, "new-session")
+		if err != nil || second == nil || second.Status != model.JobAssigned || second.Attempts != 1 || second.AttemptToken == first.AttemptToken {
+			t.Fatalf("cleaned assignment was not safely redelivered: %+v %v", second, err)
+		}
+	})
 }
 
 func TestCancelOverridesRecoveryRetryAfterTakeover(t *testing.T) {
@@ -368,6 +763,7 @@ func TestNodeInventoryAndLicenseAdmissionAreAtomic(t *testing.T) {
 		if _, err := s.RegisterNodeSession(model.Node{ID: id, GPUModel: "none", HealthStatus: "HEALTHY"}, "session-"+id); err != nil {
 			t.Fatal(err)
 		}
+		confirmAgentSession(t, s, id, "session-"+id)
 	}
 
 	start := make(chan struct{})
@@ -422,10 +818,12 @@ func TestExpiredUnlimitedLicenseRejectsOnlyNewCapacity(t *testing.T) {
 	if _, err := s.RegisterNodeSession(model.Node{ID: "existing", GPUCount: 1, VRAMGB: 24}, "same-session"); err != nil {
 		t.Fatal(err)
 	}
+	confirmAgentSession(t, s, "existing", "same-session")
 	s.SetSchedulingLimits(0, 0, time.Now().Add(-time.Minute).Format(time.RFC3339))
 	if _, err := s.RegisterNodeSession(model.Node{ID: "existing", GPUCount: 1, VRAMGB: 24}, "same-session"); err != nil {
 		t.Fatalf("same-capacity reconnect failed: %v", err)
 	}
+	confirmAgentSession(t, s, "existing", "same-session")
 	if _, err := s.RegisterNodeSession(model.Node{ID: "new"}, "new-session"); !errors.Is(err, ErrLicenseExpired) {
 		t.Fatalf("expired unlimited license accepted a new node: %v", err)
 	}
@@ -441,6 +839,7 @@ func TestHealthAndLicenseAreRecheckedBeforeStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	confirmAgentSession(t, s, node.ID, "session")
 	job, _ := s.CreateJob(model.JobCreate{Name: "guarded", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
 	if err := s.Schedule(time.Minute); err != nil {
 		t.Fatal(err)
@@ -494,6 +893,7 @@ func TestAgentSessionAndAttemptLeaseFenceLateWriters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	confirmAgentSession(t, s, node.ID, "session-one")
 	job, _ := s.CreateJob(model.JobCreate{Name: "fenced", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
 	_ = s.Schedule(time.Minute)
 	first, err := s.NextJobSession(node.ID, "session-one")
@@ -509,6 +909,7 @@ func TestAgentSessionAndAttemptLeaseFenceLateWriters(t *testing.T) {
 	if _, err := s.RegisterNodeSession(model.Node{ID: node.ID, GPUCount: 1, VRAMGB: 24}, "session-two"); err != nil {
 		t.Fatal(err)
 	}
+	confirmAgentSession(t, s, node.ID, "session-two")
 	if err := s.HeartbeatNodeSession(node.ID, "session-one"); !errors.Is(err, ErrAgentSession) {
 		t.Fatalf("stale session heartbeat was accepted: %v", err)
 	}
@@ -516,13 +917,13 @@ func TestAgentSessionAndAttemptLeaseFenceLateWriters(t *testing.T) {
 	if err != nil || second == nil || second.AttemptToken == first.AttemptToken {
 		t.Fatalf("new session did not receive a new attempt: %+v %v", second, err)
 	}
-	if _, err := s.UpdateJobLease(job.ID, node.ID, "session-one", first.AttemptToken, model.JobUpdate{Status: model.JobRunning}); !errors.Is(err, ErrAttemptLease) {
+	if _, err := s.UpdateJobLease(job.ID, node.ID, "session-one", first.AttemptToken, model.JobUpdate{Status: model.JobRunning}); !errors.Is(err, ErrAgentSession) {
 		t.Fatalf("stale attempt started the job: %v", err)
 	}
 	if _, err := s.UpdateJobLease(job.ID, node.ID, "session-two", second.AttemptToken, model.JobUpdate{Status: model.JobRunning}); err != nil {
 		t.Fatalf("current attempt could not start: %v", err)
 	}
-	if _, err := s.UpdateJobOutputLease(job.ID, node.ID, "session-one", first.AttemptToken, "late"); !errors.Is(err, ErrAttemptLease) {
+	if _, err := s.UpdateJobOutputLease(job.ID, node.ID, "session-one", first.AttemptToken, "late"); !errors.Is(err, ErrAgentSession) {
 		t.Fatalf("stale attempt wrote logs: %v", err)
 	}
 }
@@ -530,6 +931,7 @@ func TestAgentSessionAndAttemptLeaseFenceLateWriters(t *testing.T) {
 func TestCancelKeepsRunningLeaseUntilOwnerAcknowledges(t *testing.T) {
 	s := NewMemory()
 	node, _ := s.RegisterNodeSession(model.Node{ID: "cancel-fenced", GPUCount: 1, VRAMGB: 24}, "session")
+	confirmAgentSession(t, s, node.ID, "session")
 	job, _ := s.CreateJob(model.JobCreate{Name: "cancel", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
 	_ = s.Schedule(time.Minute)
 	dispatch, _ := s.NextJobSession(node.ID, "session")

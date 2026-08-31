@@ -20,7 +20,7 @@ var (
 	ErrNodeBusy           = errors.New("node has an assigned or running job")
 	ErrJobActive          = errors.New("active job must be canceled before deletion")
 	ErrPersistence        = errors.New("persist state")
-	ErrInvalidResources   = errors.New("invalid node resources")
+	ErrInvalidResources   = errors.New("invalid resources")
 	ErrLicenseCapacity    = errors.New("enterprise license capacity exceeded")
 	ErrLicenseExpired     = errors.New("enterprise license expired; new capacity is disabled")
 	ErrAgentSession       = errors.New("invalid agent session")
@@ -32,6 +32,8 @@ var (
 const (
 	agentSessionActiveFor = model.AgentSessionTTL
 	jobLeaseDuration      = 30 * time.Second
+	maxGPUsPerNodeOrJob   = 1024
+	maxPersistedJobInt    = int64(1<<31 - 1)
 	recoveryCleanupMarker = "[gpuflow:recovery-cleanup-before-failed]"
 	recoveryRetryMarker   = "[gpuflow:recovery-cleanup-before-retry]"
 )
@@ -243,6 +245,9 @@ func (s *Store) CreateJob(in model.JobCreate) (*model.Job, error) {
 }
 
 func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job, error) {
+	if err := validateAndNormalizeJobCreate(&in); err != nil {
+		return nil, err
+	}
 	before := cloneSnapshot(s.state)
 	now := time.Now().UTC()
 	for _, existing := range s.state.Jobs {
@@ -254,9 +259,6 @@ func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job,
 	if strategy == "" {
 		strategy = "lowest_cost"
 	}
-	if in.TimeoutSeconds == 0 {
-		in.TimeoutSeconds = 3600
-	}
 	j := &model.Job{ID: newID("job"), Name: in.Name, Image: in.Image, Command: in.Command,
 		Environment: in.Environment, Requirements: in.Requirements, Strategy: strategy,
 		TimeoutSeconds: in.TimeoutSeconds, MaxRetries: in.MaxRetries, Status: model.JobQueued,
@@ -267,6 +269,34 @@ func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job,
 	}
 	copy := *j
 	return &copy, nil
+}
+
+func validateAndNormalizeJobCreate(in *model.JobCreate) error {
+	if in.Requirements.GPUCount < 0 || in.Requirements.MinVRAMGB < 0 || in.Requirements.MaxHourly < 0 {
+		return fmt.Errorf("%w: job resource requirements cannot be negative", ErrInvalidResources)
+	}
+	if in.Requirements.GPUCount > maxGPUsPerNodeOrJob {
+		return fmt.Errorf("%w: gpu_count cannot exceed %d", ErrInvalidResources, maxGPUsPerNodeOrJob)
+	}
+	if math.IsNaN(in.Requirements.MaxHourly) || math.IsInf(in.Requirements.MaxHourly, 0) {
+		return fmt.Errorf("%w: max_hourly_price must be finite", ErrInvalidResources)
+	}
+	if in.TimeoutSeconds < 0 || int64(in.TimeoutSeconds) > maxPersistedJobInt {
+		return fmt.Errorf("%w: timeout_seconds must be between 0 and %d", ErrInvalidResources, maxPersistedJobInt)
+	}
+	if in.MaxRetries < 0 || int64(in.MaxRetries) > maxPersistedJobInt {
+		return fmt.Errorf("%w: max_retries must be between 0 and %d", ErrInvalidResources, maxPersistedJobInt)
+	}
+	if in.Requirements.GPUCount == 0 {
+		// CPU-only jobs are whole-node exclusive. GPU-only filters must not make
+		// them ineligible for CPU nodes or nodes with a different GPU inventory.
+		in.Requirements.MinVRAMGB = 0
+		in.Requirements.GPUModels = nil
+	}
+	if in.TimeoutSeconds == 0 {
+		in.TimeoutSeconds = 3600
+	}
+	return nil
 }
 
 func (s *Store) RerunJob(id string) (*model.Job, error) {
@@ -519,14 +549,14 @@ func (s *Store) ListJobs() []*model.Job {
 // RegisterNodeSession so concurrent processes with the same node ID cannot
 // take over one another while the current session is alive.
 func (s *Store) RegisterNode(in model.Node) (*model.Node, error) {
-	return s.registerNode(in, newToken("session"), true)
+	return s.registerNode(in, newToken("session"), true, false)
 }
 
 func (s *Store) RegisterNodeSession(in model.Node, session string) (*model.Node, error) {
-	return s.registerNode(in, strings.TrimSpace(session), false)
+	return s.registerNode(in, strings.TrimSpace(session), false, true)
 }
 
-func (s *Store) registerNode(in model.Node, session string, forceTakeover bool) (*model.Node, error) {
+func (s *Store) registerNode(in model.Node, session string, forceTakeover, requireCleanup bool) (*model.Node, error) {
 	if session == "" {
 		return nil, ErrAgentSession
 	}
@@ -567,6 +597,7 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover bool) 
 		s.recoverNodeJobsLocked(in.ID, session, now)
 	}
 	in.SessionEpoch = session
+	in.CleanupPending = requireCleanup
 	in.LastHeartbeat = now
 	s.state.Nodes[in.ID] = &in
 	s.refreshNodeUsageLocked(in.ID)
@@ -577,6 +608,60 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover bool) 
 	copy.Devices = append([]model.GPUDevice(nil), in.Devices...)
 	copy.LastHealthCheck = cloneTime(in.LastHealthCheck)
 	return &copy, nil
+}
+
+// ConfirmNodeCleanupSession opens a freshly registered session for dispatch
+// only after that exact Agent session has removed all locally managed legacy
+// containers. The pending bit is persisted with the node so a control-plane
+// restart cannot accidentally bypass the takeover gate.
+func (s *Store) ConfirmNodeCleanupSession(id, session string) (*model.Node, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node := s.state.Nodes[id]
+	if node == nil {
+		return nil, ErrNotFound
+	}
+	if err := s.validateAgentSessionLocked(node, session, time.Now().UTC(), false, true); err != nil {
+		return nil, err
+	}
+	if !node.CleanupPending {
+		return nil, ErrNodeUnavailable
+	}
+	before := cloneSnapshot(s.state)
+	node.CleanupPending = false
+	node.LastHeartbeat = time.Now().UTC()
+	if err := s.commitLocked(before); err != nil {
+		return nil, err
+	}
+	copy := *node
+	copy.ActiveJobs = append([]string(nil), node.ActiveJobs...)
+	copy.Devices = append([]model.GPUDevice(nil), node.Devices...)
+	copy.LastHealthCheck = cloneTime(node.LastHealthCheck)
+	return &copy, nil
+}
+
+// validateAgentSessionLocked is the single server-side lease gate for real
+// Agent requests. A session that missed its heartbeat deadline can never
+// revive itself by making heartbeat (or any other Agent) request first. The
+// fence is persisted before the request is rejected so a control-plane restart
+// cannot restore the expired owner.
+func (s *Store) validateAgentSessionLocked(node *model.Node, session string, now time.Time, requireReady, enforceLease bool) error {
+	if enforceLease && node.SessionEpoch != "" && now.Sub(node.LastHeartbeat) > agentSessionActiveFor {
+		before := cloneSnapshot(s.state)
+		node.SessionEpoch = ""
+		node.CleanupPending = true
+		if err := s.commitLocked(before); err != nil {
+			return err
+		}
+		return ErrAgentSession
+	}
+	if session = strings.TrimSpace(session); session == "" || node.SessionEpoch != session {
+		return ErrAgentSession
+	}
+	if requireReady && node.CleanupPending {
+		return ErrNodeUnavailable
+	}
+	return nil
 }
 
 func (s *Store) validateAndAdmitNodeLocked(candidate model.Node, existing *model.Node) error {
@@ -624,6 +709,9 @@ func (s *Store) validateAndAdmitNodeLocked(candidate model.Node, existing *model
 func validateNodeResources(node model.Node, requireInventory bool) error {
 	if node.GPUCount < 0 || node.CPUCores < 0 || node.VRAMGB < 0 {
 		return fmt.Errorf("%w: node resource counts cannot be negative", ErrInvalidResources)
+	}
+	if node.GPUCount > maxGPUsPerNodeOrJob {
+		return fmt.Errorf("%w: node gpu_count cannot exceed %d", ErrInvalidResources, maxGPUsPerNodeOrJob)
 	}
 	if requireInventory && len(node.Devices) != node.GPUCount {
 		return fmt.Errorf("%w: gpu_count=%d does not match %d devices", ErrInvalidResources, node.GPUCount, len(node.Devices))
@@ -698,7 +786,7 @@ func (s *Store) HeartbeatNode(id string) error {
 	if node == nil {
 		return ErrNotFound
 	}
-	return s.heartbeatNodeLocked(node, node.SessionEpoch)
+	return s.heartbeatNodeLocked(node, node.SessionEpoch, true)
 }
 
 func (s *Store) HeartbeatNodeSession(id, session string) error {
@@ -708,12 +796,12 @@ func (s *Store) HeartbeatNodeSession(id, session string) error {
 	if node == nil {
 		return ErrNotFound
 	}
-	return s.heartbeatNodeLocked(node, strings.TrimSpace(session))
+	return s.heartbeatNodeLocked(node, session, false)
 }
 
-func (s *Store) heartbeatNodeLocked(node *model.Node, session string) error {
-	if session == "" || node.SessionEpoch != session {
-		return ErrAgentSession
+func (s *Store) heartbeatNodeLocked(node *model.Node, session string, trusted bool) error {
+	if err := s.validateAgentSessionLocked(node, session, time.Now().UTC(), !trusted, !trusted); err != nil {
+		return err
 	}
 	before := cloneSnapshot(s.state)
 	node.LastHeartbeat = time.Now().UTC()
@@ -727,7 +815,7 @@ func (s *Store) UpdateNodeHealth(id string, update model.NodeHealthUpdate) (*mod
 	if node == nil {
 		return nil, ErrNotFound
 	}
-	return s.updateNodeHealthLocked(node, node.SessionEpoch, update)
+	return s.updateNodeHealthLocked(node, node.SessionEpoch, update, true)
 }
 
 func (s *Store) UpdateNodeHealthSession(id, session string, update model.NodeHealthUpdate) (*model.Node, error) {
@@ -737,12 +825,12 @@ func (s *Store) UpdateNodeHealthSession(id, session string, update model.NodeHea
 	if node == nil {
 		return nil, ErrNotFound
 	}
-	return s.updateNodeHealthLocked(node, strings.TrimSpace(session), update)
+	return s.updateNodeHealthLocked(node, session, update, false)
 }
 
-func (s *Store) updateNodeHealthLocked(node *model.Node, session string, update model.NodeHealthUpdate) (*model.Node, error) {
-	if session == "" || node.SessionEpoch != session {
-		return nil, ErrAgentSession
+func (s *Store) updateNodeHealthLocked(node *model.Node, session string, update model.NodeHealthUpdate, trusted bool) (*model.Node, error) {
+	if err := s.validateAgentSessionLocked(node, session, time.Now().UTC(), !trusted, !trusted); err != nil {
+		return nil, err
 	}
 	status := strings.ToUpper(strings.TrimSpace(update.Status))
 	if status != "HEALTHY" && status != "DEGRADED" {
@@ -811,6 +899,30 @@ func (s *Store) requeueAssignedJobsLocked(nodeID string, now time.Time) {
 		}
 		clearJobAssignment(job)
 	}
+}
+
+// reconcileOfflineJobsLocked fences sessions whose owning Agent has remained
+// offline past the takeover boundary. Active assignments intentionally retain
+// their status and capacity: without a cleanup confirmation from the physical
+// node, the control plane cannot prove that an orphaned container stopped and
+// must not retry the same workload elsewhere.
+func (s *Store) reconcileOfflineJobsLocked(now time.Time, offlineAfter time.Duration) bool {
+	changed := false
+	for _, job := range s.state.Jobs {
+		if !activeJob(job.Status) {
+			continue
+		}
+		node := s.state.Nodes[job.AssignedNode]
+		if node == nil || now.Sub(node.LastHeartbeat) <= offlineAfter {
+			continue
+		}
+		if node.SessionEpoch != "" || !node.CleanupPending {
+			node.SessionEpoch = ""
+			node.CleanupPending = true
+			changed = true
+		}
+	}
+	return changed
 }
 
 func (s *Store) ListNodes() []*model.Node {
@@ -896,13 +1008,27 @@ func activeJob(status model.JobStatus) bool {
 
 func (s *Store) usedGPUSetLocked(nodeID string) map[int]bool {
 	used := map[int]bool{}
+	nodeGPUCount := 0
+	if node := s.state.Nodes[nodeID]; node != nil && node.GPUCount > 0 {
+		nodeGPUCount = node.GPUCount
+		if nodeGPUCount > maxGPUsPerNodeOrJob {
+			nodeGPUCount = maxGPUsPerNodeOrJob
+		}
+	}
 	for _, job := range s.state.Jobs {
 		if job.AssignedNode != nodeID || !activeJob(job.Status) {
 			continue
 		}
 		allocated := job.AllocatedGPUs
 		if len(allocated) == 0 && s.gpuGranularScheduling {
-			for index := 0; index < job.Requirements.GPUCount; index++ {
+			count := job.Requirements.GPUCount
+			if count < 0 {
+				count = 0
+			}
+			if count > nodeGPUCount {
+				count = nodeGPUCount
+			}
+			for index := 0; index < count; index++ {
 				allocated = append(allocated, index)
 			}
 		}
@@ -914,9 +1040,19 @@ func (s *Store) usedGPUSetLocked(nodeID string) map[int]bool {
 }
 
 func (s *Store) availableGPUsLocked(node *model.Node, count int) []int {
+	if count <= 0 || node.GPUCount <= 0 {
+		return nil
+	}
+	capacity := count
+	if capacity > node.GPUCount {
+		capacity = node.GPUCount
+	}
+	if capacity > maxGPUsPerNodeOrJob {
+		capacity = maxGPUsPerNodeOrJob
+	}
 	used := s.usedGPUSetLocked(node.ID)
-	available := make([]int, 0, count)
-	for index := 0; index < node.GPUCount && len(available) < count; index++ {
+	available := make([]int, 0, capacity)
+	for index := 0; index < node.GPUCount && len(available) < capacity; index++ {
 		if !used[index] {
 			available = append(available, index)
 		}
@@ -973,6 +1109,9 @@ func (s *Store) nodeHealthyLocked(node *model.Node, now time.Time) bool {
 }
 
 func (s *Store) eligibleLocked(j *model.Job, n *model.Node, now time.Time, offlineAfter time.Duration) bool {
+	if n.CleanupPending || n.SessionEpoch == "" {
+		return false
+	}
 	if now.Sub(n.LastHeartbeat) > offlineAfter {
 		return false
 	}
@@ -980,13 +1119,15 @@ func (s *Store) eligibleLocked(j *model.Job, n *model.Node, now time.Time, offli
 		return false
 	}
 	r := j.Requirements
-	if n.GPUCount < r.GPUCount || n.VRAMGB < r.MinVRAMGB {
-		return false
+	if r.GPUCount > 0 {
+		if n.GPUCount < r.GPUCount || n.VRAMGB < r.MinVRAMGB || !containsFold(r.GPUModels, n.GPUModel) {
+			return false
+		}
 	}
 	if r.MaxHourly > 0 && n.HourlyPrice > r.MaxHourly {
 		return false
 	}
-	if !containsFold(r.GPUModels, n.GPUModel) || !containsFold(r.Providers, n.Provider) || !containsFold(r.Pools, n.Pool) {
+	if !containsFold(r.Providers, n.Provider) || !containsFold(r.Pools, n.Pool) {
 		return false
 	}
 	for k, v := range r.Labels {
@@ -1046,6 +1187,8 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
+	before := cloneSnapshot(s.state)
+	changed := s.reconcileOfflineJobsLocked(now, offlineAfter)
 	licensedNodes := s.licensedNodeSetLocked(now)
 	jobs := make([]*model.Job, 0)
 	for _, j := range s.state.Jobs {
@@ -1054,8 +1197,6 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 		}
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.Before(jobs[j].CreatedAt) })
-	changed := false
-	before := cloneSnapshot(s.state)
 	for _, j := range jobs {
 		var best *model.Node
 		for _, n := range s.state.Nodes {
@@ -1067,6 +1208,8 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 				if j.Requirements.GPUCount == 0 {
 					// CPU-only jobs remain whole-node exclusive until CPU accounting is implemented.
 					capacityAvailable = !n.Busy
+				} else if j.Requirements.GPUCount > n.GPUCount {
+					capacityAvailable = false
 				} else {
 					capacityAvailable = !s.hasActiveCPUOnlyJobLocked(n.ID) && len(s.availableGPUsLocked(n, j.Requirements.GPUCount)) == j.Requirements.GPUCount
 				}
@@ -1104,7 +1247,7 @@ func (s *Store) NextJob(nodeID string) (*model.AgentJob, error) {
 	if node == nil {
 		return nil, ErrNotFound
 	}
-	return s.nextJobLocked(node, node.SessionEpoch)
+	return s.nextJobLocked(node, node.SessionEpoch, true)
 }
 
 func (s *Store) NextJobSession(nodeID, session string) (*model.AgentJob, error) {
@@ -1114,12 +1257,12 @@ func (s *Store) NextJobSession(nodeID, session string) (*model.AgentJob, error) 
 	if node == nil {
 		return nil, ErrNotFound
 	}
-	return s.nextJobLocked(node, strings.TrimSpace(session))
+	return s.nextJobLocked(node, session, false)
 }
 
-func (s *Store) nextJobLocked(node *model.Node, session string) (*model.AgentJob, error) {
-	if session == "" || node.SessionEpoch != session {
-		return nil, ErrAgentSession
+func (s *Store) nextJobLocked(node *model.Node, session string, trusted bool) (*model.AgentJob, error) {
+	if err := s.validateAgentSessionLocked(node, session, time.Now().UTC(), !trusted, !trusted); err != nil {
+		return nil, err
 	}
 	now := time.Now().UTC()
 	var selected *model.Job
@@ -1205,8 +1348,13 @@ func (s *Store) updateJobLocked(job *model.Job, nodeID, session, attemptToken st
 	if node == nil {
 		return nil, ErrNotFound
 	}
-	if !trusted && (session == "" || attemptToken == "" || node.SessionEpoch != session || job.AssignedSession != session || job.AttemptToken != attemptToken) {
-		return nil, ErrAttemptLease
+	if !trusted {
+		if err := s.validateAgentSessionLocked(node, session, time.Now().UTC(), true, true); err != nil {
+			return nil, err
+		}
+		if attemptToken == "" || job.AssignedSession != strings.TrimSpace(session) || job.AttemptToken != strings.TrimSpace(attemptToken) {
+			return nil, ErrAttemptLease
+		}
 	}
 	now := time.Now().UTC()
 	before := cloneSnapshot(s.state)
@@ -1218,7 +1366,7 @@ func (s *Store) updateJobLocked(job *model.Job, nodeID, session, attemptToken st
 			return nil, errors.New("job is not assigned")
 		}
 		_, licensed := s.licensedNodeSetLocked(now)[nodeID]
-		if !licensed || !s.nodeHealthyLocked(node, now) {
+		if (!trusted && node.CleanupPending) || !licensed || !s.nodeHealthyLocked(node, now) {
 			s.requeueAssignedJobsLocked(nodeID, now)
 			s.refreshNodeUsageLocked(nodeID)
 			if err := s.commitLocked(before); err != nil {
@@ -1303,8 +1451,16 @@ func (s *Store) updateJobOutputLocked(job *model.Job, nodeID, session, attemptTo
 		return nil, errors.New("job is not assigned to this node")
 	}
 	node := s.state.Nodes[nodeID]
-	if !trusted && (node == nil || session == "" || attemptToken == "" || node.SessionEpoch != session || job.AssignedSession != session || job.AttemptToken != attemptToken) {
-		return nil, ErrAttemptLease
+	if !trusted {
+		if node == nil {
+			return nil, ErrNotFound
+		}
+		if err := s.validateAgentSessionLocked(node, session, time.Now().UTC(), true, true); err != nil {
+			return nil, err
+		}
+		if attemptToken == "" || job.AssignedSession != strings.TrimSpace(session) || job.AttemptToken != strings.TrimSpace(attemptToken) {
+			return nil, ErrAttemptLease
+		}
 	}
 	if job.Status != model.JobRunning && job.Status != model.JobCanceling {
 		return nil, errors.New("job is not running")
@@ -1325,12 +1481,39 @@ func (s *Store) updateJobOutputLocked(job *model.Job, nodeID, session, attemptTo
 func (s *Store) ValidateJobAttempt(id, nodeID, session, attemptToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.validateJobAttemptLocked(id, nodeID, session, attemptToken)
+}
+
+// CommitJobAttempt runs commit only while the Agent session and attempt lease
+// are still valid. Holding the Store lock across the final, atomic object-store
+// promotion linearizes it with node takeover and cleanup fencing without
+// holding the lock during the potentially large staging upload.
+func (s *Store) CommitJobAttempt(id, nodeID, session, attemptToken string, commit func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.validateJobAttemptLocked(id, nodeID, session, attemptToken); err != nil {
+		return err
+	}
+	if commit == nil {
+		return errors.New("artifact commit callback is required")
+	}
+	return commit()
+}
+
+func (s *Store) validateJobAttemptLocked(id, nodeID, session, attemptToken string) error {
 	job := s.state.Jobs[id]
 	if job == nil {
 		return ErrNotFound
 	}
 	node := s.state.Nodes[nodeID]
-	if node == nil || session == "" || attemptToken == "" || node.SessionEpoch != session || job.AssignedNode != nodeID || job.AssignedSession != session || job.AttemptToken != attemptToken {
+	if node == nil {
+		return ErrNotFound
+	}
+	if err := s.validateAgentSessionLocked(node, session, time.Now().UTC(), true, true); err != nil {
+		return err
+	}
+	session, attemptToken = strings.TrimSpace(session), strings.TrimSpace(attemptToken)
+	if attemptToken == "" || job.AssignedNode != nodeID || job.AssignedSession != session || job.AttemptToken != attemptToken {
 		return ErrAttemptLease
 	}
 	if job.Status != model.JobRunning && job.Status != model.JobCanceling {

@@ -200,13 +200,13 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 		if err := json.Unmarshal(labelsJSON, &node.Labels); err != nil {
 			return fmt.Errorf("decode node %s labels: %w", node.ID, err)
 		}
+		var details nodeDetails
 		if len(detailsJSON) > 0 {
-			var details nodeDetails
 			if err := json.Unmarshal(detailsJSON, &details); err != nil {
 				return fmt.Errorf("decode node %s details: %w", node.ID, err)
 			}
-			details.apply(&node)
 		}
+		details.apply(&node)
 		s.state.Nodes[node.ID] = &node
 	}
 	if err := rows.Err(); err != nil {
@@ -261,16 +261,27 @@ type nodeDetails struct {
 	HealthReason    string            `json:"health_reason,omitempty"`
 	LastHealthCheck *time.Time        `json:"last_health_check,omitempty"`
 	SessionEpoch    string            `json:"session_epoch,omitempty"`
+	CleanupPending  *bool             `json:"cleanup_pending"`
 }
 
 func detailsFromNode(node *model.Node) nodeDetails {
-	return nodeDetails{Devices: node.Devices, DriverVersion: node.DriverVersion, DockerVersion: node.DockerVersion, HealthStatus: node.HealthStatus, HealthReason: node.HealthReason, LastHealthCheck: node.LastHealthCheck, SessionEpoch: node.SessionEpoch}
+	cleanupPending := node.CleanupPending
+	return nodeDetails{Devices: node.Devices, DriverVersion: node.DriverVersion, DockerVersion: node.DockerVersion, HealthStatus: node.HealthStatus, HealthReason: node.HealthReason, LastHealthCheck: node.LastHealthCheck, SessionEpoch: node.SessionEpoch, CleanupPending: &cleanupPending}
 }
 
 func (details nodeDetails) apply(node *model.Node) {
 	node.Devices, node.DriverVersion, node.DockerVersion = details.Devices, details.DriverVersion, details.DockerVersion
 	node.HealthStatus, node.HealthReason, node.LastHealthCheck = details.HealthStatus, details.HealthReason, details.LastHealthCheck
 	node.SessionEpoch = details.SessionEpoch
+	if details.CleanupPending == nil {
+		// details_json written before the cleanup handshake has no readiness
+		// marker. Treat it as unsafe after upgrade: the current session must be
+		// fenced and a new Agent must register, clean Docker, and confirm.
+		node.SessionEpoch = ""
+		node.CleanupPending = true
+		return
+	}
+	node.CleanupPending = *details.CleanupPending
 }
 
 func (s *Store) saveMySQLChangesLocked(before snapshot) error {

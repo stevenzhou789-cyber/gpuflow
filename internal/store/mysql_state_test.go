@@ -1,13 +1,47 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"gpuflow/internal/model"
 )
+
+func TestNodeDetailsRoundTripCleanupPending(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		original := model.Node{ID: "pending", SessionEpoch: "session", CleanupPending: pending}
+		payload, err := json.Marshal(detailsFromNode(&original))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(payload), `"cleanup_pending":`) {
+			t.Fatalf("cleanup readiness was omitted from MySQL details JSON: %s", payload)
+		}
+		var details nodeDetails
+		if err := json.Unmarshal(payload, &details); err != nil {
+			t.Fatal(err)
+		}
+		var restored model.Node
+		details.apply(&restored)
+		if restored.SessionEpoch != original.SessionEpoch || restored.CleanupPending != pending {
+			t.Fatalf("cleanup gate was not preserved in MySQL details JSON: %s", payload)
+		}
+	}
+
+	var legacy nodeDetails
+	if err := json.Unmarshal([]byte(`{"session_epoch":"legacy-session"}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacyNode := model.Node{}
+	legacy.apply(&legacyNode)
+	if legacyNode.SessionEpoch != "" || !legacyNode.CleanupPending {
+		t.Fatalf("legacy details did not fail closed: %+v", legacyNode)
+	}
+}
 
 func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	dsn := os.Getenv("GPUFLOW_TEST_MYSQL_DSN")
