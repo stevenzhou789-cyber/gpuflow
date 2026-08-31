@@ -565,6 +565,7 @@ func TestRunFailsClosedOnUnavailableOrMalformedCapabilities(t *testing.T) {
 	}{
 		{name: "unavailable", status: http.StatusServiceUnavailable, body: map[string]string{"error": "unavailable"}},
 		{name: "missing schema and features", status: http.StatusOK, body: map[string]string{"name": "enterprise"}},
+		{name: "legacy schema", status: http.StatusOK, body: edition.Descriptor{SchemaVersion: 1, Name: "enterprise", Features: map[string]bool{edition.FeatureBasicScheduler: true}}},
 		{name: "missing basic scheduler key", status: http.StatusOK, body: edition.Descriptor{SchemaVersion: edition.CapabilitiesSchemaVersion, Name: "enterprise", Features: map[string]bool{}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -593,10 +594,11 @@ func TestRunFailsClosedOnUnavailableOrMalformedCapabilities(t *testing.T) {
 	}
 }
 
-func TestRunUsesCapabilityProbeImageAndSession(t *testing.T) {
+func TestRunUsesDedicatedCapabilityProbeImageAndSession(t *testing.T) {
 	descriptor := edition.Community()
 	descriptor.Name = "enterprise"
 	descriptor.AgentImage = "gpuflow-enterprise:test"
+	descriptor.ProbeImage = "gpuflow-gpu-probe:test"
 	descriptor.Features[edition.FeatureNodeHealth] = true
 	descriptor.Features[edition.FeaturePerGPUInventory] = true
 	registered := make(chan model.Node, 1)
@@ -641,7 +643,7 @@ func TestRunUsesCapabilityProbeImageAndSession(t *testing.T) {
 			if len(args) > 0 && args[0] == "version" {
 				return []byte("27.1.0"), nil
 			}
-			if strings.Contains(strings.Join(args, " "), descriptor.AgentImage) {
+			if strings.Contains(strings.Join(args, " "), descriptor.ProbeImage) {
 				probeImageUsed.Store(true)
 			}
 			return []byte("0, GPU-a, NVIDIA L4, 23034, 550.54\n"), nil
@@ -667,11 +669,76 @@ func TestRunUsesCapabilityProbeImageAndSession(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("agent did not stop")
 	}
-	if !probeImageUsed.Load() || agent.cfg.ProbeImage != descriptor.AgentImage {
-		t.Fatalf("capability agent image was not used: %q", agent.cfg.ProbeImage)
+	if !probeImageUsed.Load() || agent.cfg.ProbeImage != descriptor.ProbeImage {
+		t.Fatalf("dedicated capability probe image was not used: %q", agent.cfg.ProbeImage)
+	}
+	if agent.cfg.ProbeImage == descriptor.AgentImage {
+		t.Fatal("Agent image was incorrectly reused as the GPU probe image")
 	}
 	if invalidHeaders.Load() != 0 {
 		t.Fatalf("invalid agent session headers: %d", invalidHeaders.Load())
+	}
+}
+
+func TestRunRegistersDegradedNodeWhenDockerGPUProbeFails(t *testing.T) {
+	descriptor := edition.Community()
+	descriptor.Name = "enterprise"
+	descriptor.ProbeImage = "gpuflow-gpu-probe:test"
+	descriptor.Features[edition.FeatureNodeHealth] = true
+	descriptor.Features[edition.FeaturePerGPUInventory] = true
+	registered := make(chan model.Node, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/capabilities":
+			_ = json.NewEncoder(w).Encode(descriptor)
+		case "/v1/nodes/register":
+			var node model.Node
+			if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
+				t.Errorf("decode registration: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(node)
+			registered <- node
+		case "/v1/nodes/degraded-node/next":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	agent := New(Config{
+		Server: server.URL, ID: "degraded-node", Executor: "docker", PollInterval: time.Hour,
+		CleanupCommand: func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
+		ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name == "nvidia-smi" {
+				return []byte("0, GPU-a, NVIDIA L4, 23034, 550.54\n"), nil
+			}
+			if len(args) > 0 && args[0] == "version" {
+				return []byte("27.1.0"), nil
+			}
+			return []byte("exec /usr/bin/nvidia-smi: no such file or directory"), errors.New("exit status 255")
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+	select {
+	case node := <-registered:
+		if node.HealthStatus != "DEGRADED" || node.GPUCount != 1 || !strings.Contains(node.HealthReason, "container runtime validation failed") {
+			t.Fatalf("unexpected degraded registration: %+v", node)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("Agent exited before registering its degraded state")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected Run result: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Agent did not stop")
 	}
 }
 

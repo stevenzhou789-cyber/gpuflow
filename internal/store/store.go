@@ -589,6 +589,15 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover, requi
 	if existing != nil && existing.SessionEpoch != "" && existing.SessionEpoch != session && !forceTakeover && now.Sub(existing.LastHeartbeat) <= agentSessionActiveFor {
 		return nil, ErrAgentSessionActive
 	}
+	// A returning Docker Agent can temporarily lose all inventory when Docker,
+	// the probe image, or the NVIDIA runtime is unavailable. Keep the last known
+	// GPU capacity while the node is explicitly DEGRADED so recovery is not
+	// mistaken for new licensed capacity. Health fencing still prevents dispatch.
+	if existing != nil && s.nodeHealthEnabled && strings.EqualFold(in.HealthStatus, "DEGRADED") && in.GPUCount == 0 && existing.GPUCount > 0 {
+		in.GPUModel, in.GPUCount, in.VRAMGB = existing.GPUModel, existing.GPUCount, existing.VRAMGB
+		in.Devices = append([]model.GPUDevice(nil), existing.Devices...)
+		in.DriverVersion = existing.DriverVersion
+	}
 	if err := s.validateAndAdmitNodeLocked(in, existing); err != nil {
 		return nil, err
 	}

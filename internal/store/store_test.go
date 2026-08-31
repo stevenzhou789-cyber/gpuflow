@@ -746,6 +746,31 @@ func TestDegradedNodeStopsAndRecoversScheduling(t *testing.T) {
 	}
 }
 
+func TestDegradedReconnectPreservesLastKnownGPUInventory(t *testing.T) {
+	s := NewMemory()
+	s.SetNodeHealthPolicy(true, 3*time.Minute)
+	s.SetPerGPUInventory(true)
+	node, err := s.RegisterNodeSession(model.Node{
+		ID: "docker-reconnect", GPUModel: "NVIDIA L4", GPUCount: 1, VRAMGB: 24,
+		HealthStatus: "HEALTHY", Devices: []model.GPUDevice{{Index: 0, UUID: "GPU-a", Model: "NVIDIA L4", VRAMGB: 24}},
+	}, "old-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmAgentSession(t, s, node.ID, "old-session")
+	s.state.Nodes[node.ID].LastHeartbeat = time.Now().Add(-time.Minute)
+
+	reconnected, err := s.RegisterNodeSession(model.Node{
+		ID: node.ID, GPUModel: "none", HealthStatus: "DEGRADED", HealthReason: "Docker is unavailable",
+	}, "new-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconnected.GPUCount != 1 || reconnected.GPUModel != "NVIDIA L4" || len(reconnected.Devices) != 1 || reconnected.HealthStatus != "DEGRADED" {
+		t.Fatalf("degraded reconnect lost known inventory: %+v", reconnected)
+	}
+}
+
 func gpuInventory(modelName string, count, vram int) []model.GPUDevice {
 	devices := make([]model.GPUDevice, count)
 	for index := range devices {

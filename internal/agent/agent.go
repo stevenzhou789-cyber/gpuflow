@@ -25,13 +25,13 @@ import (
 )
 
 type Config struct {
-	Server, Token, ID, Name, Provider, Pool, Executor, ArtifactDir, ProbeImage string
-	CPUCores                                                                   int
-	HourlyPrice                                                                float64
-	PollInterval, HeartbeatInterval, HealthInterval, ArtifactUploadTimeout     time.Duration
-	ProbeCommand                                                               func(context.Context, string, ...string) ([]byte, error)
-	CleanupCommand                                                             func(context.Context, string, ...string) ([]byte, error)
-	ExecuteCommand                                                             func(context.Context, string, ...string) *exec.Cmd
+	Server, Token, ID, Name, Provider, Pool, Executor, ArtifactDir, ProbeImage, GPUProbe string
+	CPUCores                                                                             int
+	HourlyPrice                                                                          float64
+	PollInterval, HeartbeatInterval, HealthInterval, ArtifactUploadTimeout               time.Duration
+	ProbeCommand                                                                         func(context.Context, string, ...string) ([]byte, error)
+	CleanupCommand                                                                       func(context.Context, string, ...string) ([]byte, error)
+	ExecuteCommand                                                                       func(context.Context, string, ...string) *exec.Cmd
 }
 type Agent struct {
 	cfg           Config
@@ -51,6 +51,12 @@ var (
 )
 
 func New(cfg Config) *Agent {
+	if strings.TrimSpace(cfg.Executor) == "" {
+		cfg.Executor = "docker"
+	}
+	if strings.TrimSpace(cfg.GPUProbe) == "" {
+		cfg.GPUProbe = "auto"
+	}
 	if cfg.CPUCores <= 0 {
 		cfg.CPUCores = runtime.NumCPU()
 	}
@@ -92,15 +98,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		return errors.New("invalid server capabilities: basic_scheduler feature is missing")
 	}
 	if descriptor.Features[edition.FeatureNodeHealth] && strings.TrimSpace(a.cfg.ProbeImage) == "" {
-		a.cfg.ProbeImage = strings.TrimSpace(descriptor.AgentImage)
+		a.cfg.ProbeImage = strings.TrimSpace(descriptor.ProbeImage)
 		if a.cfg.ProbeImage == "" {
-			return errors.New("server enables node health but does not provide an agent image for GPU probing")
+			return errors.New("server enables node health but does not provide a dedicated GPU probe image")
 		}
 	}
 
-	n, err := a.probeNode(runCtx)
-	if err != nil {
-		return fmt.Errorf("discover node resources: %w", err)
+	n, probeErr := a.probeNode(runCtx)
+	if probeErr != nil {
+		n.HealthStatus = "DEGRADED"
+		n.HealthReason = probeErr.Error()
+		fmt.Printf("agent GPU probe warning: %v\n", probeErr)
 	}
 	if !descriptor.Features[edition.FeaturePerGPUInventory] {
 		n.Devices, n.DriverVersion, n.DockerVersion = nil, "", ""

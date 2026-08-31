@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const CapabilitiesSchemaVersion = 1
+const CapabilitiesSchemaVersion = 2
 
 const (
 	FeatureBasicScheduler        = "basic_scheduler"
@@ -32,6 +32,7 @@ type Descriptor struct {
 	LicensedTo    string `json:"licensed_to,omitempty"`
 	ExpiresAt     string `json:"expires_at,omitempty"`
 	AgentImage    string `json:"agent_image,omitempty"`
+	ProbeImage    string `json:"probe_image,omitempty"`
 	AgentBinary   string `json:"agent_binary,omitempty"`
 	PublicURL     string `json:"public_url,omitempty"`
 	MaxNodes      int    `json:"max_nodes,omitempty"`
@@ -75,6 +76,7 @@ func (d Descriptor) Public() Descriptor {
 		SchemaVersion: d.SchemaVersion,
 		Name:          d.Name,
 		AgentImage:    d.AgentImage,
+		ProbeImage:    d.ProbeImage,
 		AgentBinary:   d.AgentBinary,
 		PublicURL:     d.PublicURL,
 		Features:      features,
@@ -86,6 +88,7 @@ func Community() Descriptor {
 		SchemaVersion: CapabilitiesSchemaVersion,
 		Name:          "community",
 		AgentImage:    "gpuflow:local",
+		ProbeImage:    "gpuflow-gpu-probe:local",
 		AgentBinary:   "gpuflow.exe",
 		Features: map[string]bool{
 			FeatureBasicScheduler:        true,

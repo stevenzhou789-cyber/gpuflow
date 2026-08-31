@@ -7,7 +7,7 @@ import (
 
 func TestCommunityDeclaresCompleteCapabilityContract(t *testing.T) {
 	descriptor := Community()
-	if descriptor.SchemaVersion != CapabilitiesSchemaVersion || descriptor.AgentBinary == "" {
+	if descriptor.SchemaVersion != CapabilitiesSchemaVersion || descriptor.AgentBinary == "" || descriptor.ProbeImage == "" {
 		t.Fatalf("incomplete descriptor: %+v", descriptor)
 	}
 	for _, feature := range []string{FeatureGPUGranularScheduling, FeatureAgentBootstrap, FeatureManagedRegistry, FeaturePerGPUInventory, FeatureNodeHealth} {
@@ -35,7 +35,7 @@ func TestPublicDescriptorOmitsCommercialLicenseDetails(t *testing.T) {
 	descriptor.LicensedTo, descriptor.ExpiresAt = "customer", "2030-01-01T00:00:00+08:00"
 	descriptor.MaxNodes, descriptor.MaxGPUs = 10, 80
 	public := descriptor.Public()
-	if public.LicensedTo != "" || public.ExpiresAt != "" || public.MaxNodes != 0 || public.MaxGPUs != 0 || !public.Features[FeatureBasicScheduler] {
+	if public.LicensedTo != "" || public.ExpiresAt != "" || public.MaxNodes != 0 || public.MaxGPUs != 0 || public.ProbeImage != descriptor.ProbeImage || !public.Features[FeatureBasicScheduler] {
 		t.Fatalf("unsafe public descriptor: %+v", public)
 	}
 }

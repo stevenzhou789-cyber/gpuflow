@@ -57,6 +57,7 @@ type Edition = {
   licensed_to?: string;
   expires_at?: string;
   agent_image?: string;
+  probe_image?: string;
   agent_binary?: string;
   public_url?: string;
   max_nodes?: number;
@@ -156,7 +157,7 @@ function App() {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [taskImages, setTaskImages] = useState<TaskImage[]>([]);
   const [edition, setEdition] = useState<Edition>({
-    schema_version: 1,
+    schema_version: 2,
     name: "community",
     features: {},
   });
@@ -177,7 +178,7 @@ function App() {
   const refreshCapabilities = useCallback(async () => {
     try {
       const nextEdition = await api<Edition>("/v1/capabilities");
-      if (nextEdition.schema_version !== 1 || !nextEdition.features) {
+      if (nextEdition.schema_version !== 2 || !nextEdition.features) {
         throw new Error("Invalid server capability response");
       }
       setEdition(nextEdition);
@@ -407,6 +408,7 @@ function App() {
           features={edition.features}
           agentBinary={edition.agent_binary || "gpuflow.exe"}
           defaultAgentImage={edition.agent_image || "gpuflow:local"}
+          defaultProbeImage={edition.probe_image || "gpuflow-gpu-probe:local"}
           defaultPublicURL={edition.public_url || window.location.origin}
           onClose={() => setShowConnect(false)}
         />
@@ -1186,6 +1188,7 @@ function ConnectNode({
   features,
   agentBinary,
   defaultAgentImage,
+  defaultProbeImage,
   defaultPublicURL,
   onClose,
 }: {
@@ -1193,6 +1196,7 @@ function ConnectNode({
   features: Record<string, boolean>;
   agentBinary: string;
   defaultAgentImage: string;
+  defaultProbeImage: string;
   defaultPublicURL: string;
   onClose: () => void;
 }) {
@@ -1200,6 +1204,7 @@ function ConnectNode({
   const [mode, setMode] = useState<"windows" | "docker">("windows");
   const [copied, setCopied] = useState(false);
   const [agentImage, setAgentImage] = useState(defaultAgentImage);
+  const [probeImage, setProbeImage] = useState(defaultProbeImage);
   const [serverURL, setServerURL] = useState(defaultPublicURL);
   const [agentToken, setAgentToken] = useState(
     agentBootstrap
@@ -1227,8 +1232,9 @@ function ConnectNode({
   const localOnlyServer = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(server);
   const binary = agentBinary;
   const token = agentToken;
-  const windowsCommand = `.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -hourly-price ${values.price} -executor docker`;
-  const dockerCommand = `docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  -e GPUFLOW_PROBE_IMAGE="${agentImage.trim() || "gpuflow:local"}" \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -hourly-price ${values.price}`;
+  const selectedProbeImage = probeImage.trim() || "gpuflow-gpu-probe:local";
+  const windowsCommand = `docker pull "${selectedProbeImage}"\n.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -hourly-price ${values.price} -executor docker -gpu-probe auto -probe-image "${selectedProbeImage}"`;
+  const dockerCommand = `docker pull "${selectedProbeImage}"\ndocker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  -e GPUFLOW_GPU_PROBE=auto -e GPUFLOW_PROBE_IMAGE="${selectedProbeImage}" \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -hourly-price ${values.price}`;
   const command = (mode === "windows" ? windowsCommand : dockerCommand).replace(
     /\n\+\s*/g,
     "\n  ",
@@ -1346,6 +1352,18 @@ function ConnectNode({
               </small>
             </label>
           )}
+          <label className="connection-field">
+            GPU 探针镜像
+            <input
+              value={probeImage}
+              onChange={(event) => {
+                setProbeImage(event.target.value);
+                setCopied(false);
+              }}
+              placeholder="registry.example.com/gpuflow/gpu-probe:v1.0.18"
+            />
+            <small>独立的 glibc 镜像，用于 Windows、Linux 和容器 Agent 验证 NVIDIA Docker 运行时。</small>
+          </label>
         </div>
         {agentTokenError && <div className="notice error">{agentTokenError}</div>}
         <div className="form-grid compact">

@@ -92,6 +92,7 @@ func runServer(args []string) error {
 	}
 	descriptor := edition.Community()
 	descriptor.AgentImage = env("GPUFLOW_AGENT_IMAGE", descriptor.AgentImage)
+	descriptor.ProbeImage = env("GPUFLOW_PROBE_IMAGE", descriptor.ProbeImage)
 	descriptor.PublicURL = strings.TrimRight(strings.TrimSpace(env("GPUFLOW_PUBLIC_URL", "")), "/")
 	artifactConfig := artifact.Config{
 		Endpoint: env("GPUFLOW_S3_ENDPOINT", ""), AccessKey: env("GPUFLOW_S3_ACCESS_KEY", ""),
@@ -130,7 +131,8 @@ func runAgent(args []string) error {
 	fs.Float64Var(&cfg.HourlyPrice, "hourly-price", envFloat("GPUFLOW_HOURLY_PRICE", 0), "estimated hourly price")
 	fs.StringVar(&cfg.Executor, "executor", env("GPUFLOW_EXECUTOR", "docker"), "docker or mock")
 	fs.StringVar(&cfg.ArtifactDir, "artifact-dir", env("GPUFLOW_ARTIFACT_WORKDIR", ""), "host-visible artifact work directory")
-	fs.StringVar(&cfg.ProbeImage, "probe-image", env("GPUFLOW_PROBE_IMAGE", ""), "agent image used to validate NVIDIA container runtime")
+	fs.StringVar(&cfg.ProbeImage, "probe-image", env("GPUFLOW_PROBE_IMAGE", ""), "dedicated glibc image used to validate NVIDIA container runtime")
+	fs.StringVar(&cfg.GPUProbe, "gpu-probe", env("GPUFLOW_GPU_PROBE", "auto"), "GPU probe mode: auto, host, or docker")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

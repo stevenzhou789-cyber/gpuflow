@@ -56,6 +56,12 @@ func NewHandlerWithConfig(cfg Config) (http.Handler, error) {
 	if strings.TrimSpace(cfg.Artifacts.Endpoint) == "" {
 		return nil, errors.New("GPUFLOW_S3_ENDPOINT is required")
 	}
+	if cfg.Descriptor.SchemaVersion != edition.CapabilitiesSchemaVersion {
+		return nil, errors.New("control-plane capabilities schema does not match this GPUFlow release")
+	}
+	if cfg.Descriptor.Features[edition.FeatureNodeHealth] && strings.TrimSpace(cfg.Descriptor.ProbeImage) == "" {
+		return nil, errors.New("GPUFLOW_PROBE_IMAGE is required when node health is enabled")
+	}
 	if _, err := edition.ParseExpiration(cfg.Descriptor.ExpiresAt); err != nil {
 		return nil, err
 	}

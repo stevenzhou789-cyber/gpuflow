@@ -25,3 +25,21 @@ func TestNewHandlerRejectsMalformedLicenseExpiration(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestNewHandlerRequiresSchemaV2DedicatedProbeImage(t *testing.T) {
+	config := Config{MySQLDSN: "unused-dsn", Artifacts: ArtifactConfig{Endpoint: "minio:9000"}}
+	legacy := edition.Community()
+	legacy.SchemaVersion = 1
+	config.Descriptor = legacy
+	if _, err := NewHandlerWithConfig(config); err == nil || !strings.Contains(err.Error(), "schema") {
+		t.Fatalf("legacy schema was accepted: %v", err)
+	}
+
+	missingProbe := edition.Community()
+	missingProbe.Features[edition.FeatureNodeHealth] = true
+	missingProbe.ProbeImage = ""
+	config.Descriptor = missingProbe
+	if _, err := NewHandlerWithConfig(config); err == nil || !strings.Contains(err.Error(), "GPUFLOW_PROBE_IMAGE") {
+		t.Fatalf("node health without a dedicated probe image was accepted: %v", err)
+	}
+}

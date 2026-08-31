@@ -53,12 +53,12 @@ func TestProbeNodeAllowsNativeCPUOnlyNode(t *testing.T) {
 }
 
 func TestProbeNodeValidatesContainerRuntime(t *testing.T) {
-	a := New(Config{ProbeImage: "ghcr.io/example/agent:v1", ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
+	a := New(Config{ProbeImage: "ghcr.io/example/gpu-probe:v1", GPUProbe: "docker", ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
 		if len(args) > 0 && args[0] == "version" {
 			return []byte("27.0.0"), nil
 		}
 		joined := strings.Join(args, " ")
-		if !strings.Contains(joined, "--gpus all") || !strings.Contains(joined, "ghcr.io/example/agent:v1") {
+		if !strings.Contains(joined, "--gpus all") || !strings.Contains(joined, "ghcr.io/example/gpu-probe:v1") {
 			t.Fatalf("unexpected probe command: %s %s", name, joined)
 		}
 		return []byte("0, NVIDIA L4, 23034"), nil
