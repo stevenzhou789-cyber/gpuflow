@@ -97,7 +97,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	if _, ok := descriptor.Features[edition.FeatureBasicScheduler]; !ok {
 		return errors.New("invalid server capabilities: basic_scheduler feature is missing")
 	}
-	if descriptor.Features[edition.FeatureNodeHealth] && strings.TrimSpace(a.cfg.ProbeImage) == "" {
+	if descriptor.Features[edition.FeatureNodeHealth] {
+		// The control plane owns the managed Registry reference. Always replace
+		// a stale node-side value so upgrades cannot keep pulling an old external
+		// Probe image supplied by a previous release.
 		a.cfg.ProbeImage = strings.TrimSpace(descriptor.ProbeImage)
 		if a.cfg.ProbeImage == "" {
 			return errors.New("server enables node health but does not provide a dedicated GPU probe image")

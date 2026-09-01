@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,5 +19,23 @@ func TestEmbeddedDashboardAndSPAFallback(t *testing.T) {
 		if !strings.Contains(response.Body.String(), "GPUFlow") {
 			t.Fatalf("%s did not return the dashboard", path)
 		}
+	}
+}
+
+func TestEmbeddedConnectCommandUsesManagedRegistryWithoutExternalPull(t *testing.T) {
+	assets, err := fs.Glob(content, "dist/assets/*.js")
+	if err != nil || len(assets) != 1 {
+		t.Fatalf("unexpected embedded JavaScript assets: %v, %v", assets, err)
+	}
+	bundle, err := content.ReadFile(assets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(bundle)
+	if strings.Contains(text, "docker pull") || strings.Contains(text, "-probe-image") {
+		t.Fatal("connect command still requires a node-side external Probe pull")
+	}
+	if !strings.Contains(text, "/enterprise/v1/registry/credentials") || !strings.Contains(text, "--password-stdin") {
+		t.Fatal("container Agent command does not bootstrap the managed Registry")
 	}
 }

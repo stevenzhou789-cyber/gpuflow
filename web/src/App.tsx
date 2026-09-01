@@ -1201,10 +1201,10 @@ function ConnectNode({
   onClose: () => void;
 }) {
   const agentBootstrap = Boolean(features.agent_bootstrap);
+  const managedRegistry = Boolean(features.managed_registry);
   const [mode, setMode] = useState<"windows" | "docker">("windows");
   const [copied, setCopied] = useState(false);
   const [agentImage, setAgentImage] = useState(defaultAgentImage);
-  const [probeImage, setProbeImage] = useState(defaultProbeImage);
   const [serverURL, setServerURL] = useState(defaultPublicURL);
   const [agentToken, setAgentToken] = useState(
     agentBootstrap
@@ -1215,6 +1215,13 @@ function ConnectNode({
     agentBootstrap,
   );
   const [agentTokenError, setAgentTokenError] = useState("");
+  const [registryCredentials, setRegistryCredentials] = useState<{
+    address: string;
+    username: string;
+    password: string;
+  } | null>(null);
+  const [registryLoading, setRegistryLoading] = useState(managedRegistry);
+  const [registryError, setRegistryError] = useState("");
   const [values, setValues] = useState({
     name: "local-gpu-01",
     pool: "default",
@@ -1232,9 +1239,11 @@ function ConnectNode({
   const localOnlyServer = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(server);
   const binary = agentBinary;
   const token = agentToken;
-  const selectedProbeImage = probeImage.trim() || "gpuflow-gpu-probe:local";
-  const windowsCommand = `docker pull "${selectedProbeImage}"\n.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -provider local -pool "${values.pool}" -hourly-price ${values.price} -executor docker -gpu-probe auto -probe-image "${selectedProbeImage}"`;
-  const dockerCommand = `docker pull "${selectedProbeImage}"\ndocker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  -e GPUFLOW_GPU_PROBE=auto -e GPUFLOW_PROBE_IMAGE="${selectedProbeImage}" \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -hourly-price ${values.price}`;
+  const registryLogin = registryCredentials
+    ? `printf '%s' '${registryCredentials.password}' | docker login "${registryCredentials.address}" --username "${registryCredentials.username}" --password-stdin\n`
+    : "";
+  const windowsCommand = `.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -pool "${values.pool}" -hourly-price ${values.price}`;
+  const dockerCommand = `${registryLogin}docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -hourly-price ${values.price}`;
   const command = (mode === "windows" ? windowsCommand : dockerCommand).replace(
     /\n\+\s*/g,
     "\n  ",
@@ -1264,6 +1273,30 @@ function ConnectNode({
       cancelled = true;
     };
   }, [agentBootstrap]);
+
+  useEffect(() => {
+    if (!managedRegistry) return;
+    let cancelled = false;
+    setRegistryLoading(true);
+    setRegistryError("");
+    api<{ address: string; username: string; password: string }>(
+      "/enterprise/v1/registry/credentials",
+    )
+      .then((response) => {
+        if (cancelled) return;
+        setRegistryCredentials(response);
+        setAgentImage(defaultAgentImage);
+        setRegistryLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setRegistryError("无法读取内置 Registry 凭据，请确认当前账号具有管理员权限。");
+        setRegistryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [defaultAgentImage, managedRegistry]);
 
   function update(key: keyof typeof values, value: string) {
     setValues((current) => ({ ...current, [key]: value }));
@@ -1344,7 +1377,7 @@ function ConnectNode({
                   setAgentImage(event.target.value);
                   setCopied(false);
                 }}
-                placeholder="ghcr.io/owner/gpuflow:v1.0.0"
+                placeholder="registry.example.com/gpuflow-system/gpuflow-enterprise:v1.0.20"
               />
               <small>
                 远程节点使用固定版本或 Digest；本地构建可使用
@@ -1354,18 +1387,12 @@ function ConnectNode({
           )}
           <label className="connection-field">
             GPU 探针镜像
-            <input
-              value={probeImage}
-              onChange={(event) => {
-                setProbeImage(event.target.value);
-                setCopied(false);
-              }}
-              placeholder="registry.example.com/gpuflow/gpu-probe:v1.0.18"
-            />
-            <small>独立的 glibc 镜像，用于 Windows、Linux 和容器 Agent 验证 NVIDIA Docker 运行时。</small>
+            <input value={defaultProbeImage} readOnly />
+            <small>由控制面下发；Agent 登录内置 Registry 后按需拉取，无需节点访问 GHCR。</small>
           </label>
         </div>
         {agentTokenError && <div className="notice error">{agentTokenError}</div>}
+        {registryError && <div className="notice error">{registryError}</div>}
         <div className="form-grid compact">
           <label>
             节点标识（唯一）
@@ -1408,9 +1435,9 @@ function ConnectNode({
             <span>在目标 GPU 主机运行</span>
             <button
               onClick={copyCommand}
-              disabled={agentBootstrap && !agentToken}
+              disabled={(agentBootstrap && !agentToken) || (mode === "docker" && managedRegistry && !registryCredentials)}
             >
-              {agentTokenLoading ? "正在准备…" : copied ? "已复制" : "复制命令"}
+              {agentTokenLoading || registryLoading ? "正在准备…" : copied ? "已复制" : "复制命令"}
             </button>
           </div>
           <pre>{command}</pre>
@@ -1419,8 +1446,8 @@ function ConnectNode({
           <strong>当前接入边界</strong>
           <p>
             节点必须已安装 Docker；GPU 容器还需要 NVIDIA 驱动和 NVIDIA Container
-            Toolkit。Agent 会自动上报宿主机逻辑 CPU 核数用于调度和资源展示，
-            并在宿主机执行任务，只应连接可信控制面。
+            Toolkit。节点必须能访问控制面及其内置 Registry；Agent 会自动登录并拉取
+            GPU 探针，无需访问 GHCR。Agent 在宿主机执行任务，只应连接可信控制面。
           </p>
         </div>
       </div>

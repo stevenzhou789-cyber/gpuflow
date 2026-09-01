@@ -74,7 +74,10 @@ func (a *Agent) probeNode(ctx context.Context) (model.Node, error) {
 		return node, dockerErr
 	}
 	{
-		args := []string{"run", "--rm", "--pull", "never", "--gpus", "all", "--entrypoint", "nvidia-smi", image}
+		// Enterprise Agents authenticate to the control-plane Registry before
+		// entering the shared Agent runtime. Pull only when the exact image is
+		// missing locally so an offline node never needs an external registry.
+		args := []string{"run", "--rm", "--pull", "missing", "--gpus", "all", "--entrypoint", "nvidia-smi", image}
 		output, err := run(ctx, "docker", append(args, gpuQueryArgs...)...)
 		if err != nil {
 			if hostInventory {

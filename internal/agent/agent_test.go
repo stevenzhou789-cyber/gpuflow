@@ -635,6 +635,7 @@ func TestRunUsesDedicatedCapabilityProbeImageAndSession(t *testing.T) {
 	var probeImageUsed atomic.Bool
 	agent := New(Config{
 		Server: server.URL, ID: "probe-node", Executor: "docker", PollInterval: time.Hour,
+		ProbeImage: "ghcr.io/obsolete/probe:v0",
 		CleanupCommand: func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
 		ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			if name != "docker" {
