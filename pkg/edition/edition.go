@@ -9,18 +9,19 @@ import (
 const CapabilitiesSchemaVersion = 2
 
 const (
-	FeatureBasicScheduler        = "basic_scheduler"
-	FeatureGPUGranularScheduling = "gpu_granular_scheduling"
-	FeatureCostAnalytics         = "cost_analytics"
-	FeatureAdvancedPolicy        = "advanced_policy"
-	FeatureAlerts                = "alerts"
-	FeatureRBAC                  = "rbac"
-	FeatureAuditLog              = "audit_log"
-	FeatureOfflineLicense        = "offline_license"
-	FeatureAgentBootstrap        = "agent_bootstrap"
-	FeatureManagedRegistry       = "managed_registry"
-	FeaturePerGPUInventory       = "per_gpu_inventory"
-	FeatureNodeHealth            = "node_health"
+	FeatureBasicScheduler            = "basic_scheduler"
+	FeatureGPUGranularScheduling     = "gpu_granular_scheduling"
+	FeatureCostAnalytics             = "cost_analytics"
+	FeatureAdvancedPolicy            = "advanced_policy"
+	FeatureAlerts                    = "alerts"
+	FeatureRBAC                      = "rbac"
+	FeatureAuditLog                  = "audit_log"
+	FeatureOfflineLicense            = "offline_license"
+	FeatureAgentBootstrap            = "agent_bootstrap"
+	FeatureManagedRegistry           = "managed_registry"
+	FeaturePerGPUInventory           = "per_gpu_inventory"
+	FeatureNodeHealth                = "node_health"
+	FeatureHeterogeneousAccelerators = "heterogeneous_accelerators"
 )
 
 // Descriptor is returned to the UI and is also the stable extension contract
@@ -37,10 +38,18 @@ type Descriptor struct {
 	PublicURL     string `json:"public_url,omitempty"`
 	MaxNodes      int    `json:"max_nodes,omitempty"`
 	MaxGPUs       int    `json:"max_gpus,omitempty"`
+	// AcceleratorLimits are signed Enterprise quotas keyed by accelerator vendor.
+	// They are omitted from the public Agent capability projection.
+	AcceleratorLimits map[string]AcceleratorLimit `json:"accelerator_limits,omitempty"`
 	// MaxCPUCores is retained for compatibility with older enterprise integrations.
 	// CPU capacity is no longer licensed or enforced.
 	MaxCPUCores int             `json:"max_cpu_cores,omitempty"`
 	Features    map[string]bool `json:"features"`
+}
+
+type AcceleratorLimit struct {
+	MaxNodes   int `json:"max_nodes"`
+	MaxDevices int `json:"max_devices"`
 }
 
 func ParseExpiration(value string) (time.Time, error) {
@@ -91,18 +100,19 @@ func Community() Descriptor {
 		ProbeImage:    "gpuflow-gpu-probe:local",
 		AgentBinary:   "gpuflow.exe",
 		Features: map[string]bool{
-			FeatureBasicScheduler:        true,
-			FeatureGPUGranularScheduling: false,
-			FeatureCostAnalytics:         false,
-			FeatureAdvancedPolicy:        false,
-			FeatureAlerts:                false,
-			FeatureRBAC:                  false,
-			FeatureAuditLog:              false,
-			FeatureOfflineLicense:        false,
-			FeatureAgentBootstrap:        false,
-			FeatureManagedRegistry:       false,
-			FeaturePerGPUInventory:       false,
-			FeatureNodeHealth:            false,
+			FeatureBasicScheduler:            true,
+			FeatureGPUGranularScheduling:     false,
+			FeatureCostAnalytics:             false,
+			FeatureAdvancedPolicy:            false,
+			FeatureAlerts:                    false,
+			FeatureRBAC:                      false,
+			FeatureAuditLog:                  false,
+			FeatureOfflineLicense:            false,
+			FeatureAgentBootstrap:            false,
+			FeatureManagedRegistry:           false,
+			FeaturePerGPUInventory:           false,
+			FeatureNodeHealth:                false,
+			FeatureHeterogeneousAccelerators: false,
 		},
 	}
 }

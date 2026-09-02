@@ -98,6 +98,31 @@ func TestDockerGPUSelectorUsesAllocatedDevices(t *testing.T) {
 	}
 }
 
+func TestAscendDockerOptionsUseDiscoveredPhysicalIDs(t *testing.T) {
+	a := New(Config{})
+	a.acceleratorBackend = backendAscend
+	a.baseline = model.Node{GPUCount: 2, Devices: []model.GPUDevice{
+		{Index: 0, UUID: "ASCEND-3", Model: "Ascend 910B", VRAMGB: 64},
+		{Index: 1, UUID: "ASCEND-7", Model: "Ascend 910B", VRAMGB: 64},
+	}}
+	job := &model.Job{Requirements: model.Requirements{GPUCount: 1}, AllocatedGPUs: []int{1}}
+	args, err := a.acceleratorDockerArgs(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if joined != "--runtime ascend -e ASCEND_VISIBLE_DEVICES=7" {
+		t.Fatalf("unexpected Ascend Docker options: %s", joined)
+	}
+}
+
+func TestAscendBackendRequiresEnterpriseCapability(t *testing.T) {
+	a := New(Config{AcceleratorBackend: "ascend"})
+	if err := a.selectAcceleratorBackend(context.Background(), edition.Community()); err == nil {
+		t.Fatal("Ascend backend was accepted by Community capabilities")
+	}
+}
+
 func TestJobContainerNameIsAttemptScoped(t *testing.T) {
 	if got := jobContainerName("job-123", 2); got != "gpuflow-job-job-123-2" {
 		t.Fatalf("unexpected attempt container name %q", got)
@@ -635,7 +660,7 @@ func TestRunUsesDedicatedCapabilityProbeImageAndSession(t *testing.T) {
 	var probeImageUsed atomic.Bool
 	agent := New(Config{
 		Server: server.URL, ID: "probe-node", Executor: "docker", PollInterval: time.Hour,
-		ProbeImage: "ghcr.io/obsolete/probe:v0",
+		ProbeImage:     "ghcr.io/obsolete/probe:v0",
 		CleanupCommand: func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
 		ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			if name != "docker" {

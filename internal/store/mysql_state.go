@@ -4,14 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"time"
 
 	"gpuflow/internal/model"
-
-	mysqldriver "github.com/go-sql-driver/mysql"
 )
 
 const mysqlJobsSchema = `CREATE TABLE IF NOT EXISTS jobs (
@@ -77,50 +74,7 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("connect mysql state: %w", err)
 	}
-	for name, schema := range map[string]string{"jobs": mysqlJobsSchema, "nodes": mysqlNodesSchema} {
-		if _, err := db.ExecContext(ctx, schema); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("migrate %s: %w", name, err)
-		}
-	}
-	if _, err := db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN allocated_gpus_json JSON NULL AFTER assigned_node"); err != nil {
-		var mysqlErr *mysqldriver.MySQLError
-		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
-			_ = db.Close()
-			return nil, fmt.Errorf("migrate job GPU allocations: %w", err)
-		}
-	}
-	for _, migration := range []struct {
-		statement string
-		name      string
-	}{
-		{"ALTER TABLE jobs ADD COLUMN assigned_session VARCHAR(64) NOT NULL DEFAULT '' AFTER assigned_node", "job assigned session"},
-		{"ALTER TABLE jobs ADD COLUMN attempt_token VARCHAR(64) NOT NULL DEFAULT '' AFTER assigned_session", "job attempt token"},
-		{"ALTER TABLE jobs ADD COLUMN lease_expires_at DATETIME(6) NULL AFTER attempt_token", "job attempt lease"},
-	} {
-		if _, err := db.ExecContext(ctx, migration.statement); err != nil {
-			var mysqlErr *mysqldriver.MySQLError
-			if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
-				_ = db.Close()
-				return nil, fmt.Errorf("migrate %s: %w", migration.name, err)
-			}
-		}
-	}
-	if _, err := db.ExecContext(ctx, "ALTER TABLE nodes ADD COLUMN cpu_cores INT NOT NULL DEFAULT 0 AFTER gpu_count"); err != nil {
-		var mysqlErr *mysqldriver.MySQLError
-		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
-			_ = db.Close()
-			return nil, fmt.Errorf("migrate node CPU capacity: %w", err)
-		}
-	}
-	if _, err := db.ExecContext(ctx, "ALTER TABLE nodes ADD COLUMN details_json JSON NULL AFTER labels_json"); err != nil {
-		var mysqlErr *mysqldriver.MySQLError
-		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
-			_ = db.Close()
-			return nil, fmt.Errorf("migrate node inventory and health: %w", err)
-		}
-	}
-	if err := (&MySQLTaskImageStore{db: db}).migrate(ctx); err != nil {
+	if err := runCoreMigrations(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -225,10 +179,23 @@ func decodeJobJSON(job *model.Job, commandJSON, environmentJSON, requirementsJSO
 	if err := json.Unmarshal(environmentJSON, &job.Environment); err != nil {
 		return fmt.Errorf("environment: %w", err)
 	}
-	if err := json.Unmarshal(requirementsJSON, &job.Requirements); err != nil {
+	var persisted struct {
+		model.Requirements
+		UsageRecords []model.AcceleratorUsageRecord `json:"usage_records,omitempty"`
+	}
+	if err := json.Unmarshal(requirementsJSON, &persisted); err != nil {
 		return fmt.Errorf("requirements: %w", err)
 	}
+	job.Requirements = persisted.Requirements
+	job.UsageRecords = persisted.UsageRecords
 	return nil
+}
+
+func encodeJobRequirements(job *model.Job) ([]byte, error) {
+	return json.Marshal(struct {
+		model.Requirements
+		UsageRecords []model.AcceleratorUsageRecord `json:"usage_records,omitempty"`
+	}{Requirements: job.Requirements, UsageRecords: job.UsageRecords})
 }
 
 const upsertJobSQL = `INSERT INTO jobs (id, name, image, command_json, environment_json,
@@ -318,7 +285,7 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 		if err != nil {
 			return fmt.Errorf("encode job %s environment: %w", job.ID, err)
 		}
-		requirementsJSON, err := json.Marshal(job.Requirements)
+		requirementsJSON, err := encodeJobRequirements(job)
 		if err != nil {
 			return fmt.Errorf("encode job %s requirements: %w", job.ID, err)
 		}

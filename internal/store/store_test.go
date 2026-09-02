@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gpuflow/internal/model"
+	"gpuflow/pkg/edition"
 )
 
 func confirmAgentSession(t *testing.T, s *Store, nodeID, session string) {
@@ -662,6 +663,116 @@ func TestCommunitySchedulingRemainsWholeNodeExclusive(t *testing.T) {
 	}
 	if assigned != 1 || queued != 1 {
 		t.Fatalf("community scheduling stopped being whole-node exclusive: %+v %+v", first, second)
+	}
+}
+
+func TestHeterogeneousSchedulingRoutesCUDAAndCANN(t *testing.T) {
+	s := NewMemory()
+	s.SetGPUGranularScheduling(true)
+	s.SetHeterogeneousAccelerators(true)
+	_, _ = s.RegisterNode(model.Node{ID: "nvidia", GPUModel: "H100", GPUCount: 1, VRAMGB: 80})
+	_, _ = s.RegisterNode(model.Node{ID: "ascend", GPUModel: "Ascend 910B", GPUCount: 1, VRAMGB: 64, Labels: map[string]string{
+		model.LabelAcceleratorVendor: model.VendorHuawei, model.LabelAcceleratorRuntime: model.RuntimeCANN,
+	}})
+	legacyCUDA, err := s.CreateJob(model.JobCreate{Name: "cuda", Image: "cuda", Requirements: model.Requirements{GPUCount: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cann, err := s.CreateJob(model.JobCreate{Name: "cann", Image: "cann", Requirements: model.Requirements{GPUCount: 1, Labels: map[string]string{
+		model.LabelAcceleratorVendor: model.VendorHuawei, model.LabelAcceleratorRuntime: model.RuntimeCANN,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	legacyCUDA, _ = s.GetJob(legacyCUDA.ID)
+	cann, _ = s.GetJob(cann.ID)
+	if legacyCUDA.AssignedNode != "nvidia" || cann.AssignedNode != "ascend" {
+		t.Fatalf("tasks crossed accelerator runtimes: cuda=%s cann=%s", legacyCUDA.AssignedNode, cann.AssignedNode)
+	}
+	if legacyCUDA.Requirements.Labels[model.LabelAcceleratorRuntime] != model.RuntimeCUDA {
+		t.Fatalf("legacy CUDA task was not normalized: %+v", legacyCUDA.Requirements.Labels)
+	}
+}
+
+func TestHeterogeneousSchedulingRejectsInvalidRuntimePair(t *testing.T) {
+	s := NewMemory()
+	s.SetHeterogeneousAccelerators(true)
+	_, err := s.CreateJob(model.JobCreate{Name: "invalid", Image: "work", Requirements: model.Requirements{GPUCount: 1, Labels: map[string]string{
+		model.LabelAcceleratorVendor: model.VendorNVIDIA, model.LabelAcceleratorRuntime: model.RuntimeCANN,
+	}}})
+	if !errors.Is(err, ErrInvalidResources) {
+		t.Fatalf("invalid accelerator pair was accepted: %v", err)
+	}
+}
+
+func TestAcceleratorLicenseLimitsEnforceVendorCapacity(t *testing.T) {
+	s := NewMemory()
+	s.SetHeterogeneousAccelerators(true)
+	s.SetCommercialLimits(10, 10, "", map[string]edition.AcceleratorLimit{
+		model.VendorNVIDIA: {MaxNodes: 1, MaxDevices: 2},
+		model.VendorHuawei: {MaxNodes: 1, MaxDevices: 1},
+	})
+	if _, err := s.RegisterNode(model.Node{ID: "nvidia", GPUModel: "L4", GPUCount: 2, VRAMGB: 24}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterNode(model.Node{ID: "ascend", GPUModel: "Ascend 910B", GPUCount: 1, VRAMGB: 64, Labels: map[string]string{
+		model.LabelAcceleratorVendor: model.VendorHuawei, model.LabelAcceleratorRuntime: model.RuntimeCANN,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterNode(model.Node{ID: "ascend-over", GPUModel: "Ascend 910B", GPUCount: 1, VRAMGB: 64, Labels: map[string]string{
+		model.LabelAcceleratorVendor: model.VendorHuawei, model.LabelAcceleratorRuntime: model.RuntimeCANN,
+	}}); !errors.Is(err, ErrLicenseCapacity) {
+		t.Fatalf("Ascend quota overflow was accepted: %v", err)
+	}
+	s.SetCommercialLimits(10, 10, "", map[string]edition.AcceleratorLimit{
+		model.VendorNVIDIA: {MaxNodes: 1, MaxDevices: 2},
+	})
+	if _, err := s.CreateJob(model.JobCreate{Name: "unlicensed-cann", Image: "cann", Requirements: model.Requirements{GPUCount: 1, Labels: map[string]string{
+		model.LabelAcceleratorVendor: model.VendorHuawei, model.LabelAcceleratorRuntime: model.RuntimeCANN,
+	}}}); !errors.Is(err, ErrLicenseCapacity) {
+		t.Fatalf("task for unlicensed accelerator vendor was accepted: %v", err)
+	}
+}
+
+func TestCostAccountingSnapshotsEveryExecutionAttempt(t *testing.T) {
+	s := NewMemory()
+	s.SetGPUGranularScheduling(true)
+	s.SetHeterogeneousAccelerators(true)
+	s.SetCostAccounting(true)
+	_, _ = s.RegisterNode(model.Node{ID: "ascend", GPUModel: "Ascend 910B", GPUCount: 2, VRAMGB: 64, HourlyPrice: 12.5, Labels: map[string]string{
+		model.LabelAcceleratorVendor: model.VendorHuawei, model.LabelAcceleratorRuntime: model.RuntimeCANN,
+	}})
+	job, _ := s.CreateJob(model.JobCreate{Name: "metered", Image: "cann", MaxRetries: 1, Requirements: model.Requirements{GPUCount: 2, Labels: map[string]string{
+		model.LabelAcceleratorVendor: model.VendorHuawei, model.LabelAcceleratorRuntime: model.RuntimeCANN,
+	}}})
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := s.Schedule(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		job, _ = s.GetJob(job.ID)
+		if _, err := s.UpdateJob(job.ID, "ascend", model.JobUpdate{Status: model.JobRunning}); err != nil {
+			t.Fatal(err)
+		}
+		status := model.JobFailed
+		if attempt == 2 {
+			status = model.JobSucceeded
+		}
+		if _, err := s.UpdateJob(job.ID, "ascend", model.JobUpdate{Status: status}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job, _ = s.GetJob(job.ID)
+	if len(job.UsageRecords) != 2 {
+		t.Fatalf("expected two durable usage attempts, got %+v", job.UsageRecords)
+	}
+	for attempt, record := range job.UsageRecords {
+		if record.Attempt != attempt+1 || record.Vendor != model.VendorHuawei || record.Model != "Ascend 910B" || record.DeviceCount != 2 || record.UnitPricePerHour != 12.5 || record.StartedAt == nil || record.FinishedAt == nil {
+			t.Fatalf("invalid usage snapshot: %+v", record)
+		}
 	}
 }
 

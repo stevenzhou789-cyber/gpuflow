@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"gpuflow/internal/model"
+	"gpuflow/pkg/edition"
 )
 
 var (
@@ -45,16 +46,19 @@ type snapshot struct {
 }
 
 type Store struct {
-	mu                     sync.Mutex
-	db                     *sql.DB
-	state                  snapshot
-	gpuGranularScheduling  bool
-	maxNodes               int
-	maxGPUs                int
-	licenseExpiresAt       time.Time
-	nodeHealthEnabled      bool
-	nodeHealthTTL          time.Duration
-	perGPUInventoryEnabled bool
+	mu                        sync.Mutex
+	db                        *sql.DB
+	state                     snapshot
+	gpuGranularScheduling     bool
+	maxNodes                  int
+	maxGPUs                   int
+	licenseExpiresAt          time.Time
+	nodeHealthEnabled         bool
+	nodeHealthTTL             time.Duration
+	perGPUInventoryEnabled    bool
+	heterogeneousAccelerators bool
+	acceleratorLimits         map[string]edition.AcceleratorLimit
+	costAccounting            bool
 }
 
 type TaskImageStore interface {
@@ -84,6 +88,10 @@ func (s *Store) SetGPUGranularScheduling(enabled bool) {
 func (s *Store) SetSchedulingLimits(maxNodes, maxGPUs int, expiresAt string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.setSchedulingLimitsLocked(maxNodes, maxGPUs, expiresAt)
+}
+
+func (s *Store) setSchedulingLimitsLocked(maxNodes, maxGPUs int, expiresAt string) {
 	s.maxNodes, s.maxGPUs = maxNodes, maxGPUs
 	s.licenseExpiresAt = time.Time{}
 	if value := strings.TrimSpace(expiresAt); value != "" {
@@ -97,6 +105,15 @@ func (s *Store) SetSchedulingLimits(maxNodes, maxGPUs int, expiresAt string) {
 			s.licenseExpiresAt = time.Unix(0, 0).UTC()
 		}
 	}
+}
+
+// SetCommercialLimits atomically replaces global and per-vendor limits during
+// a live signed-License refresh.
+func (s *Store) SetCommercialLimits(maxNodes, maxGPUs int, expiresAt string, limits map[string]edition.AcceleratorLimit) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setSchedulingLimitsLocked(maxNodes, maxGPUs, expiresAt)
+	s.acceleratorLimits = cloneAcceleratorLimits(limits)
 }
 
 func (s *Store) SetNodeHealthPolicy(enabled bool, ttl time.Duration) {
@@ -113,6 +130,35 @@ func (s *Store) SetPerGPUInventory(enabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.perGPUInventoryEnabled = enabled
+}
+
+func (s *Store) SetHeterogeneousAccelerators(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.heterogeneousAccelerators = enabled
+}
+
+func (s *Store) SetAcceleratorLimits(limits map[string]edition.AcceleratorLimit) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.acceleratorLimits = cloneAcceleratorLimits(limits)
+}
+
+func (s *Store) SetCostAccounting(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.costAccounting = enabled
+}
+
+func cloneAcceleratorLimits(source map[string]edition.AcceleratorLimit) map[string]edition.AcceleratorLimit {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]edition.AcceleratorLimit, len(source))
+	for vendor, limit := range source {
+		result[strings.ToLower(strings.TrimSpace(vendor))] = limit
+	}
+	return result
 }
 
 func (s *Store) SaveTaskImage(image model.TaskImage) error {
@@ -190,6 +236,7 @@ func cloneSnapshot(source snapshot) snapshot {
 		copy.Requirements.Providers = append([]string(nil), job.Requirements.Providers...)
 		copy.Requirements.Pools = append([]string(nil), job.Requirements.Pools...)
 		copy.Requirements.Labels = cloneStringMap(job.Requirements.Labels)
+		copy.UsageRecords = cloneUsageRecords(job.UsageRecords)
 		result.Jobs[id] = &copy
 	}
 	for id, node := range source.Nodes {
@@ -203,6 +250,15 @@ func cloneSnapshot(source snapshot) snapshot {
 	for id, image := range source.TaskImages {
 		copy := *image
 		result.TaskImages[id] = &copy
+	}
+	return result
+}
+
+func cloneUsageRecords(source []model.AcceleratorUsageRecord) []model.AcceleratorUsageRecord {
+	result := append([]model.AcceleratorUsageRecord(nil), source...)
+	for index := range result {
+		result[index].StartedAt = cloneTime(result[index].StartedAt)
+		result[index].FinishedAt = cloneTime(result[index].FinishedAt)
 	}
 	return result
 }
@@ -248,6 +304,17 @@ func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job,
 	if err := validateAndNormalizeJobCreate(&in); err != nil {
 		return nil, err
 	}
+	if s.heterogeneousAccelerators {
+		if err := normalizeAcceleratorRequirements(&in.Requirements); err != nil {
+			return nil, err
+		}
+		if in.Requirements.GPUCount > 0 && s.acceleratorLimits != nil {
+			vendor, _ := acceleratorIdentity(in.Requirements.Labels)
+			if _, licensed := s.acceleratorLimits[vendor]; !licensed {
+				return nil, fmt.Errorf("%w: accelerator vendor %q is not licensed", ErrLicenseCapacity, vendor)
+			}
+		}
+	}
 	before := cloneSnapshot(s.state)
 	now := time.Now().UTC()
 	for _, existing := range s.state.Jobs {
@@ -269,6 +336,41 @@ func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job,
 	}
 	copy := *j
 	return &copy, nil
+}
+
+func normalizeAcceleratorRequirements(requirements *model.Requirements) error {
+	if requirements.GPUCount == 0 {
+		return nil
+	}
+	if requirements.Labels == nil {
+		requirements.Labels = map[string]string{}
+	}
+	vendor := strings.ToLower(strings.TrimSpace(requirements.Labels[model.LabelAcceleratorVendor]))
+	runtimeName := strings.ToLower(strings.TrimSpace(requirements.Labels[model.LabelAcceleratorRuntime]))
+	if vendor == "" && runtimeName == "" {
+		vendor, runtimeName = model.VendorNVIDIA, model.RuntimeCUDA
+	} else if vendor == "" {
+		switch runtimeName {
+		case model.RuntimeCUDA:
+			vendor = model.VendorNVIDIA
+		case model.RuntimeCANN:
+			vendor = model.VendorHuawei
+		}
+	} else if runtimeName == "" {
+		switch vendor {
+		case model.VendorNVIDIA:
+			runtimeName = model.RuntimeCUDA
+		case model.VendorHuawei:
+			runtimeName = model.RuntimeCANN
+		}
+	}
+	if (vendor != model.VendorNVIDIA || runtimeName != model.RuntimeCUDA) &&
+		(vendor != model.VendorHuawei || runtimeName != model.RuntimeCANN) {
+		return fmt.Errorf("%w: unsupported accelerator vendor/runtime combination %q/%q", ErrInvalidResources, vendor, runtimeName)
+	}
+	requirements.Labels[model.LabelAcceleratorVendor] = vendor
+	requirements.Labels[model.LabelAcceleratorRuntime] = runtimeName
+	return nil
 }
 
 func validateAndNormalizeJobCreate(in *model.JobCreate) error {
@@ -332,6 +434,7 @@ func (s *Store) CancelJob(id string) (*model.Job, error) {
 		// An assigned job has not crossed the guarded ASSIGNED -> RUNNING
 		// transition, so cancellation is final and releases its reservation.
 		j.Status, j.FinishedAt = model.JobCanceled, &now
+		s.finalizeUsageAttemptLocked(j, model.JobCanceled, now)
 		clearJobAssignment(j)
 	case model.JobRunning:
 		j.Status = model.JobCanceling
@@ -528,6 +631,7 @@ func (s *Store) GetJob(id string) (*model.Job, error) {
 	copy := *j
 	copy.AllocatedGPUs = append([]int(nil), j.AllocatedGPUs...)
 	copy.LeaseExpiresAt = cloneTime(j.LeaseExpiresAt)
+	copy.UsageRecords = cloneUsageRecords(j.UsageRecords)
 	return &copy, nil
 }
 
@@ -539,6 +643,7 @@ func (s *Store) ListJobs() []*model.Job {
 		copy := *j
 		copy.AllocatedGPUs = append([]int(nil), j.AllocatedGPUs...)
 		copy.LeaseExpiresAt = cloneTime(j.LeaseExpiresAt)
+		copy.UsageRecords = cloneUsageRecords(j.UsageRecords)
 		result = append(result, &copy)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
@@ -577,6 +682,11 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover, requi
 	}
 	if in.HealthStatus == "" {
 		in.HealthStatus = "HEALTHY"
+	}
+	if s.heterogeneousAccelerators && in.GPUCount > 0 {
+		if err := normalizeAcceleratorNode(&in); err != nil {
+			return nil, err
+		}
 	}
 	if s.nodeHealthEnabled {
 		status := strings.ToUpper(strings.TrimSpace(in.HealthStatus))
@@ -617,6 +727,27 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover, requi
 	copy.Devices = append([]model.GPUDevice(nil), in.Devices...)
 	copy.LastHealthCheck = cloneTime(in.LastHealthCheck)
 	return &copy, nil
+}
+
+func normalizeAcceleratorNode(node *model.Node) error {
+	if node.Labels == nil {
+		node.Labels = map[string]string{}
+	}
+	vendor := strings.ToLower(strings.TrimSpace(node.Labels[model.LabelAcceleratorVendor]))
+	runtimeName := strings.ToLower(strings.TrimSpace(node.Labels[model.LabelAcceleratorRuntime]))
+	if vendor == "" && runtimeName == "" {
+		vendor, runtimeName = model.VendorNVIDIA, model.RuntimeCUDA
+	}
+	if (vendor != model.VendorNVIDIA || runtimeName != model.RuntimeCUDA) &&
+		(vendor != model.VendorHuawei || runtimeName != model.RuntimeCANN) {
+		return fmt.Errorf("%w: unsupported node accelerator vendor/runtime combination %q/%q", ErrInvalidResources, vendor, runtimeName)
+	}
+	if strings.EqualFold(strings.TrimSpace(node.GPUModel), "mixed") {
+		return fmt.Errorf("%w: mixed accelerator models on one node are not supported", ErrInvalidResources)
+	}
+	node.Labels[model.LabelAcceleratorVendor] = vendor
+	node.Labels[model.LabelAcceleratorRuntime] = runtimeName
+	return nil
 }
 
 // ConfirmNodeCleanupSession opens a freshly registered session for dispatch
@@ -712,12 +843,47 @@ func (s *Store) validateAndAdmitNodeLocked(candidate model.Node, existing *model
 	if increasesCapacity && s.maxGPUs > 0 && projectedGPUs > s.maxGPUs {
 		return fmt.Errorf("%w: %d GPUs requested, %d licensed", ErrLicenseCapacity, projectedGPUs, s.maxGPUs)
 	}
+	if err := s.validateAcceleratorCapacityLocked(candidate, existing); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) validateAcceleratorCapacityLocked(candidate model.Node, existing *model.Node) error {
+	if s.acceleratorLimits == nil || candidate.GPUCount == 0 {
+		return nil
+	}
+	vendor, _ := acceleratorIdentity(candidate.Labels)
+	limit, licensed := s.acceleratorLimits[vendor]
+	if !licensed {
+		return fmt.Errorf("%w: accelerator vendor %q is not licensed", ErrLicenseCapacity, vendor)
+	}
+	nodes, devices := 1, candidate.GPUCount
+	for id, node := range s.state.Nodes {
+		if existing != nil && id == existing.ID {
+			continue
+		}
+		nodeVendor, _ := acceleratorIdentity(node.Labels)
+		if node.GPUCount > 0 && nodeVendor == vendor {
+			nodes++
+			devices += node.GPUCount
+		}
+	}
+	if nodes > limit.MaxNodes {
+		return fmt.Errorf("%w: %s nodes requested %d, licensed %d", ErrLicenseCapacity, vendor, nodes, limit.MaxNodes)
+	}
+	if devices > limit.MaxDevices {
+		return fmt.Errorf("%w: %s devices requested %d, licensed %d", ErrLicenseCapacity, vendor, devices, limit.MaxDevices)
+	}
 	return nil
 }
 
 func validateNodeResources(node model.Node, requireInventory bool) error {
 	if node.GPUCount < 0 || node.CPUCores < 0 || node.VRAMGB < 0 {
 		return fmt.Errorf("%w: node resource counts cannot be negative", ErrInvalidResources)
+	}
+	if node.HourlyPrice < 0 || math.IsNaN(node.HourlyPrice) || math.IsInf(node.HourlyPrice, 0) {
+		return fmt.Errorf("%w: hourly_price must be finite and non-negative", ErrInvalidResources)
 	}
 	if node.GPUCount > maxGPUsPerNodeOrJob {
 		return fmt.Errorf("%w: node gpu_count cannot exceed %d", ErrInvalidResources, maxGPUsPerNodeOrJob)
@@ -897,12 +1063,64 @@ func clearJobAssignment(job *model.Job) {
 	job.AllocatedGPUs, job.LeaseExpiresAt = nil, nil
 }
 
+func (s *Store) recordUsageAssignmentLocked(job *model.Job, node *model.Node, now time.Time) {
+	if !s.costAccounting || job.Requirements.GPUCount == 0 {
+		return
+	}
+	vendor, runtimeName := acceleratorIdentity(node.Labels)
+	job.UsageRecords = append(job.UsageRecords, model.AcceleratorUsageRecord{
+		Attempt: job.Attempts, NodeID: node.ID, Vendor: vendor, Runtime: runtimeName,
+		Model: node.GPUModel, DeviceCount: job.Requirements.GPUCount,
+		UnitPricePerHour: node.HourlyPrice, AssignedAt: now, Status: string(model.JobAssigned),
+	})
+}
+
+func currentUsageAttempt(job *model.Job) *model.AcceleratorUsageRecord {
+	for index := len(job.UsageRecords) - 1; index >= 0; index-- {
+		if job.UsageRecords[index].Attempt == job.Attempts {
+			return &job.UsageRecords[index]
+		}
+	}
+	return nil
+}
+
+func (s *Store) startUsageAttemptLocked(job *model.Job, now time.Time) {
+	if !s.costAccounting {
+		return
+	}
+	if record := currentUsageAttempt(job); record != nil {
+		record.StartedAt = cloneTime(&now)
+		record.Status = string(model.JobRunning)
+	}
+}
+
+func (s *Store) finalizeUsageAttemptLocked(job *model.Job, status model.JobStatus, now time.Time) {
+	if !s.costAccounting {
+		return
+	}
+	if record := currentUsageAttempt(job); record != nil {
+		record.FinishedAt = cloneTime(&now)
+		record.Status = string(status)
+	}
+}
+
+func (s *Store) discardUnstartedUsageAttemptLocked(job *model.Job) {
+	if !s.costAccounting || len(job.UsageRecords) == 0 {
+		return
+	}
+	last := &job.UsageRecords[len(job.UsageRecords)-1]
+	if last.Attempt == job.Attempts && last.StartedAt == nil {
+		job.UsageRecords = job.UsageRecords[:len(job.UsageRecords)-1]
+	}
+}
+
 func (s *Store) requeueAssignedJobsLocked(nodeID string, now time.Time) {
 	for _, job := range s.state.Jobs {
 		if job.AssignedNode != nodeID || job.Status != model.JobAssigned {
 			continue
 		}
 		job.Status, job.UpdatedAt = model.JobQueued, now
+		s.discardUnstartedUsageAttemptLocked(job)
 		if job.Attempts > 0 {
 			job.Attempts--
 		}
@@ -1129,6 +1347,9 @@ func (s *Store) eligibleLocked(j *model.Job, n *model.Node, now time.Time, offli
 	}
 	r := j.Requirements
 	if r.GPUCount > 0 {
+		if s.heterogeneousAccelerators && !acceleratorCompatible(r.Labels, n.Labels) {
+			return false
+		}
 		if n.GPUCount < r.GPUCount || n.VRAMGB < r.MinVRAMGB || !containsFold(r.GPUModels, n.GPUModel) {
 			return false
 		}
@@ -1147,6 +1368,22 @@ func (s *Store) eligibleLocked(j *model.Job, n *model.Node, now time.Time, offli
 	return true
 }
 
+func acceleratorCompatible(jobLabels, nodeLabels map[string]string) bool {
+	jobVendor, jobRuntime := acceleratorIdentity(jobLabels)
+	nodeVendor, nodeRuntime := acceleratorIdentity(nodeLabels)
+	return jobVendor == nodeVendor && jobRuntime == nodeRuntime
+}
+
+func acceleratorIdentity(labels map[string]string) (string, string) {
+	vendor := strings.ToLower(strings.TrimSpace(labels[model.LabelAcceleratorVendor]))
+	runtimeName := strings.ToLower(strings.TrimSpace(labels[model.LabelAcceleratorRuntime]))
+	// Existing jobs and Agents predate accelerator labels and are NVIDIA/CUDA.
+	if vendor == "" && runtimeName == "" {
+		return model.VendorNVIDIA, model.RuntimeCUDA
+	}
+	return vendor, runtimeName
+}
+
 func (s *Store) licensedNodeSetLocked(now time.Time) map[string]bool {
 	allowed := map[string]bool{}
 	if !s.licenseExpiresAt.IsZero() && !now.Before(s.licenseExpiresAt) {
@@ -1158,6 +1395,8 @@ func (s *Store) licensedNodeSetLocked(now time.Time) map[string]bool {
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 	usedGPUs := 0
+	usedVendorNodes := map[string]int{}
+	usedVendorDevices := map[string]int{}
 	for _, node := range nodes {
 		if validateNodeResources(*node, s.perGPUInventoryEnabled && strings.EqualFold(node.HealthStatus, "HEALTHY")) != nil {
 			continue
@@ -1167,6 +1406,15 @@ func (s *Store) licensedNodeSetLocked(now time.Time) map[string]bool {
 		}
 		if node.GPUCount > math.MaxInt-usedGPUs || (s.maxGPUs > 0 && usedGPUs+node.GPUCount > s.maxGPUs) {
 			continue
+		}
+		if s.acceleratorLimits != nil && node.GPUCount > 0 {
+			vendor, _ := acceleratorIdentity(node.Labels)
+			limit, licensed := s.acceleratorLimits[vendor]
+			if !licensed || usedVendorNodes[vendor]+1 > limit.MaxNodes || usedVendorDevices[vendor]+node.GPUCount > limit.MaxDevices {
+				continue
+			}
+			usedVendorNodes[vendor]++
+			usedVendorDevices[vendor] += node.GPUCount
 		}
 		allowed[node.ID] = true
 		usedGPUs += node.GPUCount
@@ -1238,6 +1486,7 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 		j.Status, j.AssignedNode, j.AssignedSession, j.UpdatedAt = model.JobAssigned, best.ID, best.SessionEpoch, now
 		j.AttemptToken, j.LeaseExpiresAt = "", nil
 		j.Attempts++
+		s.recordUsageAssignmentLocked(j, best, now)
 		s.refreshNodeUsageLocked(best.ID)
 		changed = true
 	}
@@ -1384,17 +1633,20 @@ func (s *Store) updateJobLocked(job *model.Job, nodeID, session, attemptToken st
 			return nil, ErrNodeUnavailable
 		}
 		job.Status, job.StartedAt, job.LeaseExpiresAt = model.JobRunning, &now, nil
+		s.startUsageAttemptLocked(job, now)
 	case model.JobSucceeded:
 		if job.Status != model.JobRunning {
 			return nil, errors.New("job is not running")
 		}
 		job.Status, job.FinishedAt = model.JobSucceeded, &now
+		s.finalizeUsageAttemptLocked(job, model.JobSucceeded, now)
 		job.AttemptToken, job.LeaseExpiresAt, job.AssignedSession = "", nil, ""
 	case model.JobFailed:
 		if job.Status != model.JobRunning {
 			return nil, errors.New("job is not running")
 		}
 		job.FinishedAt = &now
+		s.finalizeUsageAttemptLocked(job, model.JobFailed, now)
 		if job.Attempts <= job.MaxRetries {
 			job.Status = model.JobQueued
 			clearJobAssignment(job)
@@ -1408,14 +1660,17 @@ func (s *Store) updateJobLocked(job *model.Job, nodeID, session, attemptToken st
 			return nil, errors.New("job is not canceling")
 		}
 		if job.Error == recoveryRetryMarker {
+			s.finalizeUsageAttemptLocked(job, model.JobFailed, now)
 			job.Status = model.JobQueued
 			clearJobAssignment(job)
 			job.StartedAt, job.FinishedAt = nil, nil
 			resultOutput, resultError = "", ""
 		} else if job.Error == recoveryCleanupMarker {
+			s.finalizeUsageAttemptLocked(job, model.JobFailed, now)
 			job.Status = model.JobFailed
 			resultError = "agent restarted after interruption; retry budget exhausted"
 		} else {
+			s.finalizeUsageAttemptLocked(job, model.JobCanceled, now)
 			job.Status = model.JobCanceled
 		}
 		if job.Status != model.JobQueued {

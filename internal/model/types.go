@@ -3,6 +3,15 @@ package model
 import "time"
 
 const (
+	LabelAcceleratorVendor  = "accelerator.vendor"
+	LabelAcceleratorRuntime = "accelerator.runtime"
+	VendorNVIDIA            = "nvidia"
+	VendorHuawei            = "huawei"
+	RuntimeCUDA             = "cuda"
+	RuntimeCANN             = "cann"
+)
+
+const (
 	// AgentSessionTTL is the server-side takeover threshold.
 	AgentSessionTTL = 30 * time.Second
 	// AgentSessionFailStopTTL leaves time to force-remove local containers
@@ -34,30 +43,47 @@ type Requirements struct {
 }
 
 type Job struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	Image           string            `json:"image"`
-	Command         []string          `json:"command,omitempty"`
-	Environment     map[string]string `json:"environment,omitempty"`
-	Requirements    Requirements      `json:"requirements"`
-	Strategy        string            `json:"strategy"`
-	TimeoutSeconds  int               `json:"timeout_seconds"`
-	MaxRetries      int               `json:"max_retries"`
-	Attempts        int               `json:"attempts"`
-	Recoveries      int               `json:"recoveries"`
-	Status          JobStatus         `json:"status"`
-	AssignedNode    string            `json:"assigned_node,omitempty"`
-	AllocatedGPUs   []int             `json:"allocated_gpus,omitempty"`
-	Output          string            `json:"output,omitempty"`
-	Error           string            `json:"error,omitempty"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
-	StartedAt       *time.Time        `json:"started_at,omitempty"`
-	FinishedAt      *time.Time        `json:"finished_at,omitempty"`
-	RerunOf         string            `json:"rerun_of,omitempty"`
-	AssignedSession string            `json:"-"`
-	AttemptToken    string            `json:"-"`
-	LeaseExpiresAt  *time.Time        `json:"-"`
+	ID              string                   `json:"id"`
+	Name            string                   `json:"name"`
+	Image           string                   `json:"image"`
+	Command         []string                 `json:"command,omitempty"`
+	Environment     map[string]string        `json:"environment,omitempty"`
+	Requirements    Requirements             `json:"requirements"`
+	Strategy        string                   `json:"strategy"`
+	TimeoutSeconds  int                      `json:"timeout_seconds"`
+	MaxRetries      int                      `json:"max_retries"`
+	Attempts        int                      `json:"attempts"`
+	Recoveries      int                      `json:"recoveries"`
+	Status          JobStatus                `json:"status"`
+	AssignedNode    string                   `json:"assigned_node,omitempty"`
+	AllocatedGPUs   []int                    `json:"allocated_gpus,omitempty"`
+	Output          string                   `json:"output,omitempty"`
+	Error           string                   `json:"error,omitempty"`
+	CreatedAt       time.Time                `json:"created_at"`
+	UpdatedAt       time.Time                `json:"updated_at"`
+	StartedAt       *time.Time               `json:"started_at,omitempty"`
+	FinishedAt      *time.Time               `json:"finished_at,omitempty"`
+	RerunOf         string                   `json:"rerun_of,omitempty"`
+	AssignedSession string                   `json:"-"`
+	AttemptToken    string                   `json:"-"`
+	LeaseExpiresAt  *time.Time               `json:"-"`
+	UsageRecords    []AcceleratorUsageRecord `json:"usage_records,omitempty"`
+}
+
+// AcceleratorUsageRecord is an immutable pricing snapshot for one execution
+// attempt. Enterprise billing persists these records independently of jobs.
+type AcceleratorUsageRecord struct {
+	Attempt          int        `json:"attempt"`
+	NodeID           string     `json:"node_id"`
+	Vendor           string     `json:"vendor"`
+	Runtime          string     `json:"runtime"`
+	Model            string     `json:"model"`
+	DeviceCount      int        `json:"device_count"`
+	UnitPricePerHour float64    `json:"unit_price_per_device_hour"`
+	AssignedAt       time.Time  `json:"assigned_at"`
+	StartedAt        *time.Time `json:"started_at,omitempty"`
+	FinishedAt       *time.Time `json:"finished_at,omitempty"`
+	Status           string     `json:"status"`
 }
 
 type JobCreate struct {

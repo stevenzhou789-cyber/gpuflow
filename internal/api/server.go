@@ -51,6 +51,9 @@ func NewWithStoresAndPublisher(s *store.Store, taskImages store.TaskImageStore, 
 	s.SetSchedulingLimits(descriptor.MaxNodes, descriptor.MaxGPUs, descriptor.ExpiresAt)
 	s.SetNodeHealthPolicy(descriptor.Features[edition.FeatureNodeHealth], 3*time.Minute)
 	s.SetPerGPUInventory(descriptor.Features[edition.FeaturePerGPUInventory])
+	s.SetHeterogeneousAccelerators(descriptor.Features[edition.FeatureHeterogeneousAccelerators])
+	s.SetAcceleratorLimits(descriptor.AcceleratorLimits)
+	s.SetCostAccounting(descriptor.Features[edition.FeatureCostAnalytics])
 	server := &Server{store: s, token: token, mux: http.NewServeMux(), edition: descriptor, images: NewImageBuilderWithPublisher(taskImages, publisher), artifacts: artifacts}
 	server.routes()
 	return server

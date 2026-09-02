@@ -25,24 +25,25 @@ import (
 )
 
 type Config struct {
-	Server, Token, ID, Name, Provider, Pool, Executor, ArtifactDir, ProbeImage, GPUProbe string
-	CPUCores                                                                             int
-	HourlyPrice                                                                          float64
-	PollInterval, HeartbeatInterval, HealthInterval, ArtifactUploadTimeout               time.Duration
-	ProbeCommand                                                                         func(context.Context, string, ...string) ([]byte, error)
-	CleanupCommand                                                                       func(context.Context, string, ...string) ([]byte, error)
-	ExecuteCommand                                                                       func(context.Context, string, ...string) *exec.Cmd
+	Server, Token, ID, Name, Provider, Pool, Executor, ArtifactDir, ProbeImage, GPUProbe, AcceleratorBackend string
+	CPUCores                                                                                                 int
+	HourlyPrice                                                                                              float64
+	PollInterval, HeartbeatInterval, HealthInterval, ArtifactUploadTimeout                                   time.Duration
+	ProbeCommand                                                                                             func(context.Context, string, ...string) ([]byte, error)
+	CleanupCommand                                                                                           func(context.Context, string, ...string) ([]byte, error)
+	ExecuteCommand                                                                                           func(context.Context, string, ...string) *exec.Cmd
 }
 type Agent struct {
-	cfg           Config
-	client        *client.Client
-	session       string
-	baseline      model.Node
-	workerTargets chan int
-	failStop      context.CancelCauseFunc
-	sessionTTL    time.Duration
-	leaseMu       sync.RWMutex
-	leaseDeadline time.Time
+	cfg                Config
+	client             *client.Client
+	session            string
+	baseline           model.Node
+	workerTargets      chan int
+	failStop           context.CancelCauseFunc
+	sessionTTL         time.Duration
+	leaseMu            sync.RWMutex
+	leaseDeadline      time.Time
+	acceleratorBackend string
 }
 
 var (
@@ -96,6 +97,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	if _, ok := descriptor.Features[edition.FeatureBasicScheduler]; !ok {
 		return errors.New("invalid server capabilities: basic_scheduler feature is missing")
+	}
+	if err := a.selectAcceleratorBackend(runCtx, descriptor); err != nil {
+		return err
 	}
 	if descriptor.Features[edition.FeatureNodeHealth] {
 		// The control plane owns the managed Registry reference. Always replace
@@ -366,6 +370,9 @@ func (a *Agent) tick(ctx context.Context) error {
 		// exact session and attempt as RUNNING.
 		return err
 	}
+	if err := a.validateJobAccelerator(&job); err != nil {
+		return a.failStartedJob(ctx, &job, attemptToken, err)
+	}
 	if a.cfg.ArtifactDir != "" {
 		if err := os.MkdirAll(a.cfg.ArtifactDir, 0o755); err != nil {
 			return a.failStartedJob(ctx, &job, attemptToken, fmt.Errorf("create artifact work directory: %w", err))
@@ -630,7 +637,11 @@ func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, ar
 	createArgs = append(createArgs, "--mount", "type=bind,source="+artifactDir+",target=/gpuflow/artifacts", "-e", "GPUFLOW_ARTIFACT_DIR=/gpuflow/artifacts")
 	createArgs = append(createArgs, "-e", "PYTHONUNBUFFERED=1")
 	if job.Requirements.GPUCount > 0 {
-		createArgs = append(createArgs, "--gpus", dockerGPUSelector(job))
+		deviceArgs, err := a.acceleratorDockerArgs(job)
+		if err != nil {
+			return "", err
+		}
+		createArgs = append(createArgs, deviceArgs...)
 	}
 	for k, v := range job.Environment {
 		createArgs = append(createArgs, "-e", k+"="+v)

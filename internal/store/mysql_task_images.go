@@ -15,6 +15,21 @@ type MySQLTaskImageStore struct {
 	db *sql.DB
 }
 
+const mysqlTaskImagesSchema = `CREATE TABLE IF NOT EXISTS task_images (
+  id VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(255) NOT NULL UNIQUE,
+  runtime VARCHAR(64) NOT NULL,
+  base_image VARCHAR(512) NOT NULL,
+  filename VARCHAR(255) NOT NULL,
+  command_text TEXT NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  build_log MEDIUMTEXT NOT NULL,
+  error_message TEXT NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  INDEX idx_task_images_status_created (status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+
 const insertTaskImageSQL = `INSERT INTO task_images
   (id, name, runtime, base_image, filename, command_text, status, build_log, error_message, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -43,24 +58,7 @@ func OpenMySQLTaskImageStore(dsn string) (*MySQLTaskImageStore, error) {
 }
 
 func (s *MySQLTaskImageStore) migrate(ctx context.Context) error {
-	const schema = `CREATE TABLE IF NOT EXISTS task_images (
-  id VARCHAR(64) PRIMARY KEY,
-  name VARCHAR(255) NOT NULL UNIQUE,
-  runtime VARCHAR(64) NOT NULL,
-  base_image VARCHAR(512) NOT NULL,
-  filename VARCHAR(255) NOT NULL,
-  command_text TEXT NOT NULL,
-  status VARCHAR(32) NOT NULL,
-  build_log MEDIUMTEXT NOT NULL,
-  error_message TEXT NOT NULL,
-  created_at DATETIME(6) NOT NULL,
-  updated_at DATETIME(6) NOT NULL,
-  INDEX idx_task_images_status_created (status, created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("migrate task_images: %w", err)
-	}
-	return nil
+	return runCoreMigrations(ctx, s.db)
 }
 
 func (s *MySQLTaskImageStore) SaveTaskImage(image model.TaskImage) error {

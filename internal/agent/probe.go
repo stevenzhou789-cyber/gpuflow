@@ -15,6 +15,9 @@ import (
 var gpuQueryArgs = []string{"--query-gpu=index,uuid,name,memory.total,driver_version", "--format=csv,noheader,nounits"}
 
 func (a *Agent) probeNode(ctx context.Context) (model.Node, error) {
+	if a.acceleratorBackend == "ascend" {
+		return a.probeAscendNode(ctx)
+	}
 	node := model.Node{
 		ID: a.cfg.ID, Name: a.cfg.Name, Provider: a.cfg.Provider, Pool: a.cfg.Pool,
 		GPUModel: "none", CPUCores: a.cfg.CPUCores, HourlyPrice: a.cfg.HourlyPrice,

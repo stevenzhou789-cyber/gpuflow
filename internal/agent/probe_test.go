@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"gpuflow/internal/model"
 )
 
 func TestProbeNodeDiscoversAggregateGPUCapacity(t *testing.T) {
@@ -66,5 +68,34 @@ func TestProbeNodeValidatesContainerRuntime(t *testing.T) {
 	node, err := a.probeNode(context.Background())
 	if err != nil || node.GPUCount != 1 || node.VRAMGB != 22 {
 		t.Fatalf("unexpected container probe: node=%+v err=%v", node, err)
+	}
+}
+
+func TestProbeAscendNodeDiscoversInventory(t *testing.T) {
+	a := New(Config{AcceleratorBackend: "ascend", ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case name == "docker" && strings.HasPrefix(joined, "version"):
+			return []byte("27.1.0"), nil
+		case name == "docker" && strings.HasPrefix(joined, "info"):
+			return []byte(`{"ascend":{"path":"ascend-docker-runtime"},"runc":{"path":"runc"}}`), nil
+		case name == "npu-smi" && joined == "info -m":
+			return []byte("NPU ID Chip ID Chip Logic ID Chip Name\n0 0 0 Ascend 910B\n1 0 1 Ascend 910B\n"), nil
+		case name == "npu-smi" && strings.Contains(joined, "-t memory"):
+			return []byte("Total Capacity(MB) : 65536\n"), nil
+		default:
+			return nil, errors.New("unexpected command: " + name + " " + joined)
+		}
+	}})
+	a.acceleratorBackend = backendAscend
+	node, err := a.probeNode(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.GPUModel != "Ascend 910B" || node.GPUCount != 2 || node.VRAMGB != 64 || len(node.Devices) != 2 {
+		t.Fatalf("unexpected Ascend inventory: %+v", node)
+	}
+	if node.Labels[model.LabelAcceleratorVendor] != model.VendorHuawei || node.Labels[model.LabelAcceleratorRuntime] != model.RuntimeCANN {
+		t.Fatalf("missing Ascend labels: %+v", node.Labels)
 	}
 }

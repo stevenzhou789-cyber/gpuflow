@@ -43,6 +43,25 @@ func TestNodeDetailsRoundTripCleanupPending(t *testing.T) {
 	}
 }
 
+func TestUsageRecordsRoundTripInsideRequirementsJSON(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	job := model.Job{
+		Requirements: model.Requirements{GPUCount: 2, Labels: map[string]string{model.LabelAcceleratorVendor: model.VendorHuawei}},
+		UsageRecords: []model.AcceleratorUsageRecord{{Attempt: 1, NodeID: "ascend", Vendor: model.VendorHuawei, Model: "Ascend 910B", DeviceCount: 2, UnitPricePerHour: 12.5, AssignedAt: now, StartedAt: &now}},
+	}
+	payload, err := encodeJobRequirements(&job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored model.Job
+	if err := decodeJobJSON(&restored, []byte("null"), []byte("null"), payload); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Requirements.GPUCount != 2 || len(restored.UsageRecords) != 1 || restored.UsageRecords[0].UnitPricePerHour != 12.5 || restored.UsageRecords[0].StartedAt == nil {
+		t.Fatalf("usage accounting was not persisted: %s %+v", payload, restored)
+	}
+}
+
 func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	dsn := os.Getenv("GPUFLOW_TEST_MYSQL_DSN")
 	if dsn == "" {
@@ -53,6 +72,13 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.db.Close()
+	var appliedCoreMigrations int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE id LIKE 'core/%'").Scan(&appliedCoreMigrations); err != nil {
+		t.Fatal(err)
+	}
+	if appliedCoreMigrations != len(coreMigrations) {
+		t.Fatalf("unexpected core migration count: got %d want %d", appliedCoreMigrations, len(coreMigrations))
+	}
 
 	nodeInput := model.Node{ID: "mysql-node", Name: "mysql node", Provider: "local", Pool: "default", GPUModel: "RTX 4090", GPUCount: 1, CPUCores: 16, VRAMGB: 24, Labels: map[string]string{"zone": "lab"}}
 	node, err := s.RegisterNode(nodeInput)

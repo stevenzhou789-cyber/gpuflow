@@ -10,7 +10,7 @@ func TestCommunityDeclaresCompleteCapabilityContract(t *testing.T) {
 	if descriptor.SchemaVersion != CapabilitiesSchemaVersion || descriptor.AgentBinary == "" || descriptor.ProbeImage == "" {
 		t.Fatalf("incomplete descriptor: %+v", descriptor)
 	}
-	for _, feature := range []string{FeatureGPUGranularScheduling, FeatureAgentBootstrap, FeatureManagedRegistry, FeaturePerGPUInventory, FeatureNodeHealth} {
+	for _, feature := range []string{FeatureGPUGranularScheduling, FeatureAgentBootstrap, FeatureManagedRegistry, FeaturePerGPUInventory, FeatureNodeHealth, FeatureHeterogeneousAccelerators} {
 		if _, exists := descriptor.Features[feature]; !exists {
 			t.Fatalf("missing capability %q", feature)
 		}
@@ -34,8 +34,9 @@ func TestPublicDescriptorOmitsCommercialLicenseDetails(t *testing.T) {
 	descriptor := Community()
 	descriptor.LicensedTo, descriptor.ExpiresAt = "customer", "2030-01-01T00:00:00+08:00"
 	descriptor.MaxNodes, descriptor.MaxGPUs = 10, 80
+	descriptor.AcceleratorLimits = map[string]AcceleratorLimit{"huawei": {MaxNodes: 2, MaxDevices: 16}}
 	public := descriptor.Public()
-	if public.LicensedTo != "" || public.ExpiresAt != "" || public.MaxNodes != 0 || public.MaxGPUs != 0 || public.ProbeImage != descriptor.ProbeImage || !public.Features[FeatureBasicScheduler] {
+	if public.LicensedTo != "" || public.ExpiresAt != "" || public.MaxNodes != 0 || public.MaxGPUs != 0 || len(public.AcceleratorLimits) != 0 || public.ProbeImage != descriptor.ProbeImage || !public.Features[FeatureBasicScheduler] {
 		t.Fatalf("unsafe public descriptor: %+v", public)
 	}
 }

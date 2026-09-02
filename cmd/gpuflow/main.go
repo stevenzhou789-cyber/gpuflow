@@ -133,6 +133,7 @@ func runAgent(args []string) error {
 	fs.StringVar(&cfg.ArtifactDir, "artifact-dir", env("GPUFLOW_ARTIFACT_WORKDIR", ""), "host-visible artifact work directory")
 	fs.StringVar(&cfg.ProbeImage, "probe-image", env("GPUFLOW_PROBE_IMAGE", ""), "dedicated glibc image used to validate NVIDIA container runtime")
 	fs.StringVar(&cfg.GPUProbe, "gpu-probe", env("GPUFLOW_GPU_PROBE", "auto"), "GPU probe mode: auto, host, or docker")
+	fs.StringVar(&cfg.AcceleratorBackend, "accelerator-backend", env("GPUFLOW_ACCELERATOR_BACKEND", "nvidia"), "accelerator backend: nvidia, ascend, or auto")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

@@ -22,7 +22,12 @@ type Job = {
   updated_at: string;
   created_at: string;
   rerun_of?: string;
-  requirements: { gpu_count: number; min_vram_gb: number; pools?: string[] };
+  requirements: {
+    gpu_count: number;
+    min_vram_gb: number;
+    pools?: string[];
+    labels?: Record<string, string>;
+  };
 };
 type JobPage = { items: Job[]; total: number; page: number; page_size: number; total_pages: number };
 type NodePage = { items: Node[]; total: number; page: number; page_size: number; total_pages: number };
@@ -62,6 +67,7 @@ type Edition = {
   public_url?: string;
   max_nodes?: number;
   max_gpus?: number;
+  accelerator_limits?: Record<string, { max_nodes: number; max_devices: number }>;
   features: Record<string, boolean>;
 };
 
@@ -70,6 +76,16 @@ type Insights = {
   retry_count: number;
   average_runtime_minutes: number;
   recommendation: string;
+  total_device_hours: number;
+  total_cost: number;
+  currency: string;
+  by_accelerator: {
+    vendor: string;
+    model: string;
+    attempts: number;
+    device_hours: number;
+    cost: number;
+  }[];
 };
 
 type TaskImageStatus = "building" | "ready" | "failed";
@@ -382,6 +398,8 @@ function App() {
         <SubmitJob
           nodes={nodes}
           taskImages={taskImages}
+          features={edition.features}
+          acceleratorLimits={edition.accelerator_limits}
           initialImage={submitPreset?.image}
           onClose={() => setShowSubmit(false)}
           onCreated={() => {
@@ -406,6 +424,7 @@ function App() {
         <ConnectNode
           nodes={nodes}
           features={edition.features}
+          acceleratorLimits={edition.accelerator_limits}
           agentBinary={edition.agent_binary || "gpuflow.exe"}
           defaultAgentImage={edition.agent_image || "gpuflow:local"}
           defaultProbeImage={edition.probe_image || "gpuflow-gpu-probe:local"}
@@ -461,9 +480,9 @@ function Overview({
         />
         {edition.features.cost_analytics && (
           <Metric
-            label="平均运行时长"
-            value={`${(insights?.average_runtime_minutes || 0).toFixed(1)}m`}
-            note={insights?.recommendation || "正在生成运行洞察"}
+            label="累计算力成本"
+            value={`¥${(insights?.total_cost || 0).toFixed(2)}`}
+            note={`${(insights?.total_device_hours || 0).toFixed(2)} 卡时 · 冻结执行单价`}
             tone="purple"
           />
         )}
@@ -517,7 +536,22 @@ function Overview({
           )}
         </div>
       </section>
-      <section className="feature-strip">
+      {edition.features.cost_analytics && insights?.by_accelerator?.length ? (
+        <section className="feature-strip">
+          <div>
+            <span className="eyebrow">COMMERCIAL LEDGER</span>
+            <h3>异构算力商业账本</h3>
+            <p>按每次执行冻结厂商、型号、卡数和单价；任务删除后账本仍保留。</p>
+          </div>
+          <div className="feature-tags">
+            {insights.by_accelerator.map((item) => (
+              <span className="enabled" key={`${item.vendor}-${item.model}`}>
+                {item.vendor.toUpperCase()} · {item.model} · {item.device_hours.toFixed(2)} 卡时 · ¥{item.cost.toFixed(2)}
+              </span>
+            ))}
+          </div>
+        </section>
+      ) : <section className="feature-strip">
         <div>
           <span className="eyebrow">NEXT LEVEL</span>
           <h3>从任务队列走向成本自治</h3>
@@ -539,7 +573,7 @@ function Overview({
             审计日志
           </span>
         </div>
-      </section>
+      </section>}
     </>
   );
 }
@@ -1186,6 +1220,7 @@ function PageControls({ page, totalPages, onPage }: { page: number; totalPages: 
 function ConnectNode({
   nodes,
   features,
+  acceleratorLimits,
   agentBinary,
   defaultAgentImage,
   defaultProbeImage,
@@ -1194,6 +1229,7 @@ function ConnectNode({
 }: {
   nodes: Node[];
   features: Record<string, boolean>;
+  acceleratorLimits?: Record<string, { max_nodes: number; max_devices: number }>;
   agentBinary: string;
   defaultAgentImage: string;
   defaultProbeImage: string;
@@ -1202,7 +1238,10 @@ function ConnectNode({
 }) {
   const agentBootstrap = Boolean(features.agent_bootstrap);
   const managedRegistry = Boolean(features.managed_registry);
-  const [mode, setMode] = useState<"windows" | "docker">("windows");
+  const heterogeneousAccelerators = Boolean(features.heterogeneous_accelerators);
+  const licensedNVIDIA = !acceleratorLimits || Boolean(acceleratorLimits.nvidia);
+  const licensedHuawei = !acceleratorLimits || Boolean(acceleratorLimits.huawei);
+  const [mode, setMode] = useState<"windows" | "linux" | "docker">(licensedNVIDIA ? "windows" : "linux");
   const [copied, setCopied] = useState(false);
   const [agentImage, setAgentImage] = useState(defaultAgentImage);
   const [serverURL, setServerURL] = useState(defaultPublicURL);
@@ -1226,6 +1265,7 @@ function ConnectNode({
     name: "local-gpu-01",
     pool: "default",
     price: "0",
+    backend: licensedNVIDIA ? "nvidia" : "ascend",
   });
   const pools = [
     ...new Set([
@@ -1242,9 +1282,17 @@ function ConnectNode({
   const registryLogin = registryCredentials
     ? `printf '%s' '${registryCredentials.password}' | docker login "${registryCredentials.address}" --username "${registryCredentials.username}" --password-stdin\n`
     : "";
-  const windowsCommand = `.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -pool "${values.pool}" -hourly-price ${values.price}`;
+  const backendArgument = heterogeneousAccelerators
+    ? ` -accelerator-backend ${values.backend}`
+    : "";
+  const windowsCommand = `.\\${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -pool "${values.pool}" -hourly-price ${values.price}${backendArgument}`;
+  const linuxCommand = `./${binary} agent -server "${server}" ${agentToken ? `-token "${agentToken}" ` : ""}-id "${values.name}" -name "${values.name}" -pool "${values.pool}" -hourly-price ${values.price}${backendArgument}`;
   const dockerCommand = `${registryLogin}docker run -d --name gpuflow-agent --restart unless-stopped \\\n+  -v /var/run/docker.sock:/var/run/docker.sock \\\n+  -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \\\n+  ${agentImage.trim() || "gpuflow:local"} agent -server "${server}" ${token ? `-token "${token}" ` : ""}-id "${values.name}" -name "${values.name}" \\\n+  -provider local -pool "${values.pool}" -hourly-price ${values.price}`;
-  const command = (mode === "windows" ? windowsCommand : dockerCommand).replace(
+  const command = (mode === "windows"
+    ? windowsCommand
+    : mode === "linux"
+      ? linuxCommand
+      : dockerCommand).replace(
     /\n\+\s*/g,
     "\n  ",
   );
@@ -1323,15 +1371,25 @@ function ConnectNode({
           <button
             className={mode === "windows" ? "active" : ""}
             onClick={() => setMode("windows")}
+            disabled={heterogeneousAccelerators && values.backend === "ascend"}
           >
             Windows Agent
           </button>
           <button
             className={mode === "docker" ? "active" : ""}
             onClick={() => setMode("docker")}
+            disabled={heterogeneousAccelerators && values.backend === "ascend"}
           >
             Linux / Docker
           </button>
+          {heterogeneousAccelerators && (
+            <button
+              className={mode === "linux" ? "active" : ""}
+              onClick={() => setMode("linux")}
+            >
+              Linux 原生 Agent
+            </button>
+          )}
           <button disabled>阿里云 · 即将支持</button>
           <button disabled>腾讯云 · 即将支持</button>
         </div>
@@ -1385,15 +1443,33 @@ function ConnectNode({
               </small>
             </label>
           )}
-          <label className="connection-field">
-            GPU 探针镜像
-            <input value={defaultProbeImage} readOnly />
-            <small>由控制面下发；Agent 登录内置 Registry 后按需拉取，无需节点访问 GHCR。</small>
-          </label>
+          {(!heterogeneousAccelerators || values.backend !== "ascend") && (
+            <label className="connection-field">
+              GPU 探针镜像
+              <input value={defaultProbeImage} readOnly />
+              <small>由控制面下发；Agent 登录内置 Registry 后按需拉取，无需节点访问 GHCR。</small>
+            </label>
+          )}
         </div>
         {agentTokenError && <div className="notice error">{agentTokenError}</div>}
         {registryError && <div className="notice error">{registryError}</div>}
         <div className="form-grid compact">
+          {heterogeneousAccelerators && (
+            <label>
+              加速器类型
+              <select
+                value={values.backend}
+                onChange={(event) => {
+                  update("backend", event.target.value);
+                  if (event.target.value === "ascend") setMode("linux");
+                }}
+              >
+                {licensedNVIDIA && <option value="nvidia">NVIDIA · CUDA</option>}
+                {licensedHuawei && <option value="ascend">华为昇腾 · CANN</option>}
+              </select>
+              <small>昇腾一期使用 Linux 原生 Agent，并通过 Ascend Docker Runtime 执行任务。</small>
+            </label>
+          )}
           <label>
             节点标识（唯一）
             <input
@@ -1444,11 +1520,15 @@ function ConnectNode({
         </div>
         <div className="connect-note">
           <strong>当前接入边界</strong>
-          <p>
-            节点必须已安装 Docker；GPU 容器还需要 NVIDIA 驱动和 NVIDIA Container
-            Toolkit。节点必须能访问控制面及其内置 Registry；Agent 会自动登录并拉取
-            GPU 探针，无需访问 GHCR。Agent 在宿主机执行任务，只应连接可信控制面。
-          </p>
+          {heterogeneousAccelerators && values.backend === "ascend" ? (
+            <p>节点必须安装 Docker、昇腾驱动、CANN、npu-smi 和 Ascend Docker Runtime；一期不支持单节点混装不同厂商或型号。</p>
+          ) : (
+            <p>
+              节点必须已安装 Docker；GPU 容器还需要 NVIDIA 驱动和 NVIDIA Container
+              Toolkit。节点必须能访问控制面及其内置 Registry；Agent 会自动登录并拉取
+              GPU 探针，无需访问 GHCR。Agent 在宿主机执行任务，只应连接可信控制面。
+            </p>
+          )}
         </div>
       </div>
     </div>
@@ -1579,12 +1659,16 @@ function rebuildImageName(name: string, timestamp: string) {
 function SubmitJob({
   nodes,
   taskImages,
+  features,
+  acceleratorLimits,
   initialImage,
   onClose,
   onCreated,
 }: {
   nodes: Node[];
   taskImages: TaskImage[];
+  features: Record<string, boolean>;
+  acceleratorLimits?: Record<string, { max_nodes: number; max_devices: number }>;
   initialImage?: string;
   onClose: () => void;
   onCreated: () => void;
@@ -1598,6 +1682,10 @@ function SubmitJob({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [gpuCount, setGPUCount] = useState("1");
   const [minVRAM, setMinVRAM] = useState("4");
+  const licensedNVIDIA = !acceleratorLimits || Boolean(acceleratorLimits.nvidia);
+  const licensedHuawei = !acceleratorLimits || Boolean(acceleratorLimits.huawei);
+  const [accelerator, setAccelerator] = useState<"nvidia" | "huawei">(licensedNVIDIA ? "nvidia" : "huawei");
+  const heterogeneousAccelerators = Boolean(features.heterogeneous_accelerators);
   const pools = [...new Set(nodes.map((node) => node.pool))];
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1622,6 +1710,14 @@ function SubmitJob({
             gpu_count: Number(values.get("gpu_count")),
             min_vram_gb: Number(values.get("vram")),
             pools: pool ? [pool] : [],
+            ...(heterogeneousAccelerators && Number(values.get("gpu_count")) > 0
+              ? {
+                  labels: {
+                    "accelerator.vendor": accelerator,
+                    "accelerator.runtime": accelerator === "huawei" ? "cann" : "cuda",
+                  },
+                }
+              : {}),
           },
           strategy: values.get("strategy"),
           timeout_seconds: Number(values.get("timeout")),
@@ -1693,6 +1789,19 @@ function SubmitJob({
             <span>02</span>
             <strong>资源要求</strong>
           </div>
+          {heterogeneousAccelerators && (
+            <label>
+              加速器环境
+              <select
+                value={accelerator}
+                disabled={gpuCount === "0"}
+                onChange={(event) => setAccelerator(event.target.value as "nvidia" | "huawei")}
+              >
+                {licensedNVIDIA && <option value="nvidia">NVIDIA · CUDA</option>}
+                {licensedHuawei && <option value="huawei">华为昇腾 · CANN</option>}
+              </select>
+            </label>
+          )}
           <label>
             GPU数量
             <select
