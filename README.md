@@ -65,7 +65,7 @@ Copy-Item .env.example .env
 docker compose up --build -d
 ```
 
-Compose 会把当前源码构建为 `gpuflow:local`，供控制端和同一 Docker 主机上的容器 Agent 共用。默认只启动 GPUFlow 控制面、MySQL 和 MinIO，不会自动启动或注册算力节点，也不会自动提交任务。打开 [http://localhost:18080](http://localhost:18080)，使用 `.env` 中的 `GPUFLOW_TOKEN` 登录。
+Compose 会把当前源码构建为 `gpuflow:local`。控制面默认下发固定 Digest 的 Debian/glibc Probe 镜像，在线计算节点按需自动拉取，不需要重复配置镜像地址。默认只启动 GPUFlow 控制面、MySQL 和 MinIO，不会自动启动或注册算力节点，也不会自动提交任务。打开 [http://localhost:18080](http://localhost:18080)，使用 `.env` 中的 `GPUFLOW_TOKEN` 登录。
 
 确认三个服务正常：
 
@@ -308,27 +308,20 @@ docker build -t gpuflow:local .
 Agent 需要访问宿主机 Docker，因此容器启动时通常要挂载 Docker Socket：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow-gpu-probe:stable
 docker run -d \
   --name gpuflow-agent \
   --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts \
   -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \
-  -e GPUFLOW_GPU_PROBE=auto \
-  -e GPUFLOW_PROBE_IMAGE=ghcr.io/stevenzhou789-cyber/gpuflow-gpu-probe:stable \
   ghcr.io/stevenzhou789-cyber/gpuflow:stable agent \
   -server "http://control-plane.example.com:8080" \
   -token "replace-with-your-token" \
   -id "lab-gpu-01" \
-  -name "lab-gpu-01" \
-  -provider local \
-  -pool default \
-  -hourly-price 0 \
-  -executor docker
+  -name "lab-gpu-01"
 ```
 
-`GPUFLOW_GPU_PROBE=auto` 在 Windows/Linux 原生 Agent 中先读取宿主机 `nvidia-smi`，再用独立探针镜像验证 Docker GPU；容器 Agent 无法直接读取宿主机命令时会通过 Docker Socket 使用同一探针镜像完成发现。探针镜像必须基于 glibc，不能复用 Alpine Agent 镜像。探测或 Docker Runtime 暂时失败时，Agent 仍会以 `DEGRADED` 注册并周期重试，不会在注册前退出；同一节点 DEGRADED 重连时控制面会保留最后一次已知 GPU 清单，恢复后自动转为 `HEALTHY`。
+Agent 自动采用控制面下发的独立 glibc Probe 镜像：Windows/Linux 原生 Agent 先读取宿主机 `nvidia-smi`，容器 Agent 无法读取宿主机命令时会通过 Docker Socket 自动拉取并运行 Probe。探测或 Docker Runtime 暂时失败时，Agent 仍会以 `DEGRADED` 注册并周期重试，不会在注册前退出；同一节点 DEGRADED 重连时控制面会保留最后一次已知 GPU 清单，恢复后自动转为 `HEALTHY`。
 
 正式节点应使用明确的 `v*` 版本、`sha-*` 镜像或 Digest；与控制端共用 Docker 的本地开发节点可以使用 Compose 自动构建的 `gpuflow:local`。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
 
@@ -434,13 +427,13 @@ docker compose up --build -d
 | `GPUFLOW_TOKEN` | 与控制面一致的 Token |
 | `GPUFLOW_NODE_ID` | 稳定且唯一的节点标识 |
 | `GPUFLOW_NODE_NAME` | 节点显示名称 |
-| `GPUFLOW_PROVIDER` | 提供方，当前使用 `local` |
-| `GPUFLOW_POOL` | 资源池名称 |
-| `GPUFLOW_GPU_PROBE` | GPU 探测模式：`auto`、`host` 或 `docker`；默认 `auto` |
-| `GPUFLOW_PROBE_IMAGE` | 独立的 glibc GPU 探针镜像，用于 Windows、Linux 和容器 Agent 验证 NVIDIA Runtime；不能使用 Alpine Agent 镜像 |
+| `GPUFLOW_PROVIDER` | 可选高级配置；默认 `local` |
+| `GPUFLOW_POOL` | 可选业务配置；默认 `default` |
+| `GPUFLOW_GPU_PROBE` | 可选排障覆盖；默认自动探测 |
+| `GPUFLOW_PROBE_IMAGE` | 可选排障覆盖；正常由控制面下发 |
 | `GPUFLOW_CPU_CORES` | 可选；节点逻辑 CPU 核数，默认自动读取 Agent 进程可见的 CPU 数量 |
-| `GPUFLOW_HOURLY_PRICE` | 调度参考单价（人民币元/GPU/小时） |
-| `GPUFLOW_EXECUTOR` | `docker` 或 `mock` |
+| `GPUFLOW_HOURLY_PRICE` | 可选业务配置；默认 `0` |
+| `GPUFLOW_EXECUTOR` | 可选开发配置；生产默认 `docker` |
 | `GPUFLOW_ARTIFACT_WORKDIR` | 可选；容器化 Agent 必须设置为宿主机与 Agent 容器共享的同路径目录 |
 
 命令行参数会覆盖对应的环境变量。Agent 启动时自动识别 GPU 型号、数量和单卡显存汇总信息，并自动上报逻辑 CPU 核数；仅当容器 CPU 限额或宿主机探测结果不符合交付口径时，才使用 `-cpu-cores` 或 `GPUFLOW_CPU_CORES` 显式覆盖。

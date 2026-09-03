@@ -78,9 +78,15 @@ func (a *Agent) probeNode(ctx context.Context) (model.Node, error) {
 	}
 	{
 		// Enterprise Agents authenticate to the control-plane Registry before
-		// entering the shared Agent runtime. Pull only when the exact image is
-		// missing locally so an offline node never needs an external registry.
-		args := []string{"run", "--rm", "--pull", "missing", "--gpus", "all", "--entrypoint", "nvidia-smi", image}
+		// entering this shared runtime; Community receives an immutable public
+		// image reference. Pull only when missing so preloaded offline nodes stay
+		// independent of an external Registry.
+		args := []string{
+			"run", "--rm", "--pull", "missing", "--gpus", "all",
+			"-e", "NVIDIA_VISIBLE_DEVICES=all",
+			"-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+			"--entrypoint", "nvidia-smi", image,
+		}
 		output, err := run(ctx, "docker", append(args, gpuQueryArgs...)...)
 		if err != nil {
 			if hostInventory {

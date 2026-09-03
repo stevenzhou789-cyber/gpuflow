@@ -20,5 +20,6 @@ The default Debian base is pinned to a multi-architecture Digest. Commercial
 release pipelines must keep the override immutable as well and scan the final
 Probe image before signing it.
 
-The image must be pulled or loaded on every Docker node before the Agent starts;
-runtime probes intentionally use `docker run --pull never`.
+The control plane advertises the configured image to every Agent. Online Docker
+nodes pull it automatically when missing; air-gapped nodes must preload the same
+immutable image before the Agent starts.

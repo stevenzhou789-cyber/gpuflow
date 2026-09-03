@@ -12,9 +12,7 @@ services:
       GPUFLOW_CPU_CORES: ${GPUFLOW_CPU_CORES:-}
       GPUFLOW_HOURLY_PRICE: ${GPUFLOW_HOURLY_PRICE:-0}
       GPUFLOW_EXECUTOR: docker
-      GPUFLOW_GPU_PROBE: ${GPUFLOW_GPU_PROBE:-auto}
       GPUFLOW_ARTIFACT_WORKDIR: /var/lib/gpuflow/artifacts
-      GPUFLOW_PROBE_IMAGE: ${GPUFLOW_PROBE_IMAGE:?set GPUFLOW_PROBE_IMAGE in .env}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts

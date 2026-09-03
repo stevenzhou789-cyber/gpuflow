@@ -6,7 +6,7 @@ services:
     environment:
       GPUFLOW_TOKEN: ${GPUFLOW_TOKEN:-development-token}
       GPUFLOW_AGENT_IMAGE: ${GPUFLOW_AGENT_IMAGE:-gpuflow:local}
-      GPUFLOW_PROBE_IMAGE: ${GPUFLOW_PROBE_IMAGE:-gpuflow-gpu-probe:local}
+      GPUFLOW_PROBE_IMAGE: ${GPUFLOW_PROBE_IMAGE:-debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171}
       GPUFLOW_PUBLIC_URL: ${GPUFLOW_PUBLIC_URL:-}
       GPUFLOW_MYSQL_DSN: "gpuflow:${GPUFLOW_MYSQL_PASSWORD:-development-password}@tcp(mysql:3306)/gpuflow?parseTime=true&charset=utf8mb4"
       GPUFLOW_S3_ENDPOINT: minio:9000

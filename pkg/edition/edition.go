@@ -97,7 +97,7 @@ func Community() Descriptor {
 		SchemaVersion: CapabilitiesSchemaVersion,
 		Name:          "community",
 		AgentImage:    "gpuflow:local",
-		ProbeImage:    "gpuflow-gpu-probe:local",
+		ProbeImage:    "debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
 		AgentBinary:   "gpuflow.exe",
 		Features: map[string]bool{
 			FeatureBasicScheduler:            true,

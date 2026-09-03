@@ -1,6 +1,7 @@
 package edition
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -9,6 +10,9 @@ func TestCommunityDeclaresCompleteCapabilityContract(t *testing.T) {
 	descriptor := Community()
 	if descriptor.SchemaVersion != CapabilitiesSchemaVersion || descriptor.AgentBinary == "" || descriptor.ProbeImage == "" {
 		t.Fatalf("incomplete descriptor: %+v", descriptor)
+	}
+	if !strings.Contains(descriptor.ProbeImage, "@sha256:") {
+		t.Fatalf("Community probe image must be remotely pullable and immutable: %q", descriptor.ProbeImage)
 	}
 	for _, feature := range []string{FeatureGPUGranularScheduling, FeatureAgentBootstrap, FeatureManagedRegistry, FeaturePerGPUInventory, FeatureNodeHealth, FeatureHeterogeneousAccelerators} {
 		if _, exists := descriptor.Features[feature]; !exists {

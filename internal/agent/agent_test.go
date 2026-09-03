@@ -123,6 +123,65 @@ func TestAscendBackendRequiresEnterpriseCapability(t *testing.T) {
 	}
 }
 
+func TestAutomaticAcceleratorBackendSelectsDetectedVendor(t *testing.T) {
+	descriptor := edition.Community()
+	descriptor.Features[edition.FeatureHeterogeneousAccelerators] = true
+	tests := []struct {
+		name        string
+		probe       func(context.Context, string, ...string) ([]byte, error)
+		wantBackend string
+	}{
+		{
+			name: "ascend",
+			probe: func(_ context.Context, command string, _ ...string) ([]byte, error) {
+				if command == "npu-smi" {
+					return []byte("0 0 0 Ascend 910B"), nil
+				}
+				return nil, errors.New("nvidia-smi unavailable")
+			},
+			wantBackend: backendAscend,
+		},
+		{
+			name: "nvidia",
+			probe: func(_ context.Context, command string, _ ...string) ([]byte, error) {
+				if command == "nvidia-smi" {
+					return []byte("0, GPU-test, NVIDIA H100, 81920, 550.54"), nil
+				}
+				return nil, errors.New("npu-smi unavailable")
+			},
+			wantBackend: backendNVIDIA,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a := New(Config{AcceleratorBackend: "auto", ProbeCommand: test.probe})
+			if err := a.selectAcceleratorBackend(context.Background(), descriptor); err != nil {
+				t.Fatal(err)
+			}
+			if a.acceleratorBackend != test.wantBackend {
+				t.Fatalf("automatic backend mismatch: got %q want %q", a.acceleratorBackend, test.wantBackend)
+			}
+		})
+	}
+}
+
+func TestAutomaticAcceleratorBackendRejectsMixedVendorNode(t *testing.T) {
+	descriptor := edition.Community()
+	descriptor.Features[edition.FeatureHeterogeneousAccelerators] = true
+	a := New(Config{
+		AcceleratorBackend: "auto",
+		ProbeCommand: func(_ context.Context, command string, _ ...string) ([]byte, error) {
+			if command == "npu-smi" {
+				return []byte("0 0 0 Ascend 910B"), nil
+			}
+			return []byte("0, GPU-test, NVIDIA H100, 81920, 550.54"), nil
+		},
+	})
+	if err := a.selectAcceleratorBackend(context.Background(), descriptor); err == nil {
+		t.Fatal("automatic backend accepted a mixed-vendor node")
+	}
+}
+
 func TestJobContainerNameIsAttemptScoped(t *testing.T) {
 	if got := jobContainerName("job-123", 2); got != "gpuflow-job-job-123-2" {
 		t.Fatalf("unexpected attempt container name %q", got)
@@ -703,6 +762,46 @@ func TestRunUsesDedicatedCapabilityProbeImageAndSession(t *testing.T) {
 	}
 	if invalidHeaders.Load() != 0 {
 		t.Fatalf("invalid agent session headers: %d", invalidHeaders.Load())
+	}
+}
+
+func TestConfigureProbeImageUsesCapabilityDefault(t *testing.T) {
+	descriptor := edition.Community()
+	descriptor.ProbeImage = "  registry.example.com/gpuflow/probe:v1  "
+	agent := New(Config{})
+
+	if err := agent.configureProbeImage(descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := agent.cfg.ProbeImage, "registry.example.com/gpuflow/probe:v1"; got != want {
+		t.Fatalf("unexpected probe image: got %q want %q", got, want)
+	}
+}
+
+func TestConfigureProbeImagePreservesExplicitLocalValue(t *testing.T) {
+	descriptor := edition.Community()
+	descriptor.ProbeImage = "registry.example.com/gpuflow/server-probe:v1"
+	agent := New(Config{ProbeImage: "registry.example.com/gpuflow/local-probe:v1"})
+
+	if err := agent.configureProbeImage(descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := agent.cfg.ProbeImage, "registry.example.com/gpuflow/local-probe:v1"; got != want {
+		t.Fatalf("explicit probe image was replaced: got %q want %q", got, want)
+	}
+}
+
+func TestConfigureProbeImageNodeHealthForcesCapabilityValue(t *testing.T) {
+	descriptor := edition.Community()
+	descriptor.Features[edition.FeatureNodeHealth] = true
+	descriptor.ProbeImage = "  registry.example.com/gpuflow/managed-probe:v1  "
+	agent := New(Config{ProbeImage: "registry.example.com/gpuflow/obsolete-probe:v0"})
+
+	if err := agent.configureProbeImage(descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := agent.cfg.ProbeImage, "registry.example.com/gpuflow/managed-probe:v1"; got != want {
+		t.Fatalf("managed probe image was not enforced: got %q want %q", got, want)
 	}
 }
 

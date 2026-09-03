@@ -92,10 +92,9 @@ cd /opt/gpuflow-agent
 mv .env.example .env
 ```
 
-编辑 `.env` 中相互独立的 Agent 镜像与 glibc GPU 探针镜像、控制面地址、Token 和唯一节点 ID。先拉取或离线导入 `GPUFLOW_PROBE_IMAGE`（运行时探测使用 `--pull never`），然后启动。Agent 会在启动时自动识别 GPU 型号、数量和显存汇总信息，并自动上报进程可见的逻辑 CPU 核数；仅在容器 CPU 限额或探测结果不准确时设置 `GPUFLOW_CPU_CORES`：
+编辑 `.env` 中的 Agent 镜像、控制面地址、Token 和唯一节点 ID。Agent 会自动采用控制面下发的 Probe 镜像，不需要在节点重复配置镜像地址；在线节点需能拉取该镜像，离线节点需提前导入交付镜像。Agent 会自动识别 GPU 型号、数量和显存汇总信息，并自动上报进程可见的逻辑 CPU 核数；仅在容器 CPU 限额或探测结果不准确时设置 `GPUFLOW_CPU_CORES`：
 
 ```bash
-docker pull "$(grep '^GPUFLOW_PROBE_IMAGE=' .env | cut -d= -f2-)"
 docker compose up -d
 docker compose ps
 ```

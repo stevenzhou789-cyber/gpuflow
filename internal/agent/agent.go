@@ -101,14 +101,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.selectAcceleratorBackend(runCtx, descriptor); err != nil {
 		return err
 	}
-	if descriptor.Features[edition.FeatureNodeHealth] {
-		// The control plane owns the managed Registry reference. Always replace
-		// a stale node-side value so upgrades cannot keep pulling an old external
-		// Probe image supplied by a previous release.
-		a.cfg.ProbeImage = strings.TrimSpace(descriptor.ProbeImage)
-		if a.cfg.ProbeImage == "" {
-			return errors.New("server enables node health but does not provide a dedicated GPU probe image")
-		}
+	if err := a.configureProbeImage(descriptor); err != nil {
+		return err
 	}
 
 	n, probeErr := a.probeNode(runCtx)
@@ -192,6 +186,24 @@ func (a *Agent) Run(ctx context.Context) error {
 		return ctx.Err()
 	}
 	return context.Cause(runCtx)
+}
+
+func (a *Agent) configureProbeImage(descriptor edition.Descriptor) error {
+	serverProbeImage := strings.TrimSpace(descriptor.ProbeImage)
+	if descriptor.Features[edition.FeatureNodeHealth] {
+		// The control plane owns the managed Registry reference. Always replace
+		// a stale node-side value so upgrades cannot keep pulling an old external
+		// Probe image supplied by a previous release.
+		a.cfg.ProbeImage = serverProbeImage
+		if a.cfg.ProbeImage == "" {
+			return errors.New("server enables node health but does not provide a dedicated GPU probe image")
+		}
+		return nil
+	}
+	if strings.TrimSpace(a.cfg.ProbeImage) == "" {
+		a.cfg.ProbeImage = serverProbeImage
+	}
+	return nil
 }
 
 func (a *Agent) workerSupervisor(ctx context.Context, initial int) {
