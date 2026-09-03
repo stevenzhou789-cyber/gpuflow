@@ -683,6 +683,24 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover, requi
 	if in.HealthStatus == "" {
 		in.HealthStatus = "HEALTHY"
 	}
+	existing := s.state.Nodes[in.ID]
+	// A returning Agent can temporarily lose all inventory when Docker,
+	// the probe image, or the accelerator runtime is unavailable. Keep the last
+	// known capacity and accelerator identity while the node is explicitly
+	// DEGRADED so recovery is not mistaken for new licensed capacity.
+	if existing != nil && s.nodeHealthEnabled && strings.EqualFold(in.HealthStatus, "DEGRADED") && in.GPUCount == 0 && existing.GPUCount > 0 {
+		in.GPUModel, in.GPUCount, in.VRAMGB = existing.GPUModel, existing.GPUCount, existing.VRAMGB
+		in.Devices = append([]model.GPUDevice(nil), existing.Devices...)
+		in.DriverVersion = existing.DriverVersion
+		if in.Labels == nil {
+			in.Labels = map[string]string{}
+		}
+		for _, key := range []string{model.LabelAcceleratorVendor, model.LabelAcceleratorRuntime} {
+			if strings.TrimSpace(in.Labels[key]) == "" {
+				in.Labels[key] = existing.Labels[key]
+			}
+		}
+	}
 	if s.heterogeneousAccelerators && in.GPUCount > 0 {
 		if err := normalizeAcceleratorNode(&in); err != nil {
 			return nil, err
@@ -695,18 +713,8 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover, requi
 		}
 		in.HealthStatus, in.LastHealthCheck = status, &now
 	}
-	existing := s.state.Nodes[in.ID]
 	if existing != nil && existing.SessionEpoch != "" && existing.SessionEpoch != session && !forceTakeover && now.Sub(existing.LastHeartbeat) <= agentSessionActiveFor {
 		return nil, ErrAgentSessionActive
-	}
-	// A returning Docker Agent can temporarily lose all inventory when Docker,
-	// the probe image, or the NVIDIA runtime is unavailable. Keep the last known
-	// GPU capacity while the node is explicitly DEGRADED so recovery is not
-	// mistaken for new licensed capacity. Health fencing still prevents dispatch.
-	if existing != nil && s.nodeHealthEnabled && strings.EqualFold(in.HealthStatus, "DEGRADED") && in.GPUCount == 0 && existing.GPUCount > 0 {
-		in.GPUModel, in.GPUCount, in.VRAMGB = existing.GPUModel, existing.GPUCount, existing.VRAMGB
-		in.Devices = append([]model.GPUDevice(nil), existing.Devices...)
-		in.DriverVersion = existing.DriverVersion
 	}
 	if err := s.validateAndAdmitNodeLocked(in, existing); err != nil {
 		return nil, err
@@ -1015,15 +1023,23 @@ func (s *Store) updateNodeHealthLocked(node *model.Node, session string, update 
 		return nil, fmt.Errorf("%w: node resource counts cannot be negative", ErrInvalidResources)
 	}
 	inventoryChanged := status == "HEALTHY" && !sameInventory(node, update)
+	var healthyLabels map[string]string
 	if status == "HEALTHY" {
 		candidate := *node
 		candidate.Devices = append([]model.GPUDevice(nil), update.Devices...)
+		candidate.Labels = cloneStringMap(node.Labels)
 		candidate.GPUModel, candidate.GPUCount, candidate.VRAMGB = update.GPUModel, update.GPUCount, update.VRAMGB
 		candidate.DriverVersion, candidate.DockerVersion = update.DriverVersion, update.DockerVersion
 		candidate.HealthStatus = status
+		if s.heterogeneousAccelerators && candidate.GPUCount > 0 {
+			if err := normalizeAcceleratorNode(&candidate); err != nil {
+				return nil, err
+			}
+		}
 		if err := s.validateAndAdmitNodeLocked(candidate, node); err != nil {
 			return nil, err
 		}
+		healthyLabels = cloneStringMap(candidate.Labels)
 	}
 	before := cloneSnapshot(s.state)
 	now := time.Now().UTC()
@@ -1032,6 +1048,7 @@ func (s *Store) updateNodeHealthLocked(node *model.Node, session string, update 
 		node.Devices = append([]model.GPUDevice(nil), update.Devices...)
 		node.GPUModel, node.GPUCount, node.VRAMGB = update.GPUModel, update.GPUCount, update.VRAMGB
 		node.DriverVersion, node.DockerVersion = update.DriverVersion, update.DockerVersion
+		node.Labels = healthyLabels
 	}
 	if status == "DEGRADED" || inventoryChanged {
 		s.requeueAssignedJobsLocked(node.ID, now)

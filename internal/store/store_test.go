@@ -857,8 +857,44 @@ func TestDegradedNodeStopsAndRecoversScheduling(t *testing.T) {
 	}
 }
 
+func TestHeterogeneousNVIDIAInventoryRecoveryRestoresSchedulingIdentity(t *testing.T) {
+	s := NewMemory()
+	s.SetHeterogeneousAccelerators(true)
+	s.SetNodeHealthPolicy(true, 3*time.Minute)
+	s.SetPerGPUInventory(true)
+	node, err := s.RegisterNodeSession(model.Node{
+		ID: "nvidia-recovery", GPUModel: "none", HealthStatus: "DEGRADED", HealthReason: "Docker is unavailable",
+	}, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmAgentSession(t, s, node.ID, "session")
+	recovered, err := s.UpdateNodeHealthSession(node.ID, "session", model.NodeHealthUpdate{
+		Status: "HEALTHY", GPUModel: "NVIDIA L4", GPUCount: 1, VRAMGB: 24,
+		Devices: []model.GPUDevice{{Index: 0, UUID: "GPU-a", Model: "NVIDIA L4", VRAMGB: 24}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Labels[model.LabelAcceleratorVendor] != model.VendorNVIDIA || recovered.Labels[model.LabelAcceleratorRuntime] != model.RuntimeCUDA {
+		t.Fatalf("recovered NVIDIA identity was not normalized: %+v", recovered.Labels)
+	}
+	job, err := s.CreateJob(model.JobCreate{Name: "cuda-after-recovery", Image: "cuda", Requirements: model.Requirements{GPUCount: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	job, _ = s.GetJob(job.ID)
+	if job.AssignedNode != node.ID {
+		t.Fatalf("recovered NVIDIA node did not receive CUDA work: %+v", job)
+	}
+}
+
 func TestDegradedReconnectPreservesLastKnownGPUInventory(t *testing.T) {
 	s := NewMemory()
+	s.SetHeterogeneousAccelerators(true)
 	s.SetNodeHealthPolicy(true, 3*time.Minute)
 	s.SetPerGPUInventory(true)
 	node, err := s.RegisterNodeSession(model.Node{
@@ -879,6 +915,9 @@ func TestDegradedReconnectPreservesLastKnownGPUInventory(t *testing.T) {
 	}
 	if reconnected.GPUCount != 1 || reconnected.GPUModel != "NVIDIA L4" || len(reconnected.Devices) != 1 || reconnected.HealthStatus != "DEGRADED" {
 		t.Fatalf("degraded reconnect lost known inventory: %+v", reconnected)
+	}
+	if reconnected.Labels[model.LabelAcceleratorVendor] != model.VendorNVIDIA || reconnected.Labels[model.LabelAcceleratorRuntime] != model.RuntimeCUDA {
+		t.Fatalf("degraded reconnect lost accelerator identity: %+v", reconnected.Labels)
 	}
 }
 
