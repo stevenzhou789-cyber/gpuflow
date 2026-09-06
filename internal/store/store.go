@@ -99,8 +99,10 @@ type Store struct {
 	perGPUInventoryEnabled    bool
 	heterogeneousAccelerators bool
 	projectFairScheduling     bool
+	schedulingObservability   bool
 	acceleratorLimits         map[string]edition.AcceleratorLimit
 	costAccounting            bool
+	memorySchedulingDecisions []model.SchedulingDecision
 }
 
 type TaskImageStore interface {
@@ -192,6 +194,12 @@ func (s *Store) SetProjectFairScheduling(enabled bool) {
 	s.projectFairScheduling = enabled
 }
 
+func (s *Store) SetSchedulingObservability(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.schedulingObservability = enabled
+}
+
 func (s *Store) SetAcceleratorLimits(limits map[string]edition.AcceleratorLimit) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -264,10 +272,17 @@ func (s *Store) DeleteTaskImage(id string) error {
 }
 
 func (s *Store) commitLocked(before snapshot) error {
+	return s.commitWithSchedulingDecisionsLocked(before, nil)
+}
+
+func (s *Store) commitWithSchedulingDecisionsLocked(before snapshot, decisions []model.SchedulingDecision) error {
 	if s.db == nil {
+		for _, decision := range decisions {
+			s.memorySchedulingDecisions = append(s.memorySchedulingDecisions, cloneSchedulingDecision(decision))
+		}
 		return nil
 	}
-	err := s.saveMySQLChangesLocked(before)
+	err := s.saveMySQLChangesLocked(before, decisions)
 	if err != nil {
 		s.state = before
 		if errors.Is(err, ErrPersistence) {
@@ -1895,16 +1910,23 @@ func (s *Store) nodeHasCapacityForJobLocked(job *model.Job, node *model.Node) bo
 }
 
 func (s *Store) bestNodeForJobLocked(job *model.Job, licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration) *model.Node {
+	best, _ := s.bestNodeAndCountForJobLocked(job, licensedNodes, now, offlineAfter)
+	return best
+}
+
+func (s *Store) bestNodeAndCountForJobLocked(job *model.Job, licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration) (*model.Node, int) {
 	var best *model.Node
+	eligible := 0
 	for _, node := range s.state.Nodes {
 		if !licensedNodes[node.ID] || !s.nodeHasCapacityForJobLocked(job, node) || !s.eligibleLocked(job, node, now, offlineAfter) {
 			continue
 		}
+		eligible++
 		if betterNode(job.Strategy, node, best) {
 			best = node
 		}
 	}
-	return best
+	return best, eligible
 }
 
 func (s *Store) assignJobLocked(job *model.Job, node *model.Node, now time.Time) {
@@ -1920,7 +1942,7 @@ func (s *Store) assignJobLocked(job *model.Job, node *model.Node, now time.Time)
 	s.refreshNodeUsageLocked(node.ID)
 }
 
-func (s *Store) scheduleFIFOLocked(licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration) bool {
+func (s *Store) scheduleFIFOLocked(licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration, decisions *[]model.SchedulingDecision) bool {
 	jobs := make([]*model.Job, 0)
 	for _, job := range s.state.Jobs {
 		if job.Status == model.JobQueued {
@@ -1936,20 +1958,30 @@ func (s *Store) scheduleFIFOLocked(licensedNodes map[string]bool, now time.Time,
 		if err := s.ensureProjectCanScheduleLocked(job); err != nil {
 			continue
 		}
-		best := s.bestNodeForJobLocked(job, licensedNodes, now, offlineAfter)
+		best, eligibleNodeCount := s.bestNodeAndCountForJobLocked(job, licensedNodes, now, offlineAfter)
 		if best == nil {
 			continue
 		}
+		project := s.state.Projects[projectIDOf(job)]
+		vruntime := int64(0)
+		if project != nil {
+			vruntime = project.SchedulerVRuntime
+		}
 		s.assignJobLocked(job, best, now)
+		if s.schedulingObservability {
+			*decisions = append(*decisions, s.newSchedulingDecisionLocked(job, project, best, now, SchedulingAlgorithmFIFO, SchedulingReasonFIFOSelected, vruntime, vruntime, 0, eligibleNodeCount, 0))
+		}
 		changed = true
 	}
 	return changed
 }
 
 type fairScheduleCandidate struct {
-	project *model.Project
-	job     *model.Job
-	node    *model.Node
+	project              *model.Project
+	job                  *model.Job
+	node                 *model.Node
+	eligibleNodeCount    int
+	runnableProjectCount int
 }
 
 func fairJobBefore(a, b *model.Job) bool {
@@ -1994,7 +2026,7 @@ func (s *Store) nextFairCandidateLocked(licensedNodes map[string]bool, now time.
 		if job.Status != model.JobQueued || s.ensureProjectCanScheduleLocked(job) != nil {
 			continue
 		}
-		node := s.bestNodeForJobLocked(job, licensedNodes, now, offlineAfter)
+		node, eligibleNodeCount := s.bestNodeAndCountForJobLocked(job, licensedNodes, now, offlineAfter)
 		if node == nil {
 			continue
 		}
@@ -2005,7 +2037,7 @@ func (s *Store) nextFairCandidateLocked(licensedNodes map[string]bool, now time.
 		}
 		current := byProject[projectID]
 		if current == nil || fairJobBefore(job, current.job) {
-			byProject[projectID] = &fairScheduleCandidate{project: project, job: job, node: node}
+			byProject[projectID] = &fairScheduleCandidate{project: project, job: job, node: node, eligibleNodeCount: eligibleNodeCount}
 		}
 	}
 	var selected *fairScheduleCandidate
@@ -2014,18 +2046,26 @@ func (s *Store) nextFairCandidateLocked(licensedNodes map[string]bool, now time.
 			selected = candidate
 		}
 	}
+	if selected != nil {
+		selected.runnableProjectCount = len(byProject)
+	}
 	return selected
 }
 
-func (s *Store) scheduleFairLocked(licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration) bool {
+func (s *Store) scheduleFairLocked(licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration, decisions *[]model.SchedulingDecision) bool {
 	changed := false
 	for {
 		candidate := s.nextFairCandidateLocked(licensedNodes, now, offlineAfter)
 		if candidate == nil {
 			return changed
 		}
+		vruntimeBefore := candidate.project.SchedulerVRuntime
 		s.assignJobLocked(candidate.job, candidate.node, now)
-		candidate.project.SchedulerVRuntime += fairStrideDelta(candidate.job, candidate.project)
+		strideDelta := fairStrideDelta(candidate.job, candidate.project)
+		candidate.project.SchedulerVRuntime += strideDelta
+		if s.schedulingObservability {
+			*decisions = append(*decisions, s.newSchedulingDecisionLocked(candidate.job, candidate.project, candidate.node, now, SchedulingAlgorithmWeightedFair, SchedulingReasonWeightedFairSelected, vruntimeBefore, candidate.project.SchedulerVRuntime, strideDelta, candidate.eligibleNodeCount, candidate.runnableProjectCount))
+		}
 		changed = true
 	}
 }
@@ -2035,15 +2075,16 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
 	before := cloneSnapshot(s.state)
+	decisions := make([]model.SchedulingDecision, 0)
 	changed := s.reconcileOfflineJobsLocked(now, offlineAfter)
 	licensedNodes := s.licensedNodeSetLocked(now)
 	if s.projectFairScheduling {
-		changed = s.scheduleFairLocked(licensedNodes, now, offlineAfter) || changed
+		changed = s.scheduleFairLocked(licensedNodes, now, offlineAfter, &decisions) || changed
 	} else {
-		changed = s.scheduleFIFOLocked(licensedNodes, now, offlineAfter) || changed
+		changed = s.scheduleFIFOLocked(licensedNodes, now, offlineAfter, &decisions) || changed
 	}
 	if changed {
-		if err := s.commitLocked(before); err != nil {
+		if err := s.commitWithSchedulingDecisionsLocked(before, decisions); err != nil {
 			return err
 		}
 	}

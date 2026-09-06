@@ -88,6 +88,35 @@ func TestRuntimeProvidesProjectController(t *testing.T) {
 	}
 }
 
+func TestRuntimeProvidesSchedulingObserver(t *testing.T) {
+	state := store.NewMemory()
+	state.SetSchedulingObservability(true)
+	state.SetProjectFairScheduling(true)
+	runtime := &Runtime{handler: http.NotFoundHandler(), state: state}
+	var observer SchedulingObserver = runtime
+	if _, err := state.CreateProject(model.ProjectCreate{ID: "alpha", Name: "Alpha", Weight: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.RegisterNode(model.Node{ID: "worker", GPUCount: 1, VRAMGB: 24}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := state.CreateJobForProject("alpha", model.JobCreate{Name: "job", Image: "work", Requirements: model.Requirements{GPUCount: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Schedule(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	page, err := observer.ListSchedulingDecisions(SchedulingDecisionQuery{ProjectID: "alpha", JobID: job.ID, Limit: 1})
+	if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].ProjectWeight != 2 {
+		t.Fatalf("runtime decision query failed: %+v err=%v", page, err)
+	}
+	states := observer.ListProjectSchedulingStates()
+	if len(states) != 2 {
+		t.Fatalf("runtime scheduling state omitted a project: %+v", states)
+	}
+}
+
 func TestNewHandlerRejectsMalformedLicenseExpiration(t *testing.T) {
 	descriptor := edition.Community()
 	descriptor.ExpiresAt = "tomorrow"

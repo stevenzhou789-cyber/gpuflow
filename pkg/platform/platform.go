@@ -60,6 +60,12 @@ type ProjectUpdate = model.ProjectUpdate
 type ProjectStatus = model.ProjectStatus
 type QuotaSnapshot = model.QuotaSnapshot
 type ProjectQuotaError = store.ProjectQuotaError
+type SchedulingDecision = model.SchedulingDecision
+type SchedulingDecisionQuery = store.SchedulingDecisionQuery
+type SchedulingDecisionPage = store.SchedulingDecisionPage
+type JobSchedulingExplanation = model.JobSchedulingExplanation
+type SchedulingNodeCounts = model.SchedulingNodeCounts
+type ProjectSchedulingState = model.ProjectSchedulingState
 
 const (
 	ProjectActive   = model.ProjectActive
@@ -76,14 +82,29 @@ var (
 )
 
 const (
-	ProjectQuotaQueue       = store.ProjectQuotaQueue
-	ProjectQuotaConcurrency = store.ProjectQuotaConcurrency
-	ProjectQuotaGPU         = store.ProjectQuotaGPU
-	DefaultProjectWeight    = store.DefaultProjectWeight
-	MinProjectWeight        = store.MinProjectWeight
-	MaxProjectWeight        = store.MaxProjectWeight
-	MinJobPriority          = store.MinJobPriority
-	MaxJobPriority          = store.MaxJobPriority
+	ProjectQuotaQueue                     = store.ProjectQuotaQueue
+	ProjectQuotaConcurrency               = store.ProjectQuotaConcurrency
+	ProjectQuotaGPU                       = store.ProjectQuotaGPU
+	DefaultProjectWeight                  = store.DefaultProjectWeight
+	MinProjectWeight                      = store.MinProjectWeight
+	MaxProjectWeight                      = store.MaxProjectWeight
+	MinJobPriority                        = store.MinJobPriority
+	MaxJobPriority                        = store.MaxJobPriority
+	SchedulingAlgorithmFIFO               = store.SchedulingAlgorithmFIFO
+	SchedulingAlgorithmWeightedFair       = store.SchedulingAlgorithmWeightedFair
+	SchedulingReasonFIFOSelected          = store.SchedulingReasonFIFOSelected
+	SchedulingReasonWeightedFairSelected  = store.SchedulingReasonWeightedFairSelected
+	SchedulingReasonAssigned              = store.SchedulingReasonAssigned
+	SchedulingReasonNotQueued             = store.SchedulingReasonNotQueued
+	SchedulingReasonProjectDisabled       = store.SchedulingReasonProjectDisabled
+	SchedulingReasonNoRegisteredNodes     = store.SchedulingReasonNoRegisteredNodes
+	SchedulingReasonRequirementsUnmatched = store.SchedulingReasonRequirementsUnmatched
+	SchedulingReasonLicenseUnavailable    = store.SchedulingReasonLicenseUnavailable
+	SchedulingReasonNodesNotReady         = store.SchedulingReasonNodesNotReady
+	SchedulingReasonInsufficientCapacity  = store.SchedulingReasonInsufficientCapacity
+	SchedulingReasonProjectQueueOrder     = store.SchedulingReasonProjectQueueOrder
+	SchedulingReasonFairShareWait         = store.SchedulingReasonFairShareWait
+	SchedulingReasonAwaitingDispatch      = store.SchedulingReasonAwaitingDispatch
 )
 
 // ProjectController is the deliberately small management surface required by
@@ -94,6 +115,13 @@ type ProjectController interface {
 	ListProjects() []*Project
 	UpdateProject(string, ProjectUpdate) (*Project, error)
 	ProjectQuotaSnapshot(string) (QuotaSnapshot, error)
+}
+
+// SchedulingObserver is the read-only scheduling management surface used by
+// Enterprise. Decision history remains available after a job is deleted.
+type SchedulingObserver interface {
+	ListSchedulingDecisions(SchedulingDecisionQuery) (SchedulingDecisionPage, error)
+	ListProjectSchedulingStates() []ProjectSchedulingState
 }
 
 // Runtime owns the composed HTTP handler and its supported live controls.
@@ -120,6 +148,14 @@ func (r *Runtime) UpdateProject(id string, in ProjectUpdate) (*Project, error) {
 
 func (r *Runtime) ProjectQuotaSnapshot(id string) (QuotaSnapshot, error) {
 	return r.state.ProjectQuotaSnapshot(id)
+}
+
+func (r *Runtime) ListSchedulingDecisions(query SchedulingDecisionQuery) (SchedulingDecisionPage, error) {
+	return r.state.ListSchedulingDecisions(query)
+}
+
+func (r *Runtime) ListProjectSchedulingStates() []ProjectSchedulingState {
+	return r.state.ListProjectSchedulingStates()
 }
 
 // UpdateSchedulingLimits validates and atomically installs live scheduling

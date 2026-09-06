@@ -53,6 +53,7 @@ ON DUPLICATE KEY UPDATE id = VALUES(id)`},
 	{id: "core/0014", name: "add project scheduling weight", appVersion: "v1.1.1", statement: "ALTER TABLE projects ADD COLUMN weight INT NOT NULL DEFAULT 1 AFTER max_gpus", allowedErrorCodes: []uint16{1060}},
 	{id: "core/0015", name: "add project scheduler virtual runtime", appVersion: "v1.1.1", statement: "ALTER TABLE projects ADD COLUMN scheduler_vruntime BIGINT NOT NULL DEFAULT 0 AFTER weight", allowedErrorCodes: []uint16{1060}},
 	{id: "core/0016", name: "add job priority", appVersion: "v1.1.1", statement: "ALTER TABLE jobs ADD COLUMN priority INT NOT NULL DEFAULT 0 AFTER project_id", allowedErrorCodes: []uint16{1060}},
+	{id: "core/0017", name: "create scheduling decisions", appVersion: "v1.1.2", statement: mysqlSchedulingDecisionsSchema},
 }
 
 // runCoreMigrations serializes schema changes across control-plane instances,

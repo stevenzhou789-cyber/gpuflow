@@ -56,6 +56,7 @@ func NewWithStoresAndPublisher(s *store.Store, taskImages store.TaskImageStore, 
 	s.SetAcceleratorLimits(descriptor.AcceleratorLimits)
 	s.SetCostAccounting(descriptor.Features[edition.FeatureCostAnalytics])
 	s.SetProjectFairScheduling(descriptor.Features[edition.FeatureProjectFairScheduling])
+	s.SetSchedulingObservability(descriptor.Features[edition.FeatureSchedulingObservability])
 	server := &Server{store: s, token: token, mux: http.NewServeMux(), edition: descriptor, images: NewImageBuilderWithPublisher(taskImages, publisher), artifacts: artifacts}
 	server.routes()
 	return server
@@ -71,6 +72,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/jobs", s.createJob)
 	s.mux.HandleFunc("GET /v1/jobs", s.listJobs)
 	s.mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
+	s.mux.HandleFunc("GET /v1/jobs/{id}/scheduling", s.getJobScheduling)
 	s.mux.HandleFunc("GET /v1/jobs/{id}/attempt", s.validateJobAttempt)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/rerun", s.rerunJob)
 	s.mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancelJob)
@@ -331,6 +333,19 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, j)
+}
+func (s *Server) getJobScheduling(w http.ResponseWriter, r *http.Request) {
+	if !s.edition.Features[edition.FeatureSchedulingObservability] {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	s.scheduleBestEffort()
+	explanation, err := s.store.GetJobSchedulingForScope(requestScope(r), r.PathValue("id"), model.AgentSessionTTL)
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, explanation)
 }
 func (s *Server) rerunJob(w http.ResponseWriter, r *http.Request) {
 	j, err := s.store.RerunJobForScope(requestScope(r), r.PathValue("id"))

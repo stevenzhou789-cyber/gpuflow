@@ -24,6 +24,7 @@ const (
 	FeatureHeterogeneousAccelerators = "heterogeneous_accelerators"
 	FeatureProjectQuotas             = "project_quotas"
 	FeatureProjectFairScheduling     = "project_fair_scheduling"
+	FeatureSchedulingObservability   = "scheduling_observability"
 )
 
 // Descriptor is returned to the UI and is also the stable extension contract
@@ -117,6 +118,7 @@ func Community() Descriptor {
 			FeatureHeterogeneousAccelerators: false,
 			FeatureProjectQuotas:             false,
 			FeatureProjectFairScheduling:     false,
+			FeatureSchedulingObservability:   false,
 		},
 	}
 }

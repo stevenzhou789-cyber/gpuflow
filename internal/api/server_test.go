@@ -140,6 +140,62 @@ func TestJobPriorityRequiresProjectFairScheduling(t *testing.T) {
 	}
 }
 
+func TestSchedulingExplanationIsFeatureGatedAndProjectScoped(t *testing.T) {
+	state := store.NewMemory()
+	for _, id := range []string{"alpha", "beta"} {
+		if _, err := state.CreateProject(model.ProjectCreate{ID: id, Name: id, Weight: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job, err := state.CreateJobForProject("alpha", model.JobCreate{
+		Name: "explain", Image: "work", Requirements: model.Requirements{GPUCount: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	community := New(state, "test-token").Handler()
+	disabled := scopedAPIRequest(t, community, projectscope.Project("alpha"), http.MethodGet, "/v1/jobs/"+job.ID+"/scheduling", nil)
+	if disabled.Code != http.StatusNotFound {
+		t.Fatalf("Community exposed scheduling explanation: %d %s", disabled.Code, disabled.Body.String())
+	}
+
+	descriptor := edition.Community()
+	descriptor.Features[edition.FeatureProjectFairScheduling] = true
+	descriptor.Features[edition.FeatureSchedulingObservability] = true
+	handler := NewWithEdition(state, "test-token", descriptor).Handler()
+	crossProject := scopedAPIRequest(t, handler, projectscope.Project("beta"), http.MethodGet, "/v1/jobs/"+job.ID+"/scheduling", nil)
+	if crossProject.Code != http.StatusNotFound {
+		t.Fatalf("cross-project scheduling explanation leaked: %d %s", crossProject.Code, crossProject.Body.String())
+	}
+
+	queued := scopedAPIRequest(t, handler, projectscope.Project("alpha"), http.MethodGet, "/v1/jobs/"+job.ID+"/scheduling", nil)
+	if queued.Code != http.StatusOK {
+		t.Fatalf("queued scheduling explanation returned %d: %s", queued.Code, queued.Body.String())
+	}
+	var explanation model.JobSchedulingExplanation
+	if err := json.Unmarshal(queued.Body.Bytes(), &explanation); err != nil {
+		t.Fatal(err)
+	}
+	if explanation.JobID != job.ID || explanation.ProjectID != "alpha" || explanation.ReasonCode != store.SchedulingReasonNoRegisteredNodes || explanation.Nodes.Registered != 0 {
+		t.Fatalf("unexpected queued explanation: %+v", explanation)
+	}
+
+	if _, err := state.RegisterNode(model.Node{ID: "worker", GPUCount: 1, VRAMGB: 24}); err != nil {
+		t.Fatal(err)
+	}
+	assigned := scopedAPIRequest(t, handler, projectscope.Project("alpha"), http.MethodGet, "/v1/jobs/"+job.ID+"/scheduling", nil)
+	if assigned.Code != http.StatusOK {
+		t.Fatalf("assigned scheduling explanation returned %d: %s", assigned.Code, assigned.Body.String())
+	}
+	if err := json.Unmarshal(assigned.Body.Bytes(), &explanation); err != nil {
+		t.Fatal(err)
+	}
+	if explanation.Status != model.JobAssigned || explanation.ReasonCode != store.SchedulingReasonAssigned || explanation.LatestDecision == nil || explanation.LatestDecision.JobID != job.ID || explanation.LatestDecision.NodeID != "worker" {
+		t.Fatalf("assignment decision was not exposed: %+v", explanation)
+	}
+}
+
 func TestProjectScopeCoversAllUserJobRoutes(t *testing.T) {
 	state := store.NewMemory()
 	for _, id := range []string{"alpha", "beta"} {

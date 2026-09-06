@@ -73,6 +73,7 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.db.Close()
+	s.SetSchedulingObservability(true)
 	var appliedCoreMigrations int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE id LIKE 'core/%'").Scan(&appliedCoreMigrations); err != nil {
 		t.Fatal(err)
@@ -109,6 +110,10 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	}
 	if err := s.Schedule(time.Minute); err != nil {
 		t.Fatal(err)
+	}
+	decisions, err := s.ListSchedulingDecisions(SchedulingDecisionQuery{ProjectID: projectID, JobID: job.ID})
+	if err != nil || decisions.Total != 1 || len(decisions.Items) != 1 || decisions.Items[0].Algorithm != SchedulingAlgorithmFIFO || decisions.Items[0].JobCreatedAt.IsZero() {
+		t.Fatalf("initial scheduling decision was not persisted: %+v err=%v", decisions, err)
 	}
 	if _, err := s.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobRunning, Output: "partial"}); err != nil {
 		t.Fatal(err)
@@ -217,6 +222,10 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	}
 	if _, err := deletedReopened.GetJob(job.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("deleted job returned after reopen: %v", err)
+	}
+	retainedDecisions, err := deletedReopened.ListSchedulingDecisions(SchedulingDecisionQuery{ProjectID: projectID, JobID: job.ID})
+	if err != nil || retainedDecisions.Total == 0 || len(retainedDecisions.Items) == 0 {
+		t.Fatalf("job deletion removed scheduling decision history: %+v err=%v", retainedDecisions, err)
 	}
 	rollbackNode, err := deletedReopened.RegisterNode(model.Node{ID: "rollback-node"})
 	if err != nil {

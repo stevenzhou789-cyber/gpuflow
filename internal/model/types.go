@@ -154,6 +154,77 @@ type QuotaSnapshot struct {
 	MaxGPUs           int    `json:"max_gpus"`
 }
 
+// SchedulingDecision is an immutable snapshot of one successful scheduler
+// assignment. It intentionally contains the decision inputs needed to explain
+// the choice even after the job, project, or node changes later.
+type SchedulingDecision struct {
+	DecisionID            string    `json:"decision_id"`
+	DecidedAt             time.Time `json:"decided_at"`
+	JobID                 string    `json:"job_id"`
+	JobCreatedAt          time.Time `json:"job_created_at"`
+	ProjectID             string    `json:"project_id"`
+	Attempt               int       `json:"attempt"`
+	NodeID                string    `json:"node_id"`
+	AllocatedGPUs         []int     `json:"allocated_gpus,omitempty"`
+	Algorithm             string    `json:"algorithm"`
+	ReasonCode            string    `json:"reason_code"`
+	Priority              int       `json:"priority"`
+	GPUCost               int       `json:"gpu_cost"`
+	ProjectWeight         int       `json:"project_weight"`
+	ProjectVRuntimeBefore int64     `json:"project_vruntime_before"`
+	ProjectVRuntimeAfter  int64     `json:"project_vruntime_after"`
+	StrideDelta           int64     `json:"stride_delta"`
+	Strategy              string    `json:"strategy"`
+	NodeVendor            string    `json:"node_vendor,omitempty"`
+	NodeRuntime           string    `json:"node_runtime,omitempty"`
+	NodeModel             string    `json:"node_model,omitempty"`
+	NodeVRAMGB            int       `json:"node_vram_gb"`
+	NodeHourlyPrice       float64   `json:"node_hourly_price"`
+	EligibleNodeCount     int       `json:"eligible_node_count"`
+	RunnableProjectCount  int       `json:"runnable_project_count"`
+}
+
+type SchedulingNodeCounts struct {
+	Registered         int `json:"registered"`
+	RequirementMatched int `json:"requirement_matched"`
+	LicensedMatched    int `json:"licensed_matched"`
+	Ready              int `json:"ready"`
+	Available          int `json:"available"`
+}
+
+// JobSchedulingExplanation is evaluated from the same predicates used by the
+// scheduler. Queue reasons are live state; LatestDecision is durable history.
+type JobSchedulingExplanation struct {
+	JobID                   string               `json:"job_id"`
+	ProjectID               string               `json:"project_id"`
+	Status                  JobStatus            `json:"status"`
+	SchedulerMode           string               `json:"scheduler_mode"`
+	ReasonCode              string               `json:"reason_code"`
+	EvaluatedAt             time.Time            `json:"evaluated_at"`
+	Priority                int                  `json:"priority"`
+	GPUCost                 int                  `json:"gpu_cost"`
+	JobsAheadInProject      int                  `json:"jobs_ahead_in_project"`
+	ProjectWeight           int                  `json:"project_weight"`
+	ProjectVRuntime         int64                `json:"project_vruntime"`
+	MinimumProjectVRuntime  int64                `json:"minimum_project_vruntime"`
+	RelativeProjectVRuntime int64                `json:"relative_project_vruntime"`
+	Quota                   QuotaSnapshot        `json:"quota"`
+	Nodes                   SchedulingNodeCounts `json:"nodes"`
+	LatestDecision          *SchedulingDecision  `json:"latest_decision,omitempty"`
+}
+
+type ProjectSchedulingState struct {
+	ProjectID        string        `json:"project_id"`
+	Status           ProjectStatus `json:"status"`
+	Weight           int           `json:"weight"`
+	VRuntime         int64         `json:"vruntime"`
+	MinimumVRuntime  int64         `json:"minimum_vruntime"`
+	RelativeVRuntime int64         `json:"relative_vruntime"`
+	QueuedJobs       int           `json:"queued_jobs"`
+	ConcurrentJobs   int           `json:"concurrent_jobs"`
+	AllocatedGPUs    int           `json:"allocated_gpus"`
+}
+
 type Node struct {
 	ID              string            `json:"id"`
 	Name            string            `json:"name"`

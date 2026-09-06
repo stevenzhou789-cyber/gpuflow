@@ -72,6 +72,35 @@ const mysqlProjectsSchema = `CREATE TABLE IF NOT EXISTS projects (
   INDEX idx_projects_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
 
+const mysqlSchedulingDecisionsSchema = `CREATE TABLE IF NOT EXISTS scheduling_decisions (
+  decision_id VARCHAR(64) PRIMARY KEY,
+  decided_at DATETIME(6) NOT NULL,
+  job_id VARCHAR(64) NOT NULL,
+  job_created_at DATETIME(6) NOT NULL,
+  project_id VARCHAR(64) NOT NULL,
+  attempt INT NOT NULL,
+  node_id VARCHAR(64) NOT NULL,
+  allocated_gpus_json JSON NOT NULL,
+  algorithm VARCHAR(64) NOT NULL,
+  reason_code VARCHAR(64) NOT NULL,
+  priority INT NOT NULL,
+  gpu_cost INT NOT NULL,
+  project_weight INT NOT NULL,
+  project_vruntime_before BIGINT NOT NULL,
+  project_vruntime_after BIGINT NOT NULL,
+  stride_delta BIGINT NOT NULL,
+  strategy VARCHAR(64) NOT NULL,
+  node_vendor VARCHAR(64) NOT NULL,
+  node_runtime VARCHAR(64) NOT NULL,
+  node_model VARCHAR(255) NOT NULL,
+  node_vram_gb INT NOT NULL,
+  node_hourly_price DOUBLE NOT NULL,
+  eligible_node_count INT NOT NULL,
+  runnable_project_count INT NOT NULL,
+  INDEX idx_scheduling_decisions_project_time (project_id, decided_at, decision_id),
+  INDEX idx_scheduling_decisions_job_time (job_id, decided_at, decision_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+
 func OpenMySQLStateStore(dsn string) (*Store, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -304,7 +333,7 @@ func (details nodeDetails) apply(node *model.Node) {
 	node.CleanupPending = *details.CleanupPending
 }
 
-func (s *Store) saveMySQLChangesLocked(before snapshot) error {
+func (s *Store) saveMySQLChangesLocked(before snapshot, decisions []model.SchedulingDecision) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -382,11 +411,35 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 			return fmt.Errorf("insert node %s: %w", node.ID, err)
 		}
 	}
+	for _, decision := range decisions {
+		allocatedJSON, err := json.Marshal(decision.AllocatedGPUs)
+		if err != nil {
+			return fmt.Errorf("encode scheduling decision %s GPUs: %w", decision.DecisionID, err)
+		}
+		if _, err := tx.ExecContext(ctx, insertSchedulingDecisionSQL,
+			decision.DecisionID, decision.DecidedAt, decision.JobID, decision.JobCreatedAt,
+			decision.ProjectID, decision.Attempt, decision.NodeID, allocatedJSON,
+			decision.Algorithm, decision.ReasonCode, decision.Priority, decision.GPUCost,
+			decision.ProjectWeight, decision.ProjectVRuntimeBefore, decision.ProjectVRuntimeAfter,
+			decision.StrideDelta, decision.Strategy, decision.NodeVendor, decision.NodeRuntime,
+			decision.NodeModel, decision.NodeVRAMGB, decision.NodeHourlyPrice,
+			decision.EligibleNodeCount, decision.RunnableProjectCount); err != nil {
+			return fmt.Errorf("insert scheduling decision %s: %w", decision.DecisionID, err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit state transaction: %w", err)
 	}
 	return nil
 }
+
+const insertSchedulingDecisionSQL = `INSERT INTO scheduling_decisions (
+  decision_id, decided_at, job_id, job_created_at, project_id, attempt, node_id,
+  allocated_gpus_json, algorithm, reason_code, priority, gpu_cost, project_weight,
+  project_vruntime_before, project_vruntime_after, stride_delta, strategy,
+  node_vendor, node_runtime, node_model, node_vram_gb, node_hourly_price,
+  eligible_node_count, runnable_project_count)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func nullableTime(value *time.Time) any {
 	if value == nil {

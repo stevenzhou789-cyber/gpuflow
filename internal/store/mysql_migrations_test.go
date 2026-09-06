@@ -88,6 +88,9 @@ func TestV111MigrationsOnlyAppendToPublishedCoreSchema(t *testing.T) {
 		"core/0011": "3fac0c2a17a3c7726416842c0ae917df4bcfc2d5812cdcfec4ed5d844304b812",
 		"core/0012": "f93fa537fdd3e274fc1ae1198ced894793ba6b4ff6e898ca492c218323740f0d",
 		"core/0013": "6159bebd767cd13f4e85ee56644f1c446aea4503d65ffe2b55e82b9666de1cb3",
+		"core/0014": "e00f6fd44378e72d45f320fb5ba862a4b6d553b643db24419284a9a4e1e700b1",
+		"core/0015": "d361e4cafe27233f3818b0ae46538a063a4d81ee000b3f067c6f5b0853903b07",
+		"core/0016": "b0f6449407142e2c859160623c0f90acc722598395e4d3d2bb8a0d66fb1a471c",
 	}
 	for _, migration := range coreMigrations {
 		if checksum, exists := published[migration.id]; exists && migration.checksum() != checksum {
@@ -106,6 +109,25 @@ func TestV111MigrationsOnlyAppendToPublishedCoreSchema(t *testing.T) {
 		migration := coreMigrations[index+13]
 		if migration.id != id || migration.appVersion != "v1.1.1" || !migration.allows(&mysqldriver.MySQLError{Number: 1060}) {
 			t.Fatalf("v1.1.1 migrations are not a restartable append-only 0014-0016 sequence: %+v", coreMigrations)
+		}
+	}
+}
+
+func TestV112SchedulingDecisionMigrationIsAppendOnlyAndRetainsDeletedJobs(t *testing.T) {
+	if len(coreMigrations) < 17 {
+		t.Fatalf("v1.1.2 migration is missing: %+v", coreMigrations)
+	}
+	migration := coreMigrations[16]
+	statement := strings.ToLower(migration.statement)
+	if migration.id != "core/0017" || migration.appVersion != "v1.1.2" || !strings.Contains(statement, "create table if not exists scheduling_decisions") {
+		t.Fatalf("unexpected v1.1.2 migration: %+v", migration)
+	}
+	if strings.Contains(statement, "foreign key") || strings.Contains(statement, "references jobs") {
+		t.Fatalf("scheduling audit would be deleted with its job: %s", migration.statement)
+	}
+	for _, index := range []string{"idx_scheduling_decisions_project_time", "idx_scheduling_decisions_job_time"} {
+		if !strings.Contains(statement, index) {
+			t.Fatalf("scheduling decision query index %q is missing", index)
 		}
 	}
 }

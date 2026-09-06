@@ -313,6 +313,7 @@ func TestFairSchedulerRechecksHardQuotaAfterEveryAssignment(t *testing.T) {
 func TestFairSchedulerRollsBackAssignmentAndVRuntimeTogether(t *testing.T) {
 	state := NewMemory()
 	state.SetProjectFairScheduling(true)
+	state.SetSchedulingObservability(true)
 	createWeightedProject(t, state, "alpha", 1)
 	if _, err := state.RegisterNode(model.Node{ID: "worker", GPUCount: 1, VRAMGB: 24}); err != nil {
 		t.Fatal(err)
@@ -336,8 +337,8 @@ func TestFairSchedulerRollsBackAssignmentAndVRuntimeTogether(t *testing.T) {
 	rolledBackJob, _ := state.GetJob(job.ID)
 	rolledBackProject, _ := state.GetProject("alpha")
 	nodes := state.ListNodes()
-	if rolledBackJob.Status != model.JobQueued || rolledBackProject.SchedulerVRuntime != 0 || len(nodes) != 1 || nodes[0].Busy {
-		t.Fatalf("assignment and vruntime did not roll back together: job=%+v project=%+v nodes=%+v", rolledBackJob, rolledBackProject, nodes)
+	if rolledBackJob.Status != model.JobQueued || rolledBackProject.SchedulerVRuntime != 0 || len(nodes) != 1 || nodes[0].Busy || len(state.memorySchedulingDecisions) != 0 {
+		t.Fatalf("assignment, vruntime, and decision did not roll back together: job=%+v project=%+v nodes=%+v decisions=%+v", rolledBackJob, rolledBackProject, nodes, state.memorySchedulingDecisions)
 	}
 }
 
