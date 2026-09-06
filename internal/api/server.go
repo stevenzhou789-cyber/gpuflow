@@ -19,6 +19,7 @@ import (
 	"gpuflow/internal/store"
 	"gpuflow/internal/webui"
 	"gpuflow/pkg/edition"
+	"gpuflow/pkg/projectscope"
 )
 
 type Server struct {
@@ -171,7 +172,7 @@ func (s *Server) discardArtifact(staged artifact.Staged) {
 }
 
 func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.GetJob(r.PathValue("id")); err != nil {
+	if _, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id")); err != nil {
 		handleStoreError(w, err)
 		return
 	}
@@ -184,7 +185,7 @@ func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.GetJob(r.PathValue("id")); err != nil {
+	if _, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id")); err != nil {
 		handleStoreError(w, err)
 		return
 	}
@@ -201,7 +202,7 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) downloadFullJobLog(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.PathValue("id"))
+	job, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id"))
 	if err != nil {
 		handleStoreError(w, err)
 		return
@@ -225,6 +226,9 @@ func (s *Server) downloadFullJobLog(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := projectscope.FromContext(r.Context()); !ok {
+			r = r.WithContext(projectscope.WithContext(r.Context(), projectscope.Default()))
+		}
 		if r.URL.Path == "/healthz" || r.URL.Path == "/v1/capabilities" || !strings.HasPrefix(r.URL.Path, "/v1/") || s.token == "" {
 			next.ServeHTTP(w, r)
 			return
@@ -235,6 +239,22 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func requestScope(r *http.Request) projectscope.Scope {
+	scope, _ := projectscope.FromContext(r.Context())
+	return scope
+}
+
+func projectForCreate(r *http.Request) string {
+	scope := requestScope(r)
+	if scope.AllProjects {
+		if projectID := strings.TrimSpace(r.URL.Query().Get("project_id")); projectID != "" {
+			return projectID
+		}
+		return projectscope.DefaultProjectID
+	}
+	return scope.ProjectID
 }
 
 func logging(next http.Handler) http.Handler {
@@ -255,6 +275,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
+func writeErrorCode(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]string{"code": code, "error": message})
+}
 func decode(w http.ResponseWriter, r *http.Request, v any) error {
 	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	d.DisallowUnknownFields()
@@ -271,7 +294,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "name and image are required")
 		return
 	}
-	j, err := s.store.CreateJob(in)
+	j, err := s.store.CreateJobForProject(projectForCreate(r), in)
 	if err != nil {
 		handleStoreError(w, err)
 		return
@@ -281,17 +304,23 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	s.scheduleBestEffort()
+	scope := requestScope(r)
+	if scope.AllProjects {
+		if projectID := strings.TrimSpace(r.URL.Query().Get("project_id")); projectID != "" {
+			scope = projectscope.Project(projectID)
+		}
+	}
 	if r.URL.RawQuery == "" {
-		writeJSON(w, 200, s.store.ListJobs())
+		writeJSON(w, 200, s.store.ListJobsForScope(scope))
 		return
 	}
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
-	writeJSON(w, 200, s.store.QueryJobs(store.JobQuery{Search: r.URL.Query().Get("q"), Status: r.URL.Query().Get("status"), Pool: r.URL.Query().Get("pool"), Node: r.URL.Query().Get("node"), Sort: r.URL.Query().Get("sort"), Order: r.URL.Query().Get("order"), Page: page, PageSize: pageSize}))
+	writeJSON(w, 200, s.store.QueryJobsForScope(scope, store.JobQuery{Search: r.URL.Query().Get("q"), Status: r.URL.Query().Get("status"), Pool: r.URL.Query().Get("pool"), Node: r.URL.Query().Get("node"), Sort: r.URL.Query().Get("sort"), Order: r.URL.Query().Get("order"), Page: page, PageSize: pageSize}))
 }
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	s.scheduleBestEffort()
-	j, err := s.store.GetJob(r.PathValue("id"))
+	j, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id"))
 	if err != nil {
 		handleStoreError(w, err)
 		return
@@ -299,7 +328,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, j)
 }
 func (s *Server) rerunJob(w http.ResponseWriter, r *http.Request) {
-	j, err := s.store.RerunJob(r.PathValue("id"))
+	j, err := s.store.RerunJobForScope(requestScope(r), r.PathValue("id"))
 	if err != nil {
 		handleStoreError(w, err)
 		return
@@ -308,7 +337,7 @@ func (s *Server) rerunJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, j)
 }
 func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
-	j, err := s.store.CancelJob(r.PathValue("id"))
+	j, err := s.store.CancelJobForScope(requestScope(r), r.PathValue("id"))
 	if err != nil {
 		handleStoreError(w, err)
 		return
@@ -318,7 +347,8 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 	s.scheduleBestEffort()
-	if err := s.store.BeginJobDeletion(r.PathValue("id")); err != nil {
+	scope := requestScope(r)
+	if err := s.store.BeginJobDeletionForScope(scope, r.PathValue("id")); err != nil {
 		handleStoreError(w, err)
 		return
 	}
@@ -328,7 +358,7 @@ func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.store.DeleteJob(r.PathValue("id")); err != nil {
+	if err := s.store.DeleteJobForScope(scope, r.PathValue("id")); err != nil {
 		handleStoreError(w, err)
 		return
 	}
@@ -458,6 +488,11 @@ func (s *Server) scheduleBestEffort() {
 	}
 }
 func handleStoreError(w http.ResponseWriter, err error) {
+	var quotaErr *store.ProjectQuotaError
+	if errors.As(err, &quotaErr) {
+		writeErrorCode(w, http.StatusTooManyRequests, quotaErr.Code, quotaErr.Error())
+		return
+	}
 	if errors.Is(err, store.ErrPersistence) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -468,6 +503,18 @@ func handleStoreError(w http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, store.ErrInvalidResources) {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrInvalidProject) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrProjectDisabled) {
+		writeErrorCode(w, http.StatusForbidden, "project_disabled", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrProjectConflict) {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	if errors.Is(err, store.ErrLicenseExpired) || errors.Is(err, store.ErrLicenseCapacity) {

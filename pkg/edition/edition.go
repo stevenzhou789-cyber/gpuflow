@@ -22,6 +22,7 @@ const (
 	FeaturePerGPUInventory           = "per_gpu_inventory"
 	FeatureNodeHealth                = "node_health"
 	FeatureHeterogeneousAccelerators = "heterogeneous_accelerators"
+	FeatureProjectQuotas             = "project_quotas"
 )
 
 // Descriptor is returned to the UI and is also the stable extension contract
@@ -113,6 +114,7 @@ func Community() Descriptor {
 			FeaturePerGPUInventory:           false,
 			FeatureNodeHealth:                false,
 			FeatureHeterogeneousAccelerators: false,
+			FeatureProjectQuotas:             false,
 		},
 	}
 }

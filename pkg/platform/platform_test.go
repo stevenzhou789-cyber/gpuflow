@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -59,6 +60,31 @@ func TestRuntimeProvidesExplicitAtomicSchedulingControl(t *testing.T) {
 	}
 	if assigned != 1 {
 		t.Fatalf("live scheduling limits were not applied atomically: assigned=%d", assigned)
+	}
+}
+
+func TestRuntimeProvidesProjectController(t *testing.T) {
+	state := store.NewMemory()
+	runtime := &Runtime{handler: http.NotFoundHandler(), state: state}
+	var controller ProjectController = runtime
+	project, err := controller.CreateProject(ProjectCreate{ID: "alpha", Name: "Alpha", MaxQueuedJobs: 2, MaxConcurrentJobs: 1, MaxGPUs: 2})
+	if err != nil || project.ID != "alpha" {
+		t.Fatalf("project controller create failed: %+v err=%v", project, err)
+	}
+	projects := controller.ListProjects()
+	if len(projects) != 2 {
+		t.Fatalf("project controller did not include default and alpha: %+v", projects)
+	}
+	snapshot, err := controller.ProjectQuotaSnapshot("alpha")
+	if err != nil || snapshot.MaxQueuedJobs != 2 || snapshot.ProjectID != "alpha" {
+		t.Fatalf("project quota snapshot failed: %+v err=%v", snapshot, err)
+	}
+	disabled := model.ProjectDisabled
+	if _, err := controller.UpdateProject("default", ProjectUpdate{Status: &disabled}); !errors.Is(err, ErrProjectConflict) {
+		t.Fatalf("controller disabled default project: %v", err)
+	}
+	if _, err := controller.GetProject("missing"); !errors.Is(err, ErrProjectNotFound) {
+		t.Fatalf("controller did not preserve not-found error: %v", err)
 	}
 }
 

@@ -44,6 +44,7 @@ type Requirements struct {
 
 type Job struct {
 	ID              string                   `json:"id"`
+	ProjectID       string                   `json:"project_id"`
 	Name            string                   `json:"name"`
 	Image           string                   `json:"image"`
 	Command         []string                 `json:"command,omitempty"`
@@ -95,6 +96,56 @@ type JobCreate struct {
 	Strategy       string            `json:"strategy,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
 	MaxRetries     int               `json:"max_retries,omitempty"`
+}
+
+type ProjectStatus string
+
+const (
+	ProjectActive   ProjectStatus = "active"
+	ProjectDisabled ProjectStatus = "disabled"
+)
+
+// Project is a durable scheduling and isolation boundary. A zero quota means
+// unlimited; the Community default project therefore preserves legacy
+// behavior without adding deployment configuration.
+type Project struct {
+	ID                string        `json:"id"`
+	Name              string        `json:"name"`
+	Status            ProjectStatus `json:"status"`
+	MaxQueuedJobs     int           `json:"max_queued_jobs"`
+	MaxConcurrentJobs int           `json:"max_concurrent_jobs"`
+	MaxGPUs           int           `json:"max_gpus"`
+	CreatedAt         time.Time     `json:"created_at"`
+	UpdatedAt         time.Time     `json:"updated_at"`
+}
+
+type ProjectCreate struct {
+	ID                string        `json:"id"`
+	Name              string        `json:"name"`
+	Status            ProjectStatus `json:"status,omitempty"`
+	MaxQueuedJobs     int           `json:"max_queued_jobs"`
+	MaxConcurrentJobs int           `json:"max_concurrent_jobs"`
+	MaxGPUs           int           `json:"max_gpus"`
+}
+
+// ProjectUpdate uses pointers so setting a quota to zero (unlimited) is
+// distinguishable from leaving that quota unchanged.
+type ProjectUpdate struct {
+	Name              *string        `json:"name,omitempty"`
+	Status            *ProjectStatus `json:"status,omitempty"`
+	MaxQueuedJobs     *int           `json:"max_queued_jobs,omitempty"`
+	MaxConcurrentJobs *int           `json:"max_concurrent_jobs,omitempty"`
+	MaxGPUs           *int           `json:"max_gpus,omitempty"`
+}
+
+type QuotaSnapshot struct {
+	ProjectID         string `json:"project_id"`
+	QueuedJobs        int    `json:"queued_jobs"`
+	ConcurrentJobs    int    `json:"concurrent_jobs"`
+	AllocatedGPUs     int    `json:"allocated_gpus"`
+	MaxQueuedJobs     int    `json:"max_queued_jobs"`
+	MaxConcurrentJobs int    `json:"max_concurrent_jobs"`
+	MaxGPUs           int    `json:"max_gpus"`
 }
 
 type Node struct {

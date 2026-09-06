@@ -19,6 +19,7 @@ import (
 	"gpuflow/internal/model"
 	"gpuflow/internal/store"
 	"gpuflow/pkg/edition"
+	"gpuflow/pkg/projectscope"
 )
 
 type testImagePublisher struct{}
@@ -77,6 +78,115 @@ func confirmNodeReady(t *testing.T, server *httptest.Server, nodeID, session str
 	t.Helper()
 	if status := requestWithAgentCredentials(t, server, http.MethodPost, "/v1/nodes/"+nodeID+"/cleanup-complete", nil, nil, session, ""); status != http.StatusOK {
 		t.Fatalf("confirm cleanup for %s returned %d", nodeID, status)
+	}
+}
+
+func scopedAPIRequest(t *testing.T, handler http.Handler, scope projectscope.Scope, method, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var payload bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&payload).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(method, path, &payload)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(projectscope.WithContext(req.Context(), scope))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	return recorder
+}
+
+func TestCommunityJobsUseDefaultProject(t *testing.T) {
+	handler := New(store.NewMemory(), "test-token").Handler()
+	response := scopedAPIRequest(t, handler, projectscope.Default(), http.MethodPost, "/v1/jobs", model.JobCreate{Name: "default", Image: "alpine"})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create returned %d: %s", response.Code, response.Body.String())
+	}
+	var job model.Job
+	if err := json.Unmarshal(response.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	if job.ProjectID != projectscope.DefaultProjectID {
+		t.Fatalf("community job was not assigned to the default project: %+v", job)
+	}
+}
+
+func TestProjectScopeCoversAllUserJobRoutes(t *testing.T) {
+	state := store.NewMemory()
+	for _, id := range []string{"alpha", "beta"} {
+		if _, err := state.CreateProject(model.ProjectCreate{ID: id, Name: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := New(state, "test-token").Handler()
+	created := scopedAPIRequest(t, handler, projectscope.Project("alpha"), http.MethodPost, "/v1/jobs?project_id=beta", model.JobCreate{Name: "alpha", Image: "alpine"})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create returned %d: %s", created.Code, created.Body.String())
+	}
+	var job model.Job
+	if err := json.Unmarshal(created.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	if job.ProjectID != "alpha" {
+		t.Fatalf("request parameter overrode authenticated project: %+v", job)
+	}
+
+	for _, route := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/v1/jobs/" + job.ID},
+		{http.MethodPost, "/v1/jobs/" + job.ID + "/rerun"},
+		{http.MethodPost, "/v1/jobs/" + job.ID + "/cancel"},
+		{http.MethodDelete, "/v1/jobs/" + job.ID},
+		{http.MethodGet, "/v1/jobs/" + job.ID + "/logs/full"},
+		{http.MethodGet, "/v1/jobs/" + job.ID + "/artifacts"},
+		{http.MethodGet, "/v1/jobs/" + job.ID + "/artifacts/result.tgz"},
+	} {
+		response := scopedAPIRequest(t, handler, projectscope.Project("beta"), route.method, route.path, nil)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("cross-project %s %s returned %d: %s", route.method, route.path, response.Code, response.Body.String())
+		}
+	}
+	listed := scopedAPIRequest(t, handler, projectscope.Project("beta"), http.MethodGet, "/v1/jobs", nil)
+	if listed.Code != http.StatusOK {
+		t.Fatalf("list returned %d: %s", listed.Code, listed.Body.String())
+	}
+	var jobs []model.Job
+	if err := json.Unmarshal(listed.Body.Bytes(), &jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("cross-project list leaked jobs: %+v", jobs)
+	}
+}
+
+func TestGlobalScopeCanSelectProjectAndQuotaErrorsAreStable(t *testing.T) {
+	state := store.NewMemory()
+	if _, err := state.CreateProject(model.ProjectCreate{ID: "alpha", Name: "alpha", MaxQueuedJobs: 1, MaxConcurrentJobs: 1, MaxGPUs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(state, "test-token").Handler()
+	first := scopedAPIRequest(t, handler, projectscope.All(), http.MethodPost, "/v1/jobs?project_id=alpha", model.JobCreate{Name: "first", Image: "alpine"})
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first create returned %d: %s", first.Code, first.Body.String())
+	}
+	second := scopedAPIRequest(t, handler, projectscope.All(), http.MethodPost, "/v1/jobs?project_id=alpha", model.JobCreate{Name: "second", Image: "alpine"})
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("quota rejection returned %d: %s", second.Code, second.Body.String())
+	}
+	var failure map[string]string
+	if err := json.Unmarshal(second.Body.Bytes(), &failure); err != nil {
+		t.Fatal(err)
+	}
+	if failure["code"] != store.ProjectQuotaQueue {
+		t.Fatalf("unstable quota response: %+v", failure)
+	}
+	filtered := scopedAPIRequest(t, handler, projectscope.All(), http.MethodGet, "/v1/jobs?project_id=alpha", nil)
+	if filtered.Code != http.StatusOK || !strings.Contains(filtered.Body.String(), `"project_id":"alpha"`) {
+		t.Fatalf("global project filter failed: %d %s", filtered.Code, filtered.Body.String())
 	}
 }
 

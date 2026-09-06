@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"gpuflow/internal/model"
+	"gpuflow/pkg/projectscope"
 )
 
 const mysqlJobsSchema = `CREATE TABLE IF NOT EXISTS jobs (
@@ -59,6 +60,18 @@ const mysqlNodesSchema = `CREATE TABLE IF NOT EXISTS nodes (
   INDEX idx_nodes_current_job (current_job)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
 
+const mysqlProjectsSchema = `CREATE TABLE IF NOT EXISTS projects (
+  id VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  max_queued_jobs INT NOT NULL DEFAULT 0,
+  max_concurrent_jobs INT NOT NULL DEFAULT 0,
+  max_gpus INT NOT NULL DEFAULT 0,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  INDEX idx_projects_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+
 func OpenMySQLStateStore(dsn string) (*Store, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -78,7 +91,10 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	s := &Store{db: db, state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}}
+	s := &Store{db: db, state: snapshot{
+		Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{},
+		Projects: map[string]*model.Project{}, TaskImages: map[string]*model.TaskImage{},
+	}}
 	if err := s.loadMySQL(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -87,11 +103,39 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 }
 
 func (s *Store) loadMySQL(ctx context.Context) error {
-	const jobsQuery = `SELECT id, name, image, command_json, environment_json, requirements_json,
+	const projectsQuery = `SELECT id, name, status, max_queued_jobs, max_concurrent_jobs, max_gpus,
+  created_at, updated_at FROM projects`
+	rows, err := s.db.QueryContext(ctx, projectsQuery)
+	if err != nil {
+		return fmt.Errorf("load projects: %w", err)
+	}
+	for rows.Next() {
+		var project model.Project
+		if err := rows.Scan(&project.ID, &project.Name, &project.Status, &project.MaxQueuedJobs,
+			&project.MaxConcurrentJobs, &project.MaxGPUs, &project.CreatedAt, &project.UpdatedAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan project: %w", err)
+		}
+		if err := validateProject(&project); err != nil {
+			rows.Close()
+			return fmt.Errorf("validate project %s: %w", project.ID, err)
+		}
+		s.state.Projects[project.ID] = &project
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate projects: %w", err)
+	}
+	rows.Close()
+	if s.state.Projects[projectscope.DefaultProjectID] == nil {
+		return fmt.Errorf("load projects: default project is missing")
+	}
+
+	const jobsQuery = `SELECT id, project_id, name, image, command_json, environment_json, requirements_json,
   strategy, timeout_seconds, max_retries, attempts, recoveries, status, assigned_node,
   assigned_session, attempt_token, lease_expires_at, allocated_gpus_json, output, error_message,
   created_at, updated_at, started_at, finished_at, rerun_of FROM jobs`
-	rows, err := s.db.QueryContext(ctx, jobsQuery)
+	rows, err = s.db.QueryContext(ctx, jobsQuery)
 	if err != nil {
 		return fmt.Errorf("load jobs: %w", err)
 	}
@@ -99,7 +143,7 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 		var job model.Job
 		var commandJSON, environmentJSON, requirementsJSON, allocatedGPUsJSON []byte
 		var leaseExpiresAt, startedAt, finishedAt sql.NullTime
-		if err := rows.Scan(&job.ID, &job.Name, &job.Image, &commandJSON, &environmentJSON, &requirementsJSON,
+		if err := rows.Scan(&job.ID, &job.ProjectID, &job.Name, &job.Image, &commandJSON, &environmentJSON, &requirementsJSON,
 			&job.Strategy, &job.TimeoutSeconds, &job.MaxRetries, &job.Attempts, &job.Recoveries, &job.Status,
 			&job.AssignedNode, &job.AssignedSession, &job.AttemptToken, &leaseExpiresAt, &allocatedGPUsJSON,
 			&job.Output, &job.Error, &job.CreatedAt, &job.UpdatedAt, &startedAt, &finishedAt, &job.RerunOf); err != nil {
@@ -198,12 +242,12 @@ func encodeJobRequirements(job *model.Job) ([]byte, error) {
 	}{Requirements: job.Requirements, UsageRecords: job.UsageRecords})
 }
 
-const upsertJobSQL = `INSERT INTO jobs (id, name, image, command_json, environment_json,
+const upsertJobSQL = `INSERT INTO jobs (id, project_id, name, image, command_json, environment_json,
   requirements_json, strategy, timeout_seconds, max_retries, attempts, recoveries, status,
   assigned_node, assigned_session, attempt_token, lease_expires_at, allocated_gpus_json,
   output, error_message, created_at, updated_at, started_at, finished_at, rerun_of)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE name=VALUES(name), image=VALUES(image), command_json=VALUES(command_json),
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE project_id=VALUES(project_id), name=VALUES(name), image=VALUES(image), command_json=VALUES(command_json),
   environment_json=VALUES(environment_json), requirements_json=VALUES(requirements_json),
   strategy=VALUES(strategy), timeout_seconds=VALUES(timeout_seconds), max_retries=VALUES(max_retries),
   attempts=VALUES(attempts), recoveries=VALUES(recoveries), status=VALUES(status),
@@ -211,6 +255,13 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), image=VALUES(image), command_json=VAL
   lease_expires_at=VALUES(lease_expires_at), allocated_gpus_json=VALUES(allocated_gpus_json), output=VALUES(output), error_message=VALUES(error_message),
   created_at=VALUES(created_at), updated_at=VALUES(updated_at), started_at=VALUES(started_at),
   finished_at=VALUES(finished_at), rerun_of=VALUES(rerun_of)`
+
+const upsertProjectSQL = `INSERT INTO projects (id, name, status, max_queued_jobs,
+  max_concurrent_jobs, max_gpus, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE name=VALUES(name), status=VALUES(status),
+  max_queued_jobs=VALUES(max_queued_jobs), max_concurrent_jobs=VALUES(max_concurrent_jobs),
+  max_gpus=VALUES(max_gpus), updated_at=VALUES(updated_at)`
 
 const upsertNodeSQL = `INSERT INTO nodes (id, name, provider, pool, gpu_model, gpu_count,
   cpu_cores, vram_gb, hourly_price, labels_json, details_json, busy, current_job, last_heartbeat)
@@ -259,6 +310,15 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 		return fmt.Errorf("begin state transaction: %w", err)
 	}
 	defer tx.Rollback()
+	for _, project := range s.state.Projects {
+		if previous, exists := before.Projects[project.ID]; exists && reflect.DeepEqual(previous, project) {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, upsertProjectSQL, project.ID, project.Name, project.Status,
+			project.MaxQueuedJobs, project.MaxConcurrentJobs, project.MaxGPUs, project.CreatedAt, project.UpdatedAt); err != nil {
+			return fmt.Errorf("insert project %s: %w", project.ID, err)
+		}
+	}
 	for id := range before.Jobs {
 		if _, exists := s.state.Jobs[id]; !exists {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM jobs WHERE id = ?", id); err != nil {
@@ -293,7 +353,7 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 		if err != nil {
 			return fmt.Errorf("encode job %s GPU allocations: %w", job.ID, err)
 		}
-		if _, err := tx.ExecContext(ctx, upsertJobSQL, job.ID, job.Name, job.Image, commandJSON,
+		if _, err := tx.ExecContext(ctx, upsertJobSQL, job.ID, projectIDOf(job), job.Name, job.Image, commandJSON,
 			environmentJSON, requirementsJSON, job.Strategy, job.TimeoutSeconds, job.MaxRetries,
 			job.Attempts, job.Recoveries, job.Status, job.AssignedNode, job.AssignedSession, job.AttemptToken,
 			nullableTime(job.LeaseExpiresAt), allocatedGPUsJSON, job.Output, job.Error,

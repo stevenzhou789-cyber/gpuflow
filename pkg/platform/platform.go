@@ -9,6 +9,7 @@ import (
 
 	"gpuflow/internal/api"
 	"gpuflow/internal/artifact"
+	"gpuflow/internal/model"
 	"gpuflow/internal/store"
 	"gpuflow/pkg/edition"
 )
@@ -51,6 +52,45 @@ type SchedulingController interface {
 	UpdateSchedulingLimits(SchedulingLimits) error
 }
 
+// Project DTO aliases form the public extension contract without duplicating
+// the Store's durable representation.
+type Project = model.Project
+type ProjectCreate = model.ProjectCreate
+type ProjectUpdate = model.ProjectUpdate
+type ProjectStatus = model.ProjectStatus
+type QuotaSnapshot = model.QuotaSnapshot
+type ProjectQuotaError = store.ProjectQuotaError
+
+const (
+	ProjectActive   = model.ProjectActive
+	ProjectDisabled = model.ProjectDisabled
+)
+
+var (
+	ErrNotFound        = store.ErrNotFound
+	ErrProjectNotFound = store.ErrNotFound
+	ErrInvalidProject  = store.ErrInvalidProject
+	ErrProjectConflict = store.ErrProjectConflict
+	ErrProjectDisabled = store.ErrProjectDisabled
+	ErrProjectQuota    = store.ErrProjectQuota
+)
+
+const (
+	ProjectQuotaQueue       = store.ProjectQuotaQueue
+	ProjectQuotaConcurrency = store.ProjectQuotaConcurrency
+	ProjectQuotaGPU         = store.ProjectQuotaGPU
+)
+
+// ProjectController is the deliberately small management surface required by
+// Enterprise. Projects are never physically deleted in v1.1.0.
+type ProjectController interface {
+	CreateProject(ProjectCreate) (*Project, error)
+	GetProject(string) (*Project, error)
+	ListProjects() []*Project
+	UpdateProject(string, ProjectUpdate) (*Project, error)
+	ProjectQuotaSnapshot(string) (QuotaSnapshot, error)
+}
+
 // Runtime owns the composed HTTP handler and its supported live controls.
 // Callers should retain Runtime instead of asserting private methods on the
 // returned http.Handler.
@@ -60,6 +100,22 @@ type Runtime struct {
 }
 
 func (r *Runtime) Handler() http.Handler { return r.handler }
+
+func (r *Runtime) CreateProject(in ProjectCreate) (*Project, error) {
+	return r.state.CreateProject(in)
+}
+
+func (r *Runtime) GetProject(id string) (*Project, error) { return r.state.GetProject(id) }
+
+func (r *Runtime) ListProjects() []*Project { return r.state.ListProjects() }
+
+func (r *Runtime) UpdateProject(id string, in ProjectUpdate) (*Project, error) {
+	return r.state.UpdateProject(id, in)
+}
+
+func (r *Runtime) ProjectQuotaSnapshot(id string) (QuotaSnapshot, error) {
+	return r.state.ProjectQuotaSnapshot(id)
+}
 
 // UpdateSchedulingLimits validates and atomically installs live scheduling
 // limits. A malformed update is rejected without changing the existing policy.

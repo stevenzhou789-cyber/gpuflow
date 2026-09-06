@@ -72,3 +72,30 @@ func TestCoreMigrationDefinitionsAreAppendOnlyAndValid(t *testing.T) {
 		t.Fatalf("current migration sequence does not validate itself: %v", err)
 	}
 }
+
+func TestV110MigrationsOnlyAppendToPublishedCoreSchema(t *testing.T) {
+	published := map[string]string{
+		"core/0001": "d6958b2c06246bcecb8aedf87b1be9bb20bebabd8fb09223e89faa4f3bc414cf",
+		"core/0002": "7808ba697a331f409220f6a2a6ef9cba98bee80ab72a2432cde66d5ac7ae6632",
+		"core/0003": "75272ef7383cc9624abf909af3a56fa4579ce50c1d0b9f5a859117a815c8a779",
+		"core/0004": "eb3c89cd26b96324b7ad568724d4d7e4208ba671e2e81c45b026b54da026efae",
+		"core/0005": "f3a80b47e5a4789f8d6b2ad88164b847dd738fa6884e97a9e83bd2309f8059c3",
+		"core/0006": "54f2e6e66c5976ffbf3bbd6c1434316b02085c6517af84def935141a99193570",
+		"core/0007": "ef190b3cc41f97ee140c0048b413a5e81fc8438ad7b6c20b811ef824d1ebff36",
+		"core/0008": "d89e81cd8189a1532dd25b7f5cfc8faa0e206de08d7220494d037c9384ed2385",
+		"core/0009": "b27257e0eca73b959ea6a98ab8bb83d44d99421541d44328e942fc2314581755",
+	}
+	for _, migration := range coreMigrations {
+		if checksum, exists := published[migration.id]; exists && migration.checksum() != checksum {
+			t.Fatalf("published migration %s changed checksum: got %s want %s", migration.id, migration.checksum(), checksum)
+		}
+	}
+	if len(coreMigrations) < 13 {
+		t.Fatalf("v1.1.0 migrations are missing: %+v", coreMigrations)
+	}
+	for index, id := range []string{"core/0010", "core/0011", "core/0012", "core/0013"} {
+		if coreMigrations[index+9].id != id {
+			t.Fatalf("v1.1.0 migrations are not an append-only 0010-0013 sequence: %+v", coreMigrations)
+		}
+	}
+}

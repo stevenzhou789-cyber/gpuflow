@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -85,7 +86,11 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := s.CreateJob(model.JobCreate{Name: "mysql job", Image: "alpine", Command: []string{"echo", "mysql"}, Environment: map[string]string{"MODE": "test"}, Requirements: model.Requirements{GPUCount: 1, Labels: map[string]string{"zone": "lab"}}, MaxRetries: 2})
+	projectID := fmt.Sprintf("mysql-%d", time.Now().UnixNano())
+	if _, err := s.CreateProject(model.ProjectCreate{ID: projectID, Name: "MySQL project", MaxQueuedJobs: 2, MaxConcurrentJobs: 1, MaxGPUs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.CreateJobForProject(projectID, model.JobCreate{Name: "mysql job", Image: "alpine", Command: []string{"echo", "mysql"}, Environment: map[string]string{"MODE": "test"}, Requirements: model.Requirements{GPUCount: 1, Labels: map[string]string{"zone": "lab"}}, MaxRetries: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,8 +141,12 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persistedJob.Status != model.JobAssigned || persistedJob.Attempts != 2 || persistedJob.Recoveries != 1 || persistedJob.Environment["MODE"] != "test" || persistedJob.Requirements.Labels["zone"] != "lab" {
+	if persistedJob.ProjectID != projectID || persistedJob.Status != model.JobAssigned || persistedJob.Attempts != 2 || persistedJob.Recoveries != 1 || persistedJob.Environment["MODE"] != "test" || persistedJob.Requirements.Labels["zone"] != "lab" {
 		t.Fatalf("unexpected persisted job: %+v", persistedJob)
+	}
+	project, err := reopened.GetProject(projectID)
+	if err != nil || project.MaxQueuedJobs != 2 || project.MaxConcurrentJobs != 1 || project.MaxGPUs != 1 {
+		t.Fatalf("unexpected persisted project: %+v err=%v", project, err)
 	}
 	nodes := reopened.ListNodes()
 	if len(nodes) != 1 || nodes[0].CurrentJob != job.ID || !nodes[0].Busy || nodes[0].CPUCores != 16 || nodes[0].Labels["zone"] != "lab" || nodes[0].HealthStatus != "HEALTHY" || len(nodes[0].Devices) != 1 || nodes[0].Devices[0].UUID != "GPU-persisted" || nodes[0].SessionEpoch == "" {

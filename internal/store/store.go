@@ -11,9 +11,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"gpuflow/internal/model"
 	"gpuflow/pkg/edition"
+	"gpuflow/pkg/projectscope"
 )
 
 var (
@@ -28,7 +30,33 @@ var (
 	ErrAgentSessionActive = errors.New("another agent session for this node is still active")
 	ErrAttemptLease       = errors.New("invalid or expired job attempt lease")
 	ErrNodeUnavailable    = errors.New("node is not eligible to start jobs")
+	ErrInvalidProject     = errors.New("invalid project")
+	ErrProjectConflict    = errors.New("project update conflicts with current usage")
+	ErrProjectDisabled    = errors.New("project is disabled")
+	ErrProjectQuota       = errors.New("project quota exceeded")
 )
+
+const (
+	ProjectQuotaQueue       = "project_queue_quota_exceeded"
+	ProjectQuotaConcurrency = "project_concurrency_quota_exceeded"
+	ProjectQuotaGPU         = "project_gpu_quota_exceeded"
+)
+
+// ProjectQuotaError carries a stable machine-readable reason while remaining
+// compatible with errors.Is(err, ErrProjectQuota).
+type ProjectQuotaError struct {
+	ProjectID string
+	Code      string
+	Limit     int
+	Used      int
+	Requested int
+}
+
+func (e *ProjectQuotaError) Error() string {
+	return fmt.Sprintf("%s: project %q uses %d of %d and requested %d", e.Code, e.ProjectID, e.Used, e.Limit, e.Requested)
+}
+
+func (e *ProjectQuotaError) Unwrap() error { return ErrProjectQuota }
 
 const (
 	agentSessionActiveFor = model.AgentSessionTTL
@@ -42,6 +70,7 @@ const (
 type snapshot struct {
 	Jobs       map[string]*model.Job
 	Nodes      map[string]*model.Node
+	Projects   map[string]*model.Project
 	TaskImages map[string]*model.TaskImage
 }
 
@@ -70,7 +99,13 @@ type TaskImageStore interface {
 // NewMemory creates a non-persistent store for isolated unit tests. Production
 // composition always uses OpenMySQLStateStore.
 func NewMemory() *Store {
-	return &Store{state: snapshot{Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{}, TaskImages: map[string]*model.TaskImage{}}}
+	now := time.Now().UTC()
+	defaultProject := &model.Project{ID: projectscope.DefaultProjectID, Name: "Default", Status: model.ProjectActive, CreatedAt: now, UpdatedAt: now}
+	return &Store{state: snapshot{
+		Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{},
+		Projects:   map[string]*model.Project{projectscope.DefaultProjectID: defaultProject},
+		TaskImages: map[string]*model.TaskImage{},
+	}}
 }
 
 func (s *Store) SetGPUGranularScheduling(enabled bool) {
@@ -225,7 +260,10 @@ func (s *Store) commitLocked(before snapshot) error {
 }
 
 func cloneSnapshot(source snapshot) snapshot {
-	result := snapshot{Jobs: make(map[string]*model.Job, len(source.Jobs)), Nodes: make(map[string]*model.Node, len(source.Nodes)), TaskImages: make(map[string]*model.TaskImage, len(source.TaskImages))}
+	result := snapshot{
+		Jobs: make(map[string]*model.Job, len(source.Jobs)), Nodes: make(map[string]*model.Node, len(source.Nodes)),
+		Projects: make(map[string]*model.Project, len(source.Projects)), TaskImages: make(map[string]*model.TaskImage, len(source.TaskImages)),
+	}
 	for id, job := range source.Jobs {
 		copy := *job
 		copy.LeaseExpiresAt = cloneTime(job.LeaseExpiresAt)
@@ -246,6 +284,10 @@ func cloneSnapshot(source snapshot) snapshot {
 		copy.ActiveJobs = append([]string(nil), node.ActiveJobs...)
 		copy.Devices = append([]model.GPUDevice(nil), node.Devices...)
 		result.Nodes[id] = &copy
+	}
+	for id, project := range source.Projects {
+		copy := *project
+		result.Projects[id] = &copy
 	}
 	for id, image := range source.TaskImages {
 		copy := *image
@@ -294,13 +336,250 @@ func newToken(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(b)
 }
 
-func (s *Store) CreateJob(in model.JobCreate) (*model.Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.createJobLocked(in, "")
+func normalizeProjectID(projectID string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return projectscope.DefaultProjectID
+	}
+	return projectID
 }
 
-func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job, error) {
+func validateProject(project *model.Project) error {
+	project.ID = strings.TrimSpace(project.ID)
+	project.Name = strings.TrimSpace(project.Name)
+	if project.ID == "" || len(project.ID) > 64 {
+		return fmt.Errorf("%w: id must contain 1 to 64 characters", ErrInvalidProject)
+	}
+	for index, value := range project.ID {
+		if (value >= 'a' && value <= 'z') || (value >= '0' && value <= '9') || (index > 0 && (value == '-' || value == '_')) {
+			continue
+		}
+		return fmt.Errorf("%w: id must be a lowercase slug", ErrInvalidProject)
+	}
+	if project.Name == "" || utf8.RuneCountInString(project.Name) > 255 {
+		return fmt.Errorf("%w: name must contain 1 to 255 characters", ErrInvalidProject)
+	}
+	if project.Status == "" {
+		project.Status = model.ProjectActive
+	}
+	if project.Status != model.ProjectActive && project.Status != model.ProjectDisabled {
+		return fmt.Errorf("%w: status must be active or disabled", ErrInvalidProject)
+	}
+	if project.ID == projectscope.DefaultProjectID && project.Status != model.ProjectActive {
+		return fmt.Errorf("%w: default project must remain active", ErrInvalidProject)
+	}
+	if project.MaxQueuedJobs < 0 || project.MaxConcurrentJobs < 0 || project.MaxGPUs < 0 {
+		return fmt.Errorf("%w: quotas cannot be negative", ErrInvalidProject)
+	}
+	if int64(project.MaxQueuedJobs) > maxPersistedJobInt || int64(project.MaxConcurrentJobs) > maxPersistedJobInt || int64(project.MaxGPUs) > maxPersistedJobInt {
+		return fmt.Errorf("%w: quotas cannot exceed %d", ErrInvalidProject, maxPersistedJobInt)
+	}
+	return nil
+}
+
+func (s *Store) CreateProject(in model.ProjectCreate) (*model.Project, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	project := &model.Project{
+		ID: in.ID, Name: in.Name, Status: in.Status,
+		MaxQueuedJobs: in.MaxQueuedJobs, MaxConcurrentJobs: in.MaxConcurrentJobs, MaxGPUs: in.MaxGPUs,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := validateProject(project); err != nil {
+		return nil, err
+	}
+	if _, exists := s.state.Projects[project.ID]; exists {
+		return nil, fmt.Errorf("%w: project %q already exists", ErrProjectConflict, project.ID)
+	}
+	before := cloneSnapshot(s.state)
+	s.state.Projects[project.ID] = project
+	if err := s.commitLocked(before); err != nil {
+		return nil, err
+	}
+	copy := *project
+	return &copy, nil
+}
+
+func (s *Store) GetProject(id string) (*model.Project, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project := s.state.Projects[normalizeProjectID(id)]
+	if project == nil {
+		return nil, ErrNotFound
+	}
+	copy := *project
+	return &copy, nil
+}
+
+func (s *Store) ListProjects() []*model.Project {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]*model.Project, 0, len(s.state.Projects))
+	for _, project := range s.state.Projects {
+		copy := *project
+		result = append(result, &copy)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
+}
+
+func (s *Store) UpdateProject(id string, in model.ProjectUpdate) (*model.Project, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id = normalizeProjectID(id)
+	current := s.state.Projects[id]
+	if current == nil {
+		return nil, ErrNotFound
+	}
+	candidate := *current
+	if in.Name != nil {
+		candidate.Name = *in.Name
+	}
+	if in.Status != nil {
+		candidate.Status = *in.Status
+	}
+	if in.MaxQueuedJobs != nil {
+		candidate.MaxQueuedJobs = *in.MaxQueuedJobs
+	}
+	if in.MaxConcurrentJobs != nil {
+		candidate.MaxConcurrentJobs = *in.MaxConcurrentJobs
+	}
+	if in.MaxGPUs != nil {
+		candidate.MaxGPUs = *in.MaxGPUs
+	}
+	if id == projectscope.DefaultProjectID && candidate.Status != model.ProjectActive {
+		return nil, fmt.Errorf("%w: default project cannot be disabled", ErrProjectConflict)
+	}
+	if err := validateProject(&candidate); err != nil {
+		return nil, err
+	}
+	usage := s.quotaSnapshotLocked(id)
+	if candidate.MaxQueuedJobs > 0 && usage.QueuedJobs > candidate.MaxQueuedJobs {
+		return nil, fmt.Errorf("%w: queued jobs %d exceed requested limit %d", ErrProjectConflict, usage.QueuedJobs, candidate.MaxQueuedJobs)
+	}
+	if candidate.MaxConcurrentJobs > 0 && usage.ConcurrentJobs > candidate.MaxConcurrentJobs {
+		return nil, fmt.Errorf("%w: concurrent jobs %d exceed requested limit %d", ErrProjectConflict, usage.ConcurrentJobs, candidate.MaxConcurrentJobs)
+	}
+	if candidate.MaxGPUs > 0 && usage.AllocatedGPUs > candidate.MaxGPUs {
+		return nil, fmt.Errorf("%w: allocated GPUs %d exceed requested limit %d", ErrProjectConflict, usage.AllocatedGPUs, candidate.MaxGPUs)
+	}
+	before := cloneSnapshot(s.state)
+	candidate.UpdatedAt = time.Now().UTC()
+	s.state.Projects[id] = &candidate
+	if err := s.commitLocked(before); err != nil {
+		return nil, err
+	}
+	copy := candidate
+	return &copy, nil
+}
+
+func projectIDOf(job *model.Job) string { return normalizeProjectID(job.ProjectID) }
+
+func activeAllocatedGPUs(job *model.Job) int {
+	if !activeJob(job.Status) || job.Requirements.GPUCount <= 0 {
+		return 0
+	}
+	if len(job.AllocatedGPUs) > 0 {
+		return len(job.AllocatedGPUs)
+	}
+	// Legacy and whole-node assignments did not persist granular indexes.
+	return job.Requirements.GPUCount
+}
+
+func (s *Store) quotaSnapshotLocked(projectID string) model.QuotaSnapshot {
+	projectID = normalizeProjectID(projectID)
+	result := model.QuotaSnapshot{ProjectID: projectID}
+	if project := s.state.Projects[projectID]; project != nil {
+		result.MaxQueuedJobs = project.MaxQueuedJobs
+		result.MaxConcurrentJobs = project.MaxConcurrentJobs
+		result.MaxGPUs = project.MaxGPUs
+	}
+	for _, job := range s.state.Jobs {
+		if projectIDOf(job) != projectID {
+			continue
+		}
+		if job.Status == model.JobQueued {
+			result.QueuedJobs++
+		}
+		if activeJob(job.Status) {
+			result.ConcurrentJobs++
+			result.AllocatedGPUs += activeAllocatedGPUs(job)
+		}
+	}
+	return result
+}
+
+func (s *Store) ProjectQuotaSnapshot(projectID string) (model.QuotaSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	projectID = normalizeProjectID(projectID)
+	if s.state.Projects[projectID] == nil {
+		return model.QuotaSnapshot{}, ErrNotFound
+	}
+	return s.quotaSnapshotLocked(projectID), nil
+}
+
+func quotaError(projectID, code string, limit, used, requested int) error {
+	return &ProjectQuotaError{ProjectID: projectID, Code: code, Limit: limit, Used: used, Requested: requested}
+}
+
+func (s *Store) ensureProjectCanQueueLocked(projectID string, additional int) error {
+	projectID = normalizeProjectID(projectID)
+	project := s.state.Projects[projectID]
+	if project == nil {
+		return ErrNotFound
+	}
+	if project.Status != model.ProjectActive {
+		return fmt.Errorf("%w: project %q", ErrProjectDisabled, projectID)
+	}
+	return s.ensureProjectQueueCapacityLocked(projectID, additional)
+}
+
+func (s *Store) ensureProjectQueueCapacityLocked(projectID string, additional int) error {
+	projectID = normalizeProjectID(projectID)
+	project := s.state.Projects[projectID]
+	if project == nil {
+		return ErrNotFound
+	}
+	usage := s.quotaSnapshotLocked(projectID)
+	if project.MaxQueuedJobs > 0 && usage.QueuedJobs+additional > project.MaxQueuedJobs {
+		return quotaError(projectID, ProjectQuotaQueue, project.MaxQueuedJobs, usage.QueuedJobs, additional)
+	}
+	return nil
+}
+
+func (s *Store) ensureProjectCanScheduleLocked(job *model.Job) error {
+	projectID := projectIDOf(job)
+	project := s.state.Projects[projectID]
+	if project == nil {
+		return ErrNotFound
+	}
+	if project.Status != model.ProjectActive {
+		return fmt.Errorf("%w: project %q", ErrProjectDisabled, projectID)
+	}
+	usage := s.quotaSnapshotLocked(projectID)
+	if project.MaxConcurrentJobs > 0 && usage.ConcurrentJobs+1 > project.MaxConcurrentJobs {
+		return quotaError(projectID, ProjectQuotaConcurrency, project.MaxConcurrentJobs, usage.ConcurrentJobs, 1)
+	}
+	requestedGPUs := job.Requirements.GPUCount
+	if project.MaxGPUs > 0 && usage.AllocatedGPUs+requestedGPUs > project.MaxGPUs {
+		return quotaError(projectID, ProjectQuotaGPU, project.MaxGPUs, usage.AllocatedGPUs, requestedGPUs)
+	}
+	return nil
+}
+
+func (s *Store) CreateJob(in model.JobCreate) (*model.Job, error) {
+	return s.CreateJobForProject(projectscope.DefaultProjectID, in)
+}
+
+func (s *Store) CreateJobForProject(projectID string, in model.JobCreate) (*model.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createJobLocked(normalizeProjectID(projectID), in, "")
+}
+
+func (s *Store) createJobLocked(projectID string, in model.JobCreate, rerunOf string) (*model.Job, error) {
 	if err := validateAndNormalizeJobCreate(&in); err != nil {
 		return nil, err
 	}
@@ -315,6 +594,13 @@ func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job,
 			}
 		}
 	}
+	if err := s.ensureProjectCanQueueLocked(projectID, 1); err != nil {
+		return nil, err
+	}
+	project := s.state.Projects[projectID]
+	if project.MaxGPUs > 0 && in.Requirements.GPUCount > project.MaxGPUs {
+		return nil, quotaError(projectID, ProjectQuotaGPU, project.MaxGPUs, 0, in.Requirements.GPUCount)
+	}
 	before := cloneSnapshot(s.state)
 	now := time.Now().UTC()
 	for _, existing := range s.state.Jobs {
@@ -326,7 +612,7 @@ func (s *Store) createJobLocked(in model.JobCreate, rerunOf string) (*model.Job,
 	if strategy == "" {
 		strategy = "lowest_cost"
 	}
-	j := &model.Job{ID: newID("job"), Name: in.Name, Image: in.Image, Command: in.Command,
+	j := &model.Job{ID: newID("job"), ProjectID: projectID, Name: in.Name, Image: in.Image, Command: in.Command,
 		Environment: in.Environment, Requirements: in.Requirements, Strategy: strategy,
 		TimeoutSeconds: in.TimeoutSeconds, MaxRetries: in.MaxRetries, Status: model.JobQueued,
 		CreatedAt: now, UpdatedAt: now, RerunOf: rerunOf}
@@ -402,14 +688,18 @@ func validateAndNormalizeJobCreate(in *model.JobCreate) error {
 }
 
 func (s *Store) RerunJob(id string) (*model.Job, error) {
+	return s.RerunJobForScope(projectscope.All(), id)
+}
+
+func (s *Store) RerunJobForScope(scope projectscope.Scope, id string) (*model.Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	original, ok := s.state.Jobs[id]
-	if !ok {
+	if !ok || !scope.Allows(projectIDOf(original)) {
 		return nil, ErrNotFound
 	}
 	in := model.JobCreate{Name: original.Name, Image: original.Image, Command: original.Command, Environment: original.Environment, Requirements: original.Requirements, Strategy: original.Strategy, TimeoutSeconds: original.TimeoutSeconds, MaxRetries: original.MaxRetries}
-	return s.createJobLocked(in, original.ID)
+	return s.createJobLocked(projectIDOf(original), in, original.ID)
 }
 
 func terminal(status model.JobStatus) bool {
@@ -417,10 +707,14 @@ func terminal(status model.JobStatus) bool {
 }
 
 func (s *Store) CancelJob(id string) (*model.Job, error) {
+	return s.CancelJobForScope(projectscope.All(), id)
+}
+
+func (s *Store) CancelJobForScope(scope projectscope.Scope, id string) (*model.Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j, ok := s.state.Jobs[id]
-	if !ok {
+	if !ok || !scope.Allows(projectIDOf(j)) {
 		return nil, ErrNotFound
 	}
 	now := time.Now().UTC()
@@ -461,9 +755,13 @@ func (s *Store) CancelJob(id string) (*model.Job, error) {
 }
 
 func (s *Store) DeleteJob(id string) error {
+	return s.DeleteJobForScope(projectscope.All(), id)
+}
+
+func (s *Store) DeleteJobForScope(scope projectscope.Scope, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.validateJobDeletionLocked(id); err != nil {
+	if err := s.validateJobDeletionForScopeLocked(scope, id); err != nil {
 		return err
 	}
 	before := cloneSnapshot(s.state)
@@ -475,10 +773,14 @@ func (s *Store) DeleteJob(id string) error {
 // removed. A failed artifact or final state deletion can then be retried
 // without returning the job to a runnable state.
 func (s *Store) BeginJobDeletion(id string) error {
+	return s.BeginJobDeletionForScope(projectscope.All(), id)
+}
+
+func (s *Store) BeginJobDeletionForScope(scope projectscope.Scope, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j, ok := s.state.Jobs[id]
-	if !ok {
+	if !ok || !scope.Allows(projectIDOf(j)) {
 		return ErrNotFound
 	}
 	if j.Status == model.JobDeleting {
@@ -494,14 +796,18 @@ func (s *Store) BeginJobDeletion(id string) error {
 }
 
 func (s *Store) ValidateJobDeletion(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.validateJobDeletionLocked(id)
+	return s.ValidateJobDeletionForScope(projectscope.All(), id)
 }
 
-func (s *Store) validateJobDeletionLocked(id string) error {
+func (s *Store) ValidateJobDeletionForScope(scope projectscope.Scope, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.validateJobDeletionForScopeLocked(scope, id)
+}
+
+func (s *Store) validateJobDeletionForScopeLocked(scope projectscope.Scope, id string) error {
 	j, ok := s.state.Jobs[id]
-	if !ok {
+	if !ok || !scope.Allows(projectIDOf(j)) {
 		return ErrNotFound
 	}
 	if !terminal(j.Status) {
@@ -537,7 +843,11 @@ type NodePage struct {
 }
 
 func (s *Store) QueryJobs(q JobQuery) JobPage {
-	jobs := s.ListJobs()
+	return s.QueryJobsForScope(projectscope.All(), q)
+}
+
+func (s *Store) QueryJobsForScope(scope projectscope.Scope, q JobQuery) JobPage {
+	jobs := s.ListJobsForScope(scope)
 	filtered := make([]*model.Job, 0, len(jobs))
 	for _, j := range jobs {
 		search := strings.ToLower(q.Search)
@@ -622,10 +932,14 @@ func jobDuration(j *model.Job) time.Duration {
 }
 
 func (s *Store) GetJob(id string) (*model.Job, error) {
+	return s.GetJobForScope(projectscope.All(), id)
+}
+
+func (s *Store) GetJobForScope(scope projectscope.Scope, id string) (*model.Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j, ok := s.state.Jobs[id]
-	if !ok {
+	if !ok || !scope.Allows(projectIDOf(j)) {
 		return nil, ErrNotFound
 	}
 	copy := *j
@@ -636,10 +950,17 @@ func (s *Store) GetJob(id string) (*model.Job, error) {
 }
 
 func (s *Store) ListJobs() []*model.Job {
+	return s.ListJobsForScope(projectscope.All())
+}
+
+func (s *Store) ListJobsForScope(scope projectscope.Scope) []*model.Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := make([]*model.Job, 0, len(s.state.Jobs))
 	for _, j := range s.state.Jobs {
+		if !scope.Allows(projectIDOf(j)) {
+			continue
+		}
 		copy := *j
 		copy.AllocatedGPUs = append([]int(nil), j.AllocatedGPUs...)
 		copy.LeaseExpiresAt = cloneTime(j.LeaseExpiresAt)
@@ -1136,11 +1457,16 @@ func (s *Store) requeueAssignedJobsLocked(nodeID string, now time.Time) {
 		if job.AssignedNode != nodeID || job.Status != model.JobAssigned {
 			continue
 		}
-		job.Status, job.UpdatedAt = model.JobQueued, now
 		s.discardUnstartedUsageAttemptLocked(job)
 		if job.Attempts > 0 {
 			job.Attempts--
 		}
+		if err := s.ensureProjectQueueCapacityLocked(projectIDOf(job), 1); err != nil {
+			job.Status, job.Error, job.FinishedAt, job.UpdatedAt = model.JobFailed, ProjectQuotaQueue, &now, now
+			clearJobAssignment(job)
+			continue
+		}
+		job.Status, job.UpdatedAt = model.JobQueued, now
 		clearJobAssignment(job)
 	}
 }
@@ -1472,6 +1798,11 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.Before(jobs[j].CreatedAt) })
 	for _, j := range jobs {
+		// Project state and hard quotas are evaluated while holding Store.mu.
+		// Earlier assignments in this same pass are therefore visible here.
+		if err := s.ensureProjectCanScheduleLocked(j); err != nil {
+			continue
+		}
 		var best *model.Node
 		for _, n := range s.state.Nodes {
 			if _, licensed := licensedNodes[n.ID]; !licensed {
@@ -1665,6 +1996,12 @@ func (s *Store) updateJobLocked(job *model.Job, nodeID, session, attemptToken st
 		job.FinishedAt = &now
 		s.finalizeUsageAttemptLocked(job, model.JobFailed, now)
 		if job.Attempts <= job.MaxRetries {
+			if err := s.ensureProjectQueueCapacityLocked(projectIDOf(job), 1); err != nil {
+				job.Status = model.JobFailed
+				job.AttemptToken, job.LeaseExpiresAt, job.AssignedSession = "", nil, ""
+				resultError = ProjectQuotaQueue
+				break
+			}
 			job.Status = model.JobQueued
 			clearJobAssignment(job)
 			job.StartedAt, job.FinishedAt = nil, nil
@@ -1678,10 +2015,15 @@ func (s *Store) updateJobLocked(job *model.Job, nodeID, session, attemptToken st
 		}
 		if job.Error == recoveryRetryMarker {
 			s.finalizeUsageAttemptLocked(job, model.JobFailed, now)
-			job.Status = model.JobQueued
-			clearJobAssignment(job)
-			job.StartedAt, job.FinishedAt = nil, nil
-			resultOutput, resultError = "", ""
+			if err := s.ensureProjectQueueCapacityLocked(projectIDOf(job), 1); err != nil {
+				job.Status = model.JobFailed
+				resultOutput, resultError = "", ProjectQuotaQueue
+			} else {
+				job.Status = model.JobQueued
+				clearJobAssignment(job)
+				job.StartedAt, job.FinishedAt = nil, nil
+				resultOutput, resultError = "", ""
+			}
 		} else if job.Error == recoveryCleanupMarker {
 			s.finalizeUsageAttemptLocked(job, model.JobFailed, now)
 			job.Status = model.JobFailed

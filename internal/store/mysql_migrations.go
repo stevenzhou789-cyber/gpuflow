@@ -43,6 +43,13 @@ var coreMigrations = []mysqlMigration{
 	{id: "core/0007", name: "add node CPU capacity", appVersion: "v1.0.20", statement: "ALTER TABLE nodes ADD COLUMN cpu_cores INT NOT NULL DEFAULT 0 AFTER gpu_count", allowedErrorCodes: []uint16{1060}},
 	{id: "core/0008", name: "add node inventory and health", appVersion: "v1.0.20", statement: "ALTER TABLE nodes ADD COLUMN details_json JSON NULL AFTER labels_json", allowedErrorCodes: []uint16{1060}},
 	{id: "core/0009", name: "create task images", appVersion: "v1.0.20", statement: mysqlTaskImagesSchema},
+	{id: "core/0010", name: "create projects", appVersion: "v1.1.0", statement: mysqlProjectsSchema},
+	{id: "core/0011", name: "create default project", appVersion: "v1.1.0", statement: `INSERT INTO projects
+  (id, name, status, max_queued_jobs, max_concurrent_jobs, max_gpus, created_at, updated_at)
+VALUES ('default', 'Default', 'active', 0, 0, 0, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))
+ON DUPLICATE KEY UPDATE id = VALUES(id)`},
+	{id: "core/0012", name: "add job project", appVersion: "v1.1.0", statement: "ALTER TABLE jobs ADD COLUMN project_id VARCHAR(64) NOT NULL DEFAULT 'default' AFTER id", allowedErrorCodes: []uint16{1060}},
+	{id: "core/0013", name: "index project jobs", appVersion: "v1.1.0", statement: "CREATE INDEX idx_jobs_project_status_created ON jobs (project_id, status, created_at)", allowedErrorCodes: []uint16{1061}},
 }
 
 // runCoreMigrations serializes schema changes across control-plane instances,
