@@ -113,6 +113,33 @@ func TestCommunityJobsUseDefaultProject(t *testing.T) {
 	}
 }
 
+func TestJobPriorityRequiresProjectFairScheduling(t *testing.T) {
+	community := New(store.NewMemory(), "test-token").Handler()
+	response := scopedAPIRequest(t, community, projectscope.Default(), http.MethodPost, "/v1/jobs", model.JobCreate{
+		Name: "priority", Image: "alpine", Priority: 10,
+	})
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "requires project fair scheduling") {
+		t.Fatalf("Community accepted job priority: %d %s", response.Code, response.Body.String())
+	}
+
+	descriptor := edition.Community()
+	descriptor.Features[edition.FeatureProjectFairScheduling] = true
+	commercial := NewWithEdition(store.NewMemory(), "test-token", descriptor).Handler()
+	response = scopedAPIRequest(t, commercial, projectscope.Default(), http.MethodPost, "/v1/jobs", model.JobCreate{
+		Name: "priority", Image: "alpine", Priority: 10,
+	})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("enabled scheduler rejected job priority: %d %s", response.Code, response.Body.String())
+	}
+	var job model.Job
+	if err := json.Unmarshal(response.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	if job.Priority != 10 {
+		t.Fatalf("job priority was not persisted: %+v", job)
+	}
+}
+
 func TestProjectScopeCoversAllUserJobRoutes(t *testing.T) {
 	state := store.NewMemory()
 	for _, id := range []string{"alpha", "beta"} {

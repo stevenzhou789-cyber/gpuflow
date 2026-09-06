@@ -87,10 +87,23 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	projectID := fmt.Sprintf("mysql-%d", time.Now().UnixNano())
-	if _, err := s.CreateProject(model.ProjectCreate{ID: projectID, Name: "MySQL project", MaxQueuedJobs: 2, MaxConcurrentJobs: 1, MaxGPUs: 1}); err != nil {
+	if _, err := s.CreateProject(model.ProjectCreate{ID: projectID, Name: "MySQL project", MaxQueuedJobs: 2, MaxConcurrentJobs: 1, MaxGPUs: 1, Weight: 3}); err != nil {
 		t.Fatal(err)
 	}
-	job, err := s.CreateJobForProject(projectID, model.JobCreate{Name: "mysql job", Image: "alpine", Command: []string{"echo", "mysql"}, Environment: map[string]string{"MODE": "test"}, Requirements: model.Requirements{GPUCount: 1, Labels: map[string]string{"zone": "lab"}}, MaxRetries: 2})
+	job, err := s.CreateJobForProject(projectID, model.JobCreate{Name: "mysql job", Image: "alpine", Priority: 73, Command: []string{"echo", "mysql"}, Environment: map[string]string{"MODE": "test"}, Requirements: model.Requirements{GPUCount: 1, Labels: map[string]string{"zone": "lab"}}, MaxRetries: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Scheduling policy mutates virtual runtime inside Store.mu. Set all three
+	// v1.1.1 fields through the same snapshot/commit path so this persistence
+	// test remains focused on atomic MySQL round-tripping.
+	s.mu.Lock()
+	beforeSchedulingState := cloneSnapshot(s.state)
+	s.state.Projects[projectID].Weight = 3
+	s.state.Projects[projectID].SchedulerVRuntime = 987654321
+	s.state.Jobs[job.ID].Priority = 73
+	err = s.commitLocked(beforeSchedulingState)
+	s.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,11 +154,11 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persistedJob.ProjectID != projectID || persistedJob.Status != model.JobAssigned || persistedJob.Attempts != 2 || persistedJob.Recoveries != 1 || persistedJob.Environment["MODE"] != "test" || persistedJob.Requirements.Labels["zone"] != "lab" {
+	if persistedJob.ProjectID != projectID || persistedJob.Priority != 73 || persistedJob.Status != model.JobAssigned || persistedJob.Attempts != 2 || persistedJob.Recoveries != 1 || persistedJob.Environment["MODE"] != "test" || persistedJob.Requirements.Labels["zone"] != "lab" {
 		t.Fatalf("unexpected persisted job: %+v", persistedJob)
 	}
 	project, err := reopened.GetProject(projectID)
-	if err != nil || project.MaxQueuedJobs != 2 || project.MaxConcurrentJobs != 1 || project.MaxGPUs != 1 {
+	if err != nil || project.MaxQueuedJobs != 2 || project.MaxConcurrentJobs != 1 || project.MaxGPUs != 1 || project.Weight != 3 || project.SchedulerVRuntime != 987654321 {
 		t.Fatalf("unexpected persisted project: %+v err=%v", project, err)
 	}
 	nodes := reopened.ListNodes()

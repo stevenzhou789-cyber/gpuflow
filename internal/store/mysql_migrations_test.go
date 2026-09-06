@@ -73,7 +73,7 @@ func TestCoreMigrationDefinitionsAreAppendOnlyAndValid(t *testing.T) {
 	}
 }
 
-func TestV110MigrationsOnlyAppendToPublishedCoreSchema(t *testing.T) {
+func TestV111MigrationsOnlyAppendToPublishedCoreSchema(t *testing.T) {
 	published := map[string]string{
 		"core/0001": "d6958b2c06246bcecb8aedf87b1be9bb20bebabd8fb09223e89faa4f3bc414cf",
 		"core/0002": "7808ba697a331f409220f6a2a6ef9cba98bee80ab72a2432cde66d5ac7ae6632",
@@ -84,18 +84,28 @@ func TestV110MigrationsOnlyAppendToPublishedCoreSchema(t *testing.T) {
 		"core/0007": "ef190b3cc41f97ee140c0048b413a5e81fc8438ad7b6c20b811ef824d1ebff36",
 		"core/0008": "d89e81cd8189a1532dd25b7f5cfc8faa0e206de08d7220494d037c9384ed2385",
 		"core/0009": "b27257e0eca73b959ea6a98ab8bb83d44d99421541d44328e942fc2314581755",
+		"core/0010": "55e956b7dd2e0764a9738c15514ee0fa0997c67d6fce9a7b94466e0be92397c9",
+		"core/0011": "3fac0c2a17a3c7726416842c0ae917df4bcfc2d5812cdcfec4ed5d844304b812",
+		"core/0012": "f93fa537fdd3e274fc1ae1198ced894793ba6b4ff6e898ca492c218323740f0d",
+		"core/0013": "6159bebd767cd13f4e85ee56644f1c446aea4503d65ffe2b55e82b9666de1cb3",
 	}
 	for _, migration := range coreMigrations {
 		if checksum, exists := published[migration.id]; exists && migration.checksum() != checksum {
 			t.Fatalf("published migration %s changed checksum: got %s want %s", migration.id, migration.checksum(), checksum)
 		}
 	}
-	if len(coreMigrations) < 13 {
-		t.Fatalf("v1.1.0 migrations are missing: %+v", coreMigrations)
+	if len(coreMigrations) < 16 {
+		t.Fatalf("v1.1.1 migrations are missing: %+v", coreMigrations)
 	}
 	for index, id := range []string{"core/0010", "core/0011", "core/0012", "core/0013"} {
 		if coreMigrations[index+9].id != id {
 			t.Fatalf("v1.1.0 migrations are not an append-only 0010-0013 sequence: %+v", coreMigrations)
+		}
+	}
+	for index, id := range []string{"core/0014", "core/0015", "core/0016"} {
+		migration := coreMigrations[index+13]
+		if migration.id != id || migration.appVersion != "v1.1.1" || !migration.allows(&mysqldriver.MySQLError{Number: 1060}) {
+			t.Fatalf("v1.1.1 migrations are not a restartable append-only 0014-0016 sequence: %+v", coreMigrations)
 		}
 	}
 }

@@ -45,6 +45,7 @@ type Requirements struct {
 type Job struct {
 	ID              string                   `json:"id"`
 	ProjectID       string                   `json:"project_id"`
+	Priority        int                      `json:"priority"`
 	Name            string                   `json:"name"`
 	Image           string                   `json:"image"`
 	Command         []string                 `json:"command,omitempty"`
@@ -90,6 +91,7 @@ type AcceleratorUsageRecord struct {
 type JobCreate struct {
 	Name           string            `json:"name"`
 	Image          string            `json:"image"`
+	Priority       int               `json:"priority,omitempty"`
 	Command        []string          `json:"command,omitempty"`
 	Environment    map[string]string `json:"environment,omitempty"`
 	Requirements   Requirements      `json:"requirements"`
@@ -115,8 +117,10 @@ type Project struct {
 	MaxQueuedJobs     int           `json:"max_queued_jobs"`
 	MaxConcurrentJobs int           `json:"max_concurrent_jobs"`
 	MaxGPUs           int           `json:"max_gpus"`
+	Weight            int           `json:"weight"`
 	CreatedAt         time.Time     `json:"created_at"`
 	UpdatedAt         time.Time     `json:"updated_at"`
+	SchedulerVRuntime int64         `json:"-"`
 }
 
 type ProjectCreate struct {
@@ -126,6 +130,7 @@ type ProjectCreate struct {
 	MaxQueuedJobs     int           `json:"max_queued_jobs"`
 	MaxConcurrentJobs int           `json:"max_concurrent_jobs"`
 	MaxGPUs           int           `json:"max_gpus"`
+	Weight            int           `json:"weight,omitempty"`
 }
 
 // ProjectUpdate uses pointers so setting a quota to zero (unlimited) is
@@ -136,6 +141,7 @@ type ProjectUpdate struct {
 	MaxQueuedJobs     *int           `json:"max_queued_jobs,omitempty"`
 	MaxConcurrentJobs *int           `json:"max_concurrent_jobs,omitempty"`
 	MaxGPUs           *int           `json:"max_gpus,omitempty"`
+	Weight            *int           `json:"weight,omitempty"`
 }
 
 type QuotaSnapshot struct {

@@ -14,7 +14,7 @@ func TestCommunityDeclaresCompleteCapabilityContract(t *testing.T) {
 	if !strings.Contains(descriptor.ProbeImage, "@sha256:") {
 		t.Fatalf("Community probe image must be remotely pullable and immutable: %q", descriptor.ProbeImage)
 	}
-	for _, feature := range []string{FeatureGPUGranularScheduling, FeatureAgentBootstrap, FeatureManagedRegistry, FeaturePerGPUInventory, FeatureNodeHealth, FeatureHeterogeneousAccelerators, FeatureProjectQuotas} {
+	for _, feature := range []string{FeatureGPUGranularScheduling, FeatureAgentBootstrap, FeatureManagedRegistry, FeaturePerGPUInventory, FeatureNodeHealth, FeatureHeterogeneousAccelerators, FeatureProjectQuotas, FeatureProjectFairScheduling} {
 		if _, exists := descriptor.Features[feature]; !exists {
 			t.Fatalf("missing capability %q", feature)
 		}

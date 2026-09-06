@@ -79,6 +79,11 @@ const (
 	ProjectQuotaQueue       = store.ProjectQuotaQueue
 	ProjectQuotaConcurrency = store.ProjectQuotaConcurrency
 	ProjectQuotaGPU         = store.ProjectQuotaGPU
+	DefaultProjectWeight    = store.DefaultProjectWeight
+	MinProjectWeight        = store.MinProjectWeight
+	MaxProjectWeight        = store.MaxProjectWeight
+	MinJobPriority          = store.MinJobPriority
+	MaxJobPriority          = store.MaxJobPriority
 )
 
 // ProjectController is the deliberately small management surface required by

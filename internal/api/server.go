@@ -55,6 +55,7 @@ func NewWithStoresAndPublisher(s *store.Store, taskImages store.TaskImageStore, 
 	s.SetHeterogeneousAccelerators(descriptor.Features[edition.FeatureHeterogeneousAccelerators])
 	s.SetAcceleratorLimits(descriptor.AcceleratorLimits)
 	s.SetCostAccounting(descriptor.Features[edition.FeatureCostAnalytics])
+	s.SetProjectFairScheduling(descriptor.Features[edition.FeatureProjectFairScheduling])
 	server := &Server{store: s, token: token, mux: http.NewServeMux(), edition: descriptor, images: NewImageBuilderWithPublisher(taskImages, publisher), artifacts: artifacts}
 	server.routes()
 	return server
@@ -292,6 +293,10 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.Image) == "" {
 		writeError(w, 400, "name and image are required")
+		return
+	}
+	if in.Priority != 0 && !s.edition.Features[edition.FeatureProjectFairScheduling] {
+		writeError(w, http.StatusBadRequest, "job priority requires project fair scheduling")
 		return
 	}
 	j, err := s.store.CreateJobForProject(projectForCreate(r), in)

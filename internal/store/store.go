@@ -63,8 +63,20 @@ const (
 	jobLeaseDuration      = 30 * time.Second
 	maxGPUsPerNodeOrJob   = 1024
 	maxPersistedJobInt    = int64(1<<31 - 1)
+	fairSchedulingStride  = int64(1_000_000)
 	recoveryCleanupMarker = "[gpuflow:recovery-cleanup-before-failed]"
 	recoveryRetryMarker   = "[gpuflow:recovery-cleanup-before-retry]"
+)
+
+// Project weights and job priorities are deliberately small, stable API
+// boundaries. Enterprise enables fair scheduling, while Community keeps the
+// legacy FIFO scheduler and the defaults below.
+const (
+	DefaultProjectWeight = 1
+	MinProjectWeight     = 1
+	MaxProjectWeight     = 100
+	MinJobPriority       = 0
+	MaxJobPriority       = 100
 )
 
 type snapshot struct {
@@ -86,6 +98,7 @@ type Store struct {
 	nodeHealthTTL             time.Duration
 	perGPUInventoryEnabled    bool
 	heterogeneousAccelerators bool
+	projectFairScheduling     bool
 	acceleratorLimits         map[string]edition.AcceleratorLimit
 	costAccounting            bool
 }
@@ -100,7 +113,7 @@ type TaskImageStore interface {
 // composition always uses OpenMySQLStateStore.
 func NewMemory() *Store {
 	now := time.Now().UTC()
-	defaultProject := &model.Project{ID: projectscope.DefaultProjectID, Name: "Default", Status: model.ProjectActive, CreatedAt: now, UpdatedAt: now}
+	defaultProject := &model.Project{ID: projectscope.DefaultProjectID, Name: "Default", Status: model.ProjectActive, Weight: DefaultProjectWeight, CreatedAt: now, UpdatedAt: now}
 	return &Store{state: snapshot{
 		Jobs: map[string]*model.Job{}, Nodes: map[string]*model.Node{},
 		Projects:   map[string]*model.Project{projectscope.DefaultProjectID: defaultProject},
@@ -171,6 +184,12 @@ func (s *Store) SetHeterogeneousAccelerators(enabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.heterogeneousAccelerators = enabled
+}
+
+func (s *Store) SetProjectFairScheduling(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.projectFairScheduling = enabled
 }
 
 func (s *Store) SetAcceleratorLimits(limits map[string]edition.AcceleratorLimit) {
@@ -371,6 +390,9 @@ func validateProject(project *model.Project) error {
 	if project.MaxQueuedJobs < 0 || project.MaxConcurrentJobs < 0 || project.MaxGPUs < 0 {
 		return fmt.Errorf("%w: quotas cannot be negative", ErrInvalidProject)
 	}
+	if project.Weight < MinProjectWeight || project.Weight > MaxProjectWeight {
+		return fmt.Errorf("%w: weight must be between %d and %d", ErrInvalidProject, MinProjectWeight, MaxProjectWeight)
+	}
 	if int64(project.MaxQueuedJobs) > maxPersistedJobInt || int64(project.MaxConcurrentJobs) > maxPersistedJobInt || int64(project.MaxGPUs) > maxPersistedJobInt {
 		return fmt.Errorf("%w: quotas cannot exceed %d", ErrInvalidProject, maxPersistedJobInt)
 	}
@@ -384,7 +406,11 @@ func (s *Store) CreateProject(in model.ProjectCreate) (*model.Project, error) {
 	project := &model.Project{
 		ID: in.ID, Name: in.Name, Status: in.Status,
 		MaxQueuedJobs: in.MaxQueuedJobs, MaxConcurrentJobs: in.MaxConcurrentJobs, MaxGPUs: in.MaxGPUs,
+		Weight:    in.Weight,
 		CreatedAt: now, UpdatedAt: now,
+	}
+	if project.Weight == 0 {
+		project.Weight = DefaultProjectWeight
 	}
 	if err := validateProject(project); err != nil {
 		return nil, err
@@ -448,6 +474,9 @@ func (s *Store) UpdateProject(id string, in model.ProjectUpdate) (*model.Project
 	if in.MaxGPUs != nil {
 		candidate.MaxGPUs = *in.MaxGPUs
 	}
+	if in.Weight != nil {
+		candidate.Weight = *in.Weight
+	}
 	if id == projectscope.DefaultProjectID && candidate.Status != model.ProjectActive {
 		return nil, fmt.Errorf("%w: default project cannot be disabled", ErrProjectConflict)
 	}
@@ -475,6 +504,57 @@ func (s *Store) UpdateProject(id string, in model.ProjectUpdate) (*model.Project
 }
 
 func projectIDOf(job *model.Job) string { return normalizeProjectID(job.ProjectID) }
+
+func (s *Store) projectBackloggedLocked(projectID string) bool {
+	projectID = normalizeProjectID(projectID)
+	for _, job := range s.state.Jobs {
+		if projectIDOf(job) == projectID && (job.Status == model.JobQueued || activeJob(job.Status)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) projectFairCompetitorLocked(projectID string, licensedNodes map[string]bool) bool {
+	projectID = normalizeProjectID(projectID)
+	for _, job := range s.state.Jobs {
+		if projectIDOf(job) != projectID {
+			continue
+		}
+		if activeJob(job.Status) {
+			return true
+		}
+		if job.Status != model.JobQueued || s.ensureProjectCanScheduleLocked(job) != nil {
+			continue
+		}
+		for _, node := range s.state.Nodes {
+			// Transient availability and capacity are intentionally ignored here:
+			// a project waiting on a compatible node remains a fair competitor.
+			if licensedNodes[node.ID] && s.nodeSatisfiesJobRequirementsLocked(job, node) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Store) minimumFairCompetitorVRuntimeLocked(excludeProjectID string, now time.Time) (int64, bool) {
+	excludeProjectID = normalizeProjectID(excludeProjectID)
+	licensedNodes := s.licensedNodeSetLocked(now)
+	var minimum int64
+	found := false
+	for projectID, project := range s.state.Projects {
+		if projectID == excludeProjectID || project.Status != model.ProjectActive ||
+			!s.projectFairCompetitorLocked(projectID, licensedNodes) {
+			continue
+		}
+		if !found || project.SchedulerVRuntime < minimum {
+			minimum = project.SchedulerVRuntime
+			found = true
+		}
+	}
+	return minimum, found
+}
 
 func activeAllocatedGPUs(job *model.Job) int {
 	if !activeJob(job.Status) || job.Requirements.GPUCount <= 0 {
@@ -601,8 +681,13 @@ func (s *Store) createJobLocked(projectID string, in model.JobCreate, rerunOf st
 	if project.MaxGPUs > 0 && in.Requirements.GPUCount > project.MaxGPUs {
 		return nil, quotaError(projectID, ProjectQuotaGPU, project.MaxGPUs, 0, in.Requirements.GPUCount)
 	}
-	before := cloneSnapshot(s.state)
 	now := time.Now().UTC()
+	before := cloneSnapshot(s.state)
+	if s.projectFairScheduling && !s.projectBackloggedLocked(projectID) {
+		if baseline, found := s.minimumFairCompetitorVRuntimeLocked(projectID, now); found && project.SchedulerVRuntime < baseline {
+			project.SchedulerVRuntime = baseline
+		}
+	}
 	for _, existing := range s.state.Jobs {
 		if !now.After(existing.CreatedAt) {
 			now = existing.CreatedAt.Add(time.Nanosecond)
@@ -614,7 +699,7 @@ func (s *Store) createJobLocked(projectID string, in model.JobCreate, rerunOf st
 	}
 	j := &model.Job{ID: newID("job"), ProjectID: projectID, Name: in.Name, Image: in.Image, Command: in.Command,
 		Environment: in.Environment, Requirements: in.Requirements, Strategy: strategy,
-		TimeoutSeconds: in.TimeoutSeconds, MaxRetries: in.MaxRetries, Status: model.JobQueued,
+		TimeoutSeconds: in.TimeoutSeconds, MaxRetries: in.MaxRetries, Priority: in.Priority, Status: model.JobQueued,
 		CreatedAt: now, UpdatedAt: now, RerunOf: rerunOf}
 	s.state.Jobs[j.ID] = j
 	if err := s.commitLocked(before); err != nil {
@@ -675,6 +760,9 @@ func validateAndNormalizeJobCreate(in *model.JobCreate) error {
 	if in.MaxRetries < 0 || int64(in.MaxRetries) > maxPersistedJobInt {
 		return fmt.Errorf("%w: max_retries must be between 0 and %d", ErrInvalidResources, maxPersistedJobInt)
 	}
+	if in.Priority < MinJobPriority || in.Priority > MaxJobPriority {
+		return fmt.Errorf("%w: priority must be between %d and %d", ErrInvalidResources, MinJobPriority, MaxJobPriority)
+	}
 	if in.Requirements.GPUCount == 0 {
 		// CPU-only jobs are whole-node exclusive. GPU-only filters must not make
 		// them ineligible for CPU nodes or nodes with a different GPU inventory.
@@ -698,7 +786,7 @@ func (s *Store) RerunJobForScope(scope projectscope.Scope, id string) (*model.Jo
 	if !ok || !scope.Allows(projectIDOf(original)) {
 		return nil, ErrNotFound
 	}
-	in := model.JobCreate{Name: original.Name, Image: original.Image, Command: original.Command, Environment: original.Environment, Requirements: original.Requirements, Strategy: original.Strategy, TimeoutSeconds: original.TimeoutSeconds, MaxRetries: original.MaxRetries}
+	in := model.JobCreate{Name: original.Name, Image: original.Image, Command: original.Command, Environment: original.Environment, Requirements: original.Requirements, Strategy: original.Strategy, TimeoutSeconds: original.TimeoutSeconds, MaxRetries: original.MaxRetries, Priority: original.Priority}
 	return s.createJobLocked(projectIDOf(original), in, original.ID)
 }
 
@@ -1688,6 +1776,10 @@ func (s *Store) eligibleLocked(j *model.Job, n *model.Node, now time.Time, offli
 	if !s.nodeHealthyLocked(n, now) {
 		return false
 	}
+	return s.nodeSatisfiesJobRequirementsLocked(j, n)
+}
+
+func (s *Store) nodeSatisfiesJobRequirementsLocked(j *model.Job, n *model.Node) bool {
 	r := j.Requirements
 	if r.GPUCount > 0 {
 		if s.heterogeneousAccelerators && !acceleratorCompatible(r.Labels, n.Labels) {
@@ -1774,12 +1866,167 @@ func betterNode(strategy string, a, b *model.Node) bool {
 		if a.VRAMGB != b.VRAMGB {
 			return a.VRAMGB > b.VRAMGB
 		}
-		return a.HourlyPrice < b.HourlyPrice
+		if a.HourlyPrice != b.HourlyPrice {
+			return a.HourlyPrice < b.HourlyPrice
+		}
 	default:
 		if a.HourlyPrice != b.HourlyPrice {
 			return a.HourlyPrice < b.HourlyPrice
 		}
-		return a.VRAMGB > b.VRAMGB
+		if a.VRAMGB != b.VRAMGB {
+			return a.VRAMGB > b.VRAMGB
+		}
+	}
+	return a.ID < b.ID
+}
+
+func (s *Store) nodeHasCapacityForJobLocked(job *model.Job, node *model.Node) bool {
+	if !s.gpuGranularScheduling {
+		return !node.Busy
+	}
+	if job.Requirements.GPUCount == 0 {
+		// CPU-only jobs remain whole-node exclusive until CPU accounting is implemented.
+		return !node.Busy
+	}
+	if job.Requirements.GPUCount > node.GPUCount {
+		return false
+	}
+	return !s.hasActiveCPUOnlyJobLocked(node.ID) && len(s.availableGPUsLocked(node, job.Requirements.GPUCount)) == job.Requirements.GPUCount
+}
+
+func (s *Store) bestNodeForJobLocked(job *model.Job, licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration) *model.Node {
+	var best *model.Node
+	for _, node := range s.state.Nodes {
+		if !licensedNodes[node.ID] || !s.nodeHasCapacityForJobLocked(job, node) || !s.eligibleLocked(job, node, now, offlineAfter) {
+			continue
+		}
+		if betterNode(job.Strategy, node, best) {
+			best = node
+		}
+	}
+	return best
+}
+
+func (s *Store) assignJobLocked(job *model.Job, node *model.Node, now time.Time) {
+	if s.gpuGranularScheduling {
+		job.AllocatedGPUs = s.availableGPUsLocked(node, job.Requirements.GPUCount)
+	} else {
+		job.AllocatedGPUs = nil
+	}
+	job.Status, job.AssignedNode, job.AssignedSession, job.UpdatedAt = model.JobAssigned, node.ID, node.SessionEpoch, now
+	job.AttemptToken, job.LeaseExpiresAt = "", nil
+	job.Attempts++
+	s.recordUsageAssignmentLocked(job, node, now)
+	s.refreshNodeUsageLocked(node.ID)
+}
+
+func (s *Store) scheduleFIFOLocked(licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration) bool {
+	jobs := make([]*model.Job, 0)
+	for _, job := range s.state.Jobs {
+		if job.Status == model.JobQueued {
+			jobs = append(jobs, job)
+		}
+	}
+	// Preserve the legacy FIFO comparator exactly when fair scheduling is off.
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.Before(jobs[j].CreatedAt) })
+	changed := false
+	for _, job := range jobs {
+		// Project state and hard quotas are evaluated while holding Store.mu.
+		// Earlier assignments in this same pass are therefore visible here.
+		if err := s.ensureProjectCanScheduleLocked(job); err != nil {
+			continue
+		}
+		best := s.bestNodeForJobLocked(job, licensedNodes, now, offlineAfter)
+		if best == nil {
+			continue
+		}
+		s.assignJobLocked(job, best, now)
+		changed = true
+	}
+	return changed
+}
+
+type fairScheduleCandidate struct {
+	project *model.Project
+	job     *model.Job
+	node    *model.Node
+}
+
+func fairJobBefore(a, b *model.Job) bool {
+	if b == nil {
+		return true
+	}
+	if a.Priority != b.Priority {
+		return a.Priority > b.Priority
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	return a.ID < b.ID
+}
+
+func fairStrideDelta(job *model.Job, project *model.Project) int64 {
+	cost := job.Requirements.GPUCount
+	if cost < 1 {
+		cost = 1
+	}
+	weight := project.Weight
+	if weight < MinProjectWeight {
+		weight = DefaultProjectWeight
+	}
+	numerator := fairSchedulingStride * int64(cost)
+	return (numerator + int64(weight) - 1) / int64(weight)
+}
+
+func fairProjectBefore(a, b *fairScheduleCandidate) bool {
+	if b == nil {
+		return true
+	}
+	if a.project.SchedulerVRuntime != b.project.SchedulerVRuntime {
+		return a.project.SchedulerVRuntime < b.project.SchedulerVRuntime
+	}
+	return a.project.ID < b.project.ID
+}
+
+func (s *Store) nextFairCandidateLocked(licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration) *fairScheduleCandidate {
+	byProject := make(map[string]*fairScheduleCandidate)
+	for _, job := range s.state.Jobs {
+		if job.Status != model.JobQueued || s.ensureProjectCanScheduleLocked(job) != nil {
+			continue
+		}
+		node := s.bestNodeForJobLocked(job, licensedNodes, now, offlineAfter)
+		if node == nil {
+			continue
+		}
+		projectID := projectIDOf(job)
+		project := s.state.Projects[projectID]
+		if project == nil {
+			continue
+		}
+		current := byProject[projectID]
+		if current == nil || fairJobBefore(job, current.job) {
+			byProject[projectID] = &fairScheduleCandidate{project: project, job: job, node: node}
+		}
+	}
+	var selected *fairScheduleCandidate
+	for _, candidate := range byProject {
+		if fairProjectBefore(candidate, selected) {
+			selected = candidate
+		}
+	}
+	return selected
+}
+
+func (s *Store) scheduleFairLocked(licensedNodes map[string]bool, now time.Time, offlineAfter time.Duration) bool {
+	changed := false
+	for {
+		candidate := s.nextFairCandidateLocked(licensedNodes, now, offlineAfter)
+		if candidate == nil {
+			return changed
+		}
+		s.assignJobLocked(candidate.job, candidate.node, now)
+		candidate.project.SchedulerVRuntime += fairStrideDelta(candidate.job, candidate.project)
+		changed = true
 	}
 }
 
@@ -1790,53 +2037,10 @@ func (s *Store) Schedule(offlineAfter time.Duration) error {
 	before := cloneSnapshot(s.state)
 	changed := s.reconcileOfflineJobsLocked(now, offlineAfter)
 	licensedNodes := s.licensedNodeSetLocked(now)
-	jobs := make([]*model.Job, 0)
-	for _, j := range s.state.Jobs {
-		if j.Status == model.JobQueued {
-			jobs = append(jobs, j)
-		}
-	}
-	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.Before(jobs[j].CreatedAt) })
-	for _, j := range jobs {
-		// Project state and hard quotas are evaluated while holding Store.mu.
-		// Earlier assignments in this same pass are therefore visible here.
-		if err := s.ensureProjectCanScheduleLocked(j); err != nil {
-			continue
-		}
-		var best *model.Node
-		for _, n := range s.state.Nodes {
-			if _, licensed := licensedNodes[n.ID]; !licensed {
-				continue
-			}
-			capacityAvailable := !n.Busy
-			if s.gpuGranularScheduling {
-				if j.Requirements.GPUCount == 0 {
-					// CPU-only jobs remain whole-node exclusive until CPU accounting is implemented.
-					capacityAvailable = !n.Busy
-				} else if j.Requirements.GPUCount > n.GPUCount {
-					capacityAvailable = false
-				} else {
-					capacityAvailable = !s.hasActiveCPUOnlyJobLocked(n.ID) && len(s.availableGPUsLocked(n, j.Requirements.GPUCount)) == j.Requirements.GPUCount
-				}
-			}
-			if capacityAvailable && s.eligibleLocked(j, n, now, offlineAfter) && betterNode(j.Strategy, n, best) {
-				best = n
-			}
-		}
-		if best == nil {
-			continue
-		}
-		if s.gpuGranularScheduling {
-			j.AllocatedGPUs = s.availableGPUsLocked(best, j.Requirements.GPUCount)
-		} else {
-			j.AllocatedGPUs = nil
-		}
-		j.Status, j.AssignedNode, j.AssignedSession, j.UpdatedAt = model.JobAssigned, best.ID, best.SessionEpoch, now
-		j.AttemptToken, j.LeaseExpiresAt = "", nil
-		j.Attempts++
-		s.recordUsageAssignmentLocked(j, best, now)
-		s.refreshNodeUsageLocked(best.ID)
-		changed = true
+	if s.projectFairScheduling {
+		changed = s.scheduleFairLocked(licensedNodes, now, offlineAfter) || changed
+	} else {
+		changed = s.scheduleFIFOLocked(licensedNodes, now, offlineAfter) || changed
 	}
 	if changed {
 		if err := s.commitLocked(before); err != nil {

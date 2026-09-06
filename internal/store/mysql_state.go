@@ -104,7 +104,7 @@ func OpenMySQLStateStore(dsn string) (*Store, error) {
 
 func (s *Store) loadMySQL(ctx context.Context) error {
 	const projectsQuery = `SELECT id, name, status, max_queued_jobs, max_concurrent_jobs, max_gpus,
-  created_at, updated_at FROM projects`
+  weight, scheduler_vruntime, created_at, updated_at FROM projects`
 	rows, err := s.db.QueryContext(ctx, projectsQuery)
 	if err != nil {
 		return fmt.Errorf("load projects: %w", err)
@@ -112,7 +112,8 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 	for rows.Next() {
 		var project model.Project
 		if err := rows.Scan(&project.ID, &project.Name, &project.Status, &project.MaxQueuedJobs,
-			&project.MaxConcurrentJobs, &project.MaxGPUs, &project.CreatedAt, &project.UpdatedAt); err != nil {
+			&project.MaxConcurrentJobs, &project.MaxGPUs, &project.Weight, &project.SchedulerVRuntime,
+			&project.CreatedAt, &project.UpdatedAt); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan project: %w", err)
 		}
@@ -131,7 +132,7 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 		return fmt.Errorf("load projects: default project is missing")
 	}
 
-	const jobsQuery = `SELECT id, project_id, name, image, command_json, environment_json, requirements_json,
+	const jobsQuery = `SELECT id, project_id, priority, name, image, command_json, environment_json, requirements_json,
   strategy, timeout_seconds, max_retries, attempts, recoveries, status, assigned_node,
   assigned_session, attempt_token, lease_expires_at, allocated_gpus_json, output, error_message,
   created_at, updated_at, started_at, finished_at, rerun_of FROM jobs`
@@ -143,7 +144,7 @@ func (s *Store) loadMySQL(ctx context.Context) error {
 		var job model.Job
 		var commandJSON, environmentJSON, requirementsJSON, allocatedGPUsJSON []byte
 		var leaseExpiresAt, startedAt, finishedAt sql.NullTime
-		if err := rows.Scan(&job.ID, &job.ProjectID, &job.Name, &job.Image, &commandJSON, &environmentJSON, &requirementsJSON,
+		if err := rows.Scan(&job.ID, &job.ProjectID, &job.Priority, &job.Name, &job.Image, &commandJSON, &environmentJSON, &requirementsJSON,
 			&job.Strategy, &job.TimeoutSeconds, &job.MaxRetries, &job.Attempts, &job.Recoveries, &job.Status,
 			&job.AssignedNode, &job.AssignedSession, &job.AttemptToken, &leaseExpiresAt, &allocatedGPUsJSON,
 			&job.Output, &job.Error, &job.CreatedAt, &job.UpdatedAt, &startedAt, &finishedAt, &job.RerunOf); err != nil {
@@ -242,12 +243,12 @@ func encodeJobRequirements(job *model.Job) ([]byte, error) {
 	}{Requirements: job.Requirements, UsageRecords: job.UsageRecords})
 }
 
-const upsertJobSQL = `INSERT INTO jobs (id, project_id, name, image, command_json, environment_json,
+const upsertJobSQL = `INSERT INTO jobs (id, project_id, priority, name, image, command_json, environment_json,
   requirements_json, strategy, timeout_seconds, max_retries, attempts, recoveries, status,
   assigned_node, assigned_session, attempt_token, lease_expires_at, allocated_gpus_json,
   output, error_message, created_at, updated_at, started_at, finished_at, rerun_of)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE project_id=VALUES(project_id), name=VALUES(name), image=VALUES(image), command_json=VALUES(command_json),
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE project_id=VALUES(project_id), priority=VALUES(priority), name=VALUES(name), image=VALUES(image), command_json=VALUES(command_json),
   environment_json=VALUES(environment_json), requirements_json=VALUES(requirements_json),
   strategy=VALUES(strategy), timeout_seconds=VALUES(timeout_seconds), max_retries=VALUES(max_retries),
   attempts=VALUES(attempts), recoveries=VALUES(recoveries), status=VALUES(status),
@@ -257,11 +258,12 @@ ON DUPLICATE KEY UPDATE project_id=VALUES(project_id), name=VALUES(name), image=
   finished_at=VALUES(finished_at), rerun_of=VALUES(rerun_of)`
 
 const upsertProjectSQL = `INSERT INTO projects (id, name, status, max_queued_jobs,
-  max_concurrent_jobs, max_gpus, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  max_concurrent_jobs, max_gpus, weight, scheduler_vruntime, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE name=VALUES(name), status=VALUES(status),
   max_queued_jobs=VALUES(max_queued_jobs), max_concurrent_jobs=VALUES(max_concurrent_jobs),
-  max_gpus=VALUES(max_gpus), updated_at=VALUES(updated_at)`
+  max_gpus=VALUES(max_gpus), weight=VALUES(weight), scheduler_vruntime=VALUES(scheduler_vruntime),
+  updated_at=VALUES(updated_at)`
 
 const upsertNodeSQL = `INSERT INTO nodes (id, name, provider, pool, gpu_model, gpu_count,
   cpu_cores, vram_gb, hourly_price, labels_json, details_json, busy, current_job, last_heartbeat)
@@ -315,7 +317,8 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, upsertProjectSQL, project.ID, project.Name, project.Status,
-			project.MaxQueuedJobs, project.MaxConcurrentJobs, project.MaxGPUs, project.CreatedAt, project.UpdatedAt); err != nil {
+			project.MaxQueuedJobs, project.MaxConcurrentJobs, project.MaxGPUs, project.Weight,
+			project.SchedulerVRuntime, project.CreatedAt, project.UpdatedAt); err != nil {
 			return fmt.Errorf("insert project %s: %w", project.ID, err)
 		}
 	}
@@ -353,7 +356,7 @@ func (s *Store) saveMySQLChangesLocked(before snapshot) error {
 		if err != nil {
 			return fmt.Errorf("encode job %s GPU allocations: %w", job.ID, err)
 		}
-		if _, err := tx.ExecContext(ctx, upsertJobSQL, job.ID, projectIDOf(job), job.Name, job.Image, commandJSON,
+		if _, err := tx.ExecContext(ctx, upsertJobSQL, job.ID, projectIDOf(job), job.Priority, job.Name, job.Image, commandJSON,
 			environmentJSON, requirementsJSON, job.Strategy, job.TimeoutSeconds, job.MaxRetries,
 			job.Attempts, job.Recoveries, job.Status, job.AssignedNode, job.AssignedSession, job.AttemptToken,
 			nullableTime(job.LeaseExpiresAt), allocatedGPUsJSON, job.Output, job.Error,
