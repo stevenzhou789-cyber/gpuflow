@@ -43,33 +43,42 @@ type Requirements struct {
 }
 
 type Job struct {
-	ID              string                   `json:"id"`
-	ProjectID       string                   `json:"project_id"`
-	Priority        int                      `json:"priority"`
-	Name            string                   `json:"name"`
-	Image           string                   `json:"image"`
-	Command         []string                 `json:"command,omitempty"`
-	Environment     map[string]string        `json:"environment,omitempty"`
-	Requirements    Requirements             `json:"requirements"`
-	Strategy        string                   `json:"strategy"`
-	TimeoutSeconds  int                      `json:"timeout_seconds"`
-	MaxRetries      int                      `json:"max_retries"`
-	Attempts        int                      `json:"attempts"`
-	Recoveries      int                      `json:"recoveries"`
-	Status          JobStatus                `json:"status"`
-	AssignedNode    string                   `json:"assigned_node,omitempty"`
-	AllocatedGPUs   []int                    `json:"allocated_gpus,omitempty"`
-	Output          string                   `json:"output,omitempty"`
-	Error           string                   `json:"error,omitempty"`
-	CreatedAt       time.Time                `json:"created_at"`
-	UpdatedAt       time.Time                `json:"updated_at"`
-	StartedAt       *time.Time               `json:"started_at,omitempty"`
-	FinishedAt      *time.Time               `json:"finished_at,omitempty"`
-	RerunOf         string                   `json:"rerun_of,omitempty"`
-	AssignedSession string                   `json:"-"`
-	AttemptToken    string                   `json:"-"`
-	LeaseExpiresAt  *time.Time               `json:"-"`
-	UsageRecords    []AcceleratorUsageRecord `json:"usage_records,omitempty"`
+	ID              string                       `json:"id"`
+	ProjectID       string                       `json:"project_id"`
+	Priority        int                          `json:"priority"`
+	Name            string                       `json:"name"`
+	Image           string                       `json:"image"`
+	Command         []string                     `json:"command,omitempty"`
+	Environment     map[string]string            `json:"environment,omitempty"`
+	Requirements    Requirements                 `json:"requirements"`
+	Strategy        string                       `json:"strategy"`
+	TimeoutSeconds  int                          `json:"timeout_seconds"`
+	MaxRetries      int                          `json:"max_retries"`
+	Attempts        int                          `json:"attempts"`
+	Recoveries      int                          `json:"recoveries"`
+	Status          JobStatus                    `json:"status"`
+	AssignedNode    string                       `json:"assigned_node,omitempty"`
+	AllocatedGPUs   []int                        `json:"allocated_gpus,omitempty"`
+	Output          string                       `json:"output,omitempty"`
+	Error           string                       `json:"error,omitempty"`
+	CreatedAt       time.Time                    `json:"created_at"`
+	UpdatedAt       time.Time                    `json:"updated_at"`
+	StartedAt       *time.Time                   `json:"started_at,omitempty"`
+	FinishedAt      *time.Time                   `json:"finished_at,omitempty"`
+	RerunOf         string                       `json:"rerun_of,omitempty"`
+	AssignedSession string                       `json:"-"`
+	AttemptToken    string                       `json:"-"`
+	LeaseExpiresAt  *time.Time                   `json:"-"`
+	UsageRecords    []AcceleratorUsageRecord     `json:"usage_records,omitempty"`
+	ArtifactRefs    map[string]ArtifactReference `json:"-"`
+}
+
+// ArtifactReference publishes one immutable upload under its user-facing name.
+// It is internal state, persisted with job requirements but never sent to Agents.
+type ArtifactReference struct {
+	StorageID    string    `json:"storage_id"`
+	Size         int64     `json:"size"`
+	LastModified time.Time `json:"last_modified"`
 }
 
 // AcceleratorUsageRecord is an immutable pricing snapshot for one execution
@@ -188,6 +197,7 @@ type SchedulingNodeCounts struct {
 	Registered         int `json:"registered"`
 	RequirementMatched int `json:"requirement_matched"`
 	LicensedMatched    int `json:"licensed_matched"`
+	Maintenance        int `json:"maintenance"`
 	Ready              int `json:"ready"`
 	Available          int `json:"available"`
 }
@@ -249,7 +259,17 @@ type Node struct {
 	LastHeartbeat   time.Time         `json:"last_heartbeat"`
 	CleanupPending  bool              `json:"cleanup_pending,omitempty"`
 	SessionEpoch    string            `json:"-"`
+
+	Maintenance          bool       `json:"maintenance,omitempty"`
+	MaintenanceState     string     `json:"maintenance_state,omitempty"`
+	MaintenanceUpdatedAt *time.Time `json:"maintenance_updated_at,omitempty"`
 }
+
+const (
+	NodeMaintenanceActive   = "active"
+	NodeMaintenanceDraining = "draining"
+	NodeMaintenanceDrained  = "drained"
+)
 
 const (
 	HeaderAgentSession = "X-GPUFlow-Agent-Session"

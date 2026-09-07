@@ -26,6 +26,7 @@ const (
 	SchedulingReasonRequirementsUnmatched = "requirements_unmatched"
 	SchedulingReasonLicenseUnavailable    = "license_capacity_unavailable"
 	SchedulingReasonNodesNotReady         = "nodes_not_ready"
+	SchedulingReasonNodesInMaintenance    = "nodes_in_maintenance"
 	SchedulingReasonInsufficientCapacity  = "insufficient_free_capacity"
 	SchedulingReasonProjectQueueOrder     = "project_queue_order"
 	SchedulingReasonFairShareWait         = "fair_share_wait"
@@ -253,6 +254,9 @@ func (s *Store) explainJobSchedulingLocked(job *model.Job, now time.Time, offlin
 			continue
 		}
 		explanation.Nodes.LicensedMatched++
+		if node.Maintenance {
+			explanation.Nodes.Maintenance++
+		}
 		if !s.eligibleLocked(job, node, now, offlineAfter) {
 			continue
 		}
@@ -280,6 +284,8 @@ func (s *Store) explainJobSchedulingLocked(job *model.Job, now time.Time, offlin
 		explanation.ReasonCode = SchedulingReasonRequirementsUnmatched
 	case explanation.Nodes.LicensedMatched == 0:
 		explanation.ReasonCode = SchedulingReasonLicenseUnavailable
+	case explanation.Nodes.Maintenance == explanation.Nodes.LicensedMatched:
+		explanation.ReasonCode = SchedulingReasonNodesInMaintenance
 	case explanation.Nodes.Ready == 0:
 		explanation.ReasonCode = SchedulingReasonNodesNotReady
 	case explanation.Nodes.Available == 0:

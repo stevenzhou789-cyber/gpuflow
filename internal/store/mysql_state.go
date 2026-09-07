@@ -255,21 +255,24 @@ func decodeJobJSON(job *model.Job, commandJSON, environmentJSON, requirementsJSO
 	}
 	var persisted struct {
 		model.Requirements
-		UsageRecords []model.AcceleratorUsageRecord `json:"usage_records,omitempty"`
+		UsageRecords []model.AcceleratorUsageRecord     `json:"usage_records,omitempty"`
+		ArtifactRefs map[string]model.ArtifactReference `json:"artifact_refs,omitempty"`
 	}
 	if err := json.Unmarshal(requirementsJSON, &persisted); err != nil {
 		return fmt.Errorf("requirements: %w", err)
 	}
 	job.Requirements = persisted.Requirements
 	job.UsageRecords = persisted.UsageRecords
+	job.ArtifactRefs = persisted.ArtifactRefs
 	return nil
 }
 
 func encodeJobRequirements(job *model.Job) ([]byte, error) {
 	return json.Marshal(struct {
 		model.Requirements
-		UsageRecords []model.AcceleratorUsageRecord `json:"usage_records,omitempty"`
-	}{Requirements: job.Requirements, UsageRecords: job.UsageRecords})
+		UsageRecords []model.AcceleratorUsageRecord     `json:"usage_records,omitempty"`
+		ArtifactRefs map[string]model.ArtifactReference `json:"artifact_refs,omitempty"`
+	}{Requirements: job.Requirements, UsageRecords: job.UsageRecords, ArtifactRefs: job.ArtifactRefs})
 }
 
 const upsertJobSQL = `INSERT INTO jobs (id, project_id, priority, name, image, command_json, environment_json,
@@ -303,25 +306,30 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), provider=VALUES(provider), pool=VALUE
   current_job=VALUES(current_job), last_heartbeat=VALUES(last_heartbeat)`
 
 type nodeDetails struct {
-	Devices         []model.GPUDevice `json:"devices,omitempty"`
-	DriverVersion   string            `json:"driver_version,omitempty"`
-	DockerVersion   string            `json:"docker_version,omitempty"`
-	HealthStatus    string            `json:"health_status,omitempty"`
-	HealthReason    string            `json:"health_reason,omitempty"`
-	LastHealthCheck *time.Time        `json:"last_health_check,omitempty"`
-	SessionEpoch    string            `json:"session_epoch,omitempty"`
-	CleanupPending  *bool             `json:"cleanup_pending"`
+	Devices              []model.GPUDevice `json:"devices,omitempty"`
+	DriverVersion        string            `json:"driver_version,omitempty"`
+	DockerVersion        string            `json:"docker_version,omitempty"`
+	HealthStatus         string            `json:"health_status,omitempty"`
+	HealthReason         string            `json:"health_reason,omitempty"`
+	LastHealthCheck      *time.Time        `json:"last_health_check,omitempty"`
+	SessionEpoch         string            `json:"session_epoch,omitempty"`
+	CleanupPending       *bool             `json:"cleanup_pending"`
+	Maintenance          bool              `json:"maintenance,omitempty"`
+	MaintenanceUpdatedAt *time.Time        `json:"maintenance_updated_at,omitempty"`
 }
 
 func detailsFromNode(node *model.Node) nodeDetails {
 	cleanupPending := node.CleanupPending
-	return nodeDetails{Devices: node.Devices, DriverVersion: node.DriverVersion, DockerVersion: node.DockerVersion, HealthStatus: node.HealthStatus, HealthReason: node.HealthReason, LastHealthCheck: node.LastHealthCheck, SessionEpoch: node.SessionEpoch, CleanupPending: &cleanupPending}
+	return nodeDetails{Devices: node.Devices, DriverVersion: node.DriverVersion, DockerVersion: node.DockerVersion, HealthStatus: node.HealthStatus, HealthReason: node.HealthReason, LastHealthCheck: node.LastHealthCheck, SessionEpoch: node.SessionEpoch, CleanupPending: &cleanupPending, Maintenance: node.Maintenance, MaintenanceUpdatedAt: cloneTime(node.MaintenanceUpdatedAt)}
 }
 
 func (details nodeDetails) apply(node *model.Node) {
 	node.Devices, node.DriverVersion, node.DockerVersion = details.Devices, details.DriverVersion, details.DockerVersion
 	node.HealthStatus, node.HealthReason, node.LastHealthCheck = details.HealthStatus, details.HealthReason, details.LastHealthCheck
 	node.SessionEpoch = details.SessionEpoch
+	node.Maintenance = details.Maintenance
+	node.MaintenanceUpdatedAt = cloneTime(details.MaintenanceUpdatedAt)
+	node.MaintenanceState = ""
 	if details.CleanupPending == nil {
 		// details_json written before the cleanup handshake has no readiness
 		// marker. Treat it as unsafe after upgrade: the current session must be

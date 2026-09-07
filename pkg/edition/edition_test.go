@@ -22,6 +22,11 @@ func TestCommunityDeclaresCompleteCapabilityContract(t *testing.T) {
 	if descriptor.Features[FeatureSchedulingObservability] {
 		t.Fatal("Community unexpectedly enabled scheduling observability")
 	}
+	for _, feature := range []string{FeatureNodeMaintenance, FeatureUsageReports} {
+		if enabled, exists := descriptor.Features[feature]; !exists || enabled {
+			t.Fatalf("Community must explicitly disable %s", feature)
+		}
+	}
 }
 
 func TestExpirationSupportsCompatibleDateAndRFC3339(t *testing.T) {

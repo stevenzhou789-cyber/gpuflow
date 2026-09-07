@@ -65,6 +65,12 @@ func NewImageBuilder(storage store.TaskImageStore) *ImageBuilder {
 }
 
 func NewImageBuilderWithPublisher(storage store.TaskImageStore, publisher ImagePublisher) *ImageBuilder {
+	return newImageBuilderWithDiscovery(storage, publisher, func() ([]byte, error) {
+		return exec.Command("docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}").Output()
+	})
+}
+
+func newImageBuilderWithDiscovery(storage store.TaskImageStore, publisher ImagePublisher, listLocalImages func() ([]byte, error)) *ImageBuilder {
 	builder := &ImageBuilder{
 		images:    make(map[string]*TaskImage),
 		store:     storage,
@@ -82,22 +88,36 @@ func NewImageBuilderWithPublisher(storage store.TaskImageStore, publisher ImageP
 	savedImages, _ := storage.ListTaskImages()
 	for _, saved := range savedImages {
 		image := saved
+		startupError := ""
 		if image.Status == "building" {
+			startupError = "控制端在镜像构建期间重启，请重新构建"
+		} else if publisher != nil && image.Status == "ready" && image.Runtime == "imported" && strings.HasPrefix(image.Name, "gpuflow-task/") {
+			// Older releases imported retained local build tags without publishing
+			// them. Keep the record for cleanup, but do not offer it to remote nodes.
+			startupError = "本机导入镜像尚未发布到企业镜像仓库，请删除记录后重新构建"
+		}
+		if startupError != "" {
 			image.Status = "failed"
-			image.Error = "控制端在镜像构建期间重启，请重新构建"
+			image.Error = startupError
 			image.UpdatedAt = time.Now().UTC()
 			if err := storage.SaveTaskImage(image); err != nil {
-				log.Printf("persist interrupted task image %s: %v", image.ID, err)
+				log.Printf("persist task image startup recovery %s: %v", image.ID, err)
 			}
 		}
 		builder.images[image.ID] = &image
 	}
-	builder.discoverLocalImages()
+	builder.discoverLocalImages(listLocalImages)
 	return builder
 }
 
-func (b *ImageBuilder) discoverLocalImages() {
-	output, err := exec.Command("docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}").Output()
+func (b *ImageBuilder) discoverLocalImages(listLocalImages func() ([]byte, error)) {
+	// Enterprise images become ready only through a successful publication.
+	// Docker retains the local build tag, which is not a distributable image
+	// and must not be reimported after a restart or deletion of its record.
+	if b.publisher != nil {
+		return
+	}
+	output, err := listLocalImages()
 	if err != nil {
 		return
 	}

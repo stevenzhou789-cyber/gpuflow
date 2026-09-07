@@ -115,7 +115,15 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	if err != nil || decisions.Total != 1 || len(decisions.Items) != 1 || decisions.Items[0].Algorithm != SchedulingAlgorithmFIFO || decisions.Items[0].JobCreatedAt.IsZero() {
 		t.Fatalf("initial scheduling decision was not persisted: %+v err=%v", decisions, err)
 	}
-	if _, err := s.UpdateJob(job.ID, node.ID, model.JobUpdate{Status: model.JobRunning, Output: "partial"}); err != nil {
+	artifactDispatch, err := s.NextJobSession(node.ID, node.SessionEpoch)
+	if err != nil || artifactDispatch == nil {
+		t.Fatalf("claim artifact attempt: %+v %v", artifactDispatch, err)
+	}
+	if _, err := s.UpdateJobLease(job.ID, node.ID, node.SessionEpoch, artifactDispatch.AttemptToken, model.JobUpdate{Status: model.JobRunning, Output: "partial"}); err != nil {
+		t.Fatal(err)
+	}
+	artifactReference := model.ArtifactReference{StorageID: job.ID + "/.gpuflow-versions/mysql-roundtrip", Size: 7, LastModified: time.Now().UTC().Truncate(time.Microsecond)}
+	if err := s.PublishJobArtifact(job.ID, node.ID, node.SessionEpoch, artifactDispatch.AttemptToken, "training.log", artifactReference); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RegisterNode(nodeInput); err != nil {
@@ -149,6 +157,10 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	if err := s.SaveTaskImage(image); err != nil {
 		t.Fatal(err)
 	}
+	maintenanceNode, err := s.SetNodeMaintenance(node.ID, true)
+	if err != nil || maintenanceNode.MaintenanceState != model.NodeMaintenanceDraining {
+		t.Fatalf("maintain assigned node before reopen: %+v %v", maintenanceNode, err)
+	}
 
 	reopened, err := OpenMySQLStateStore(dsn)
 	if err != nil {
@@ -162,6 +174,9 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	if persistedJob.ProjectID != projectID || persistedJob.Priority != 73 || persistedJob.Status != model.JobAssigned || persistedJob.Attempts != 2 || persistedJob.Recoveries != 1 || persistedJob.Environment["MODE"] != "test" || persistedJob.Requirements.Labels["zone"] != "lab" {
 		t.Fatalf("unexpected persisted job: %+v", persistedJob)
 	}
+	if persistedJob.ArtifactRefs["training.log"] != artifactReference {
+		t.Fatalf("published artifact reference did not survive reopen: %+v", persistedJob.ArtifactRefs)
+	}
 	project, err := reopened.GetProject(projectID)
 	if err != nil || project.MaxQueuedJobs != 2 || project.MaxConcurrentJobs != 1 || project.MaxGPUs != 1 || project.Weight != 3 || project.SchedulerVRuntime != 987654321 {
 		t.Fatalf("unexpected persisted project: %+v err=%v", project, err)
@@ -169,6 +184,9 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	nodes := reopened.ListNodes()
 	if len(nodes) != 1 || nodes[0].CurrentJob != job.ID || !nodes[0].Busy || nodes[0].CPUCores != 16 || nodes[0].Labels["zone"] != "lab" || nodes[0].HealthStatus != "HEALTHY" || len(nodes[0].Devices) != 1 || nodes[0].Devices[0].UUID != "GPU-persisted" || nodes[0].SessionEpoch == "" {
 		t.Fatalf("unexpected persisted nodes: %+v", nodes)
+	}
+	if !nodes[0].Maintenance || nodes[0].MaintenanceState != model.NodeMaintenanceDraining || nodes[0].MaintenanceUpdatedAt == nil || !nodes[0].MaintenanceUpdatedAt.Equal(*maintenanceNode.MaintenanceUpdatedAt) {
+		t.Fatalf("maintenance did not survive reopen: %+v", nodes[0])
 	}
 	images, err := reopened.ListTaskImages()
 	if err != nil || len(images) != 1 || images[0].ID != image.ID || images[0].Status != "ready" {

@@ -20,7 +20,7 @@ import (
 
 var (
 	ErrNotFound           = errors.New("not found")
-	ErrNodeBusy           = errors.New("node has an assigned or running job")
+	ErrNodeBusy           = errors.New("node has active jobs or pending container cleanup")
 	ErrJobActive          = errors.New("active job must be canceled before deletion")
 	ErrPersistence        = errors.New("persist state")
 	ErrInvalidResources   = errors.New("invalid resources")
@@ -309,11 +309,13 @@ func cloneSnapshot(source snapshot) snapshot {
 		copy.Requirements.Pools = append([]string(nil), job.Requirements.Pools...)
 		copy.Requirements.Labels = cloneStringMap(job.Requirements.Labels)
 		copy.UsageRecords = cloneUsageRecords(job.UsageRecords)
+		copy.ArtifactRefs = cloneArtifactReferences(job.ArtifactRefs)
 		result.Jobs[id] = &copy
 	}
 	for id, node := range source.Nodes {
 		copy := *node
 		copy.LastHealthCheck = cloneTime(node.LastHealthCheck)
+		copy.MaintenanceUpdatedAt = cloneTime(node.MaintenanceUpdatedAt)
 		copy.Labels = cloneStringMap(node.Labels)
 		copy.ActiveJobs = append([]string(nil), node.ActiveJobs...)
 		copy.Devices = append([]model.GPUDevice(nil), node.Devices...)
@@ -1049,6 +1051,7 @@ func (s *Store) GetJobForScope(scope projectscope.Scope, id string) (*model.Job,
 	copy.AllocatedGPUs = append([]int(nil), j.AllocatedGPUs...)
 	copy.LeaseExpiresAt = cloneTime(j.LeaseExpiresAt)
 	copy.UsageRecords = cloneUsageRecords(j.UsageRecords)
+	copy.ArtifactRefs = cloneArtifactReferences(j.ArtifactRefs)
 	return &copy, nil
 }
 
@@ -1068,6 +1071,7 @@ func (s *Store) ListJobsForScope(scope projectscope.Scope) []*model.Job {
 		copy.AllocatedGPUs = append([]int(nil), j.AllocatedGPUs...)
 		copy.LeaseExpiresAt = cloneTime(j.LeaseExpiresAt)
 		copy.UsageRecords = cloneUsageRecords(j.UsageRecords)
+		copy.ArtifactRefs = cloneArtifactReferences(j.ArtifactRefs)
 		result = append(result, &copy)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
@@ -1108,6 +1112,13 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover, requi
 		in.HealthStatus = "HEALTHY"
 	}
 	existing := s.state.Nodes[in.ID]
+	// These are administrator-owned fields, never Agent registration input.
+	// Restart, re-registration and health recovery cannot silently resume a node.
+	in.Maintenance, in.MaintenanceState, in.MaintenanceUpdatedAt = false, "", nil
+	if existing != nil {
+		in.Maintenance = existing.Maintenance
+		in.MaintenanceUpdatedAt = cloneTime(existing.MaintenanceUpdatedAt)
+	}
 	// A returning Agent can temporarily lose all inventory when Docker,
 	// the probe image, or the accelerator runtime is unavailable. Keep the last
 	// known capacity and accelerator identity while the node is explicitly
@@ -1155,10 +1166,7 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover, requi
 	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}
-	copy := in
-	copy.Devices = append([]model.GPUDevice(nil), in.Devices...)
-	copy.LastHealthCheck = cloneTime(in.LastHealthCheck)
-	return &copy, nil
+	return s.cloneNodeLocked(&in), nil
 }
 
 func normalizeAcceleratorNode(node *model.Node) error {
@@ -1205,11 +1213,7 @@ func (s *Store) ConfirmNodeCleanupSession(id, session string) (*model.Node, erro
 	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}
-	copy := *node
-	copy.ActiveJobs = append([]string(nil), node.ActiveJobs...)
-	copy.Devices = append([]model.GPUDevice(nil), node.Devices...)
-	copy.LastHealthCheck = cloneTime(node.LastHealthCheck)
-	return &copy, nil
+	return s.cloneNodeLocked(node), nil
 }
 
 // validateAgentSessionLocked is the single server-side lease gate for real
@@ -1481,10 +1485,7 @@ func (s *Store) updateNodeHealthLocked(node *model.Node, session string, update 
 	if err := s.commitLocked(before); err != nil {
 		return nil, err
 	}
-	copy := *node
-	copy.Devices = append([]model.GPUDevice(nil), node.Devices...)
-	copy.LastHealthCheck = cloneTime(node.LastHealthCheck)
-	return &copy, nil
+	return s.cloneNodeLocked(node), nil
 }
 
 func sameInventory(node *model.Node, update model.NodeHealthUpdate) bool {
@@ -1604,14 +1605,11 @@ func (s *Store) ListNodes() []*model.Node {
 	now := time.Now().UTC()
 	result := make([]*model.Node, 0, len(s.state.Nodes))
 	for _, n := range s.state.Nodes {
-		copy := *n
-		copy.ActiveJobs = append([]string(nil), n.ActiveJobs...)
-		copy.Devices = append([]model.GPUDevice(nil), n.Devices...)
-		copy.LastHealthCheck = cloneTime(n.LastHealthCheck)
+		copy := s.cloneNodeLocked(n)
 		if s.nodeHealthEnabled && !s.nodeHealthyLocked(n, now) && !strings.EqualFold(n.HealthStatus, "DEGRADED") {
 			copy.HealthStatus, copy.HealthReason = "DEGRADED", "health report stale"
 		}
-		result = append(result, &copy)
+		result = append(result, copy)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
@@ -1650,11 +1648,11 @@ func (s *Store) DeleteNode(id string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	if node.Busy || node.CurrentJob != "" {
+	if node.Busy || node.CurrentJob != "" || node.CleanupPending {
 		return ErrNodeBusy
 	}
 	for _, job := range s.state.Jobs {
-		if job.AssignedNode == id && (job.Status == model.JobAssigned || job.Status == model.JobRunning) {
+		if job.AssignedNode == id && activeJob(job.Status) {
 			return ErrNodeBusy
 		}
 	}
@@ -1782,7 +1780,7 @@ func (s *Store) nodeHealthyLocked(node *model.Node, now time.Time) bool {
 }
 
 func (s *Store) eligibleLocked(j *model.Job, n *model.Node, now time.Time, offlineAfter time.Duration) bool {
-	if n.CleanupPending || n.SessionEpoch == "" {
+	if n.Maintenance || n.CleanupPending || n.SessionEpoch == "" {
 		return false
 	}
 	if now.Sub(n.LastHeartbeat) > offlineAfter {
@@ -2284,7 +2282,7 @@ func (s *Store) updateJobLocked(job *model.Job, nodeID, session, attemptToken st
 	default:
 		return nil, errors.New("unsupported status transition")
 	}
-	job.Output, job.Error, job.UpdatedAt = resultOutput, resultError, now
+	job.Output, job.Error, job.UpdatedAt = boundedJobOutput(resultOutput), resultError, now
 	s.refreshNodeUsageLocked(nodeID)
 	if err := s.commitLocked(before); err != nil {
 		return nil, err
@@ -2333,11 +2331,8 @@ func (s *Store) updateJobOutputLocked(job *model.Job, nodeID, session, attemptTo
 	if job.Status != model.JobRunning && job.Status != model.JobCanceling {
 		return nil, errors.New("job is not running")
 	}
-	if len(output) > 64<<10 {
-		output = output[len(output)-(64<<10):]
-	}
 	before := cloneSnapshot(s.state)
-	job.Output = output
+	job.Output = boundedJobOutput(output)
 	job.UpdatedAt = time.Now().UTC()
 	if err := s.commitLocked(before); err != nil {
 		return nil, err
@@ -2350,22 +2345,6 @@ func (s *Store) ValidateJobAttempt(id, nodeID, session, attemptToken string) err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.validateJobAttemptLocked(id, nodeID, session, attemptToken)
-}
-
-// CommitJobAttempt runs commit only while the Agent session and attempt lease
-// are still valid. Holding the Store lock across the final, atomic object-store
-// promotion linearizes it with node takeover and cleanup fencing without
-// holding the lock during the potentially large staging upload.
-func (s *Store) CommitJobAttempt(id, nodeID, session, attemptToken string, commit func() error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.validateJobAttemptLocked(id, nodeID, session, attemptToken); err != nil {
-		return err
-	}
-	if commit == nil {
-		return errors.New("artifact commit callback is required")
-	}
-	return commit()
 }
 
 func (s *Store) validateJobAttemptLocked(id, nodeID, session, attemptToken string) error {

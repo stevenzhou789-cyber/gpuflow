@@ -743,7 +743,7 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
   }, [initialJob]);
 
   useEffect(() => {
-    if (!["assigned", "running", "canceling"].includes(job.status)) return;
+    if (!["queued", "assigned", "running", "canceling"].includes(job.status)) return;
     let active = true;
     const refresh = () =>
       api<Job>(`/v1/jobs/${job.id}`)

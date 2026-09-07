@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -142,28 +143,50 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	name := filepath.Base(header.Filename)
-	staged, err := s.artifacts.Stage(r.Context(), jobID, name, file, header.Size)
+	storageID, err := artifact.NewUploadStorageID(jobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Every upload writes its own hidden namespace. A delayed copy can only
+	// change that version, never the canonical file exposed to readers.
+	staged, err := s.artifacts.Stage(r.Context(), storageID, name, file, header.Size)
 	if err != nil {
 		s.discardArtifact(staged)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	defer s.discardArtifact(staged)
-
-	var promoteErr error
-	err = s.store.CommitJobAttempt(jobID, nodeID, session, attemptToken, func() error {
-		promoteErr = s.artifacts.Commit(r.Context(), staged)
-		return promoteErr
-	})
-	if err != nil {
-		if promoteErr != nil {
-			writeError(w, http.StatusBadGateway, promoteErr.Error())
-		} else {
-			handleStoreError(w, err)
-		}
+	if err := s.store.ValidateJobAttempt(jobID, nodeID, session, attemptToken); err != nil {
+		handleStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, artifact.Item{Name: name, Size: header.Size, LastModified: time.Now().UTC()})
+	if err := s.artifacts.Commit(r.Context(), staged); err != nil {
+		s.discardArtifactVersion(storageID)
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	modified := time.Now().UTC()
+	if err := s.store.PublishJobArtifact(jobID, nodeID, session, attemptToken, name, model.ArtifactReference{StorageID: storageID, Size: header.Size, LastModified: modified}); err != nil {
+		// A database commit error can have an uncertain outcome. Keep the
+		// immutable object in that case: a successfully committed reference must
+		// remain readable after restart. Unreferenced versions stay hidden and
+		// are removed with the job's existing recursive artifact deletion.
+		if !errors.Is(err, store.ErrPersistence) {
+			s.discardArtifactVersion(storageID)
+		}
+		handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, artifact.Item{Name: name, Size: header.Size, LastModified: modified})
+}
+
+func (s *Server) discardArtifactVersion(storageID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := s.artifacts.Delete(ctx, storageID); err != nil {
+		log.Printf("discard unpublished artifact version: %v", err)
+	}
 }
 
 func (s *Server) discardArtifact(staged artifact.Staged) {
@@ -175,7 +198,8 @@ func (s *Server) discardArtifact(staged artifact.Staged) {
 }
 
 func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id")); err != nil {
+	job, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id"))
+	if err != nil {
 		handleStoreError(w, err)
 		return
 	}
@@ -184,15 +208,31 @@ func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// Legacy canonical objects remain readable. Published references override
+	// matching names without exposing hidden versions or staging objects.
+	merged := make(map[string]artifact.Item, len(items)+len(job.ArtifactRefs))
+	for _, item := range items {
+		merged[item.Name] = item
+	}
+	for name, reference := range job.ArtifactRefs {
+		merged[name] = artifact.Item{Name: name, Size: reference.Size, LastModified: reference.LastModified}
+	}
+	items = make([]artifact.Item, 0, len(merged))
+	for _, item := range merged {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
 	writeJSON(w, http.StatusOK, map[string]any{"enabled": s.artifacts.Enabled(), "items": items})
 }
 
 func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id")); err != nil {
+	job, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id"))
+	if err != nil {
 		handleStoreError(w, err)
 		return
 	}
-	reader, item, err := s.artifacts.Open(r.Context(), r.PathValue("id"), r.PathValue("name"))
+	name := r.PathValue("name")
+	reader, item, err := s.artifacts.Open(r.Context(), artifactStorageID(job, name), name)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "artifact not found")
 		return
@@ -204,6 +244,13 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, reader)
 }
 
+func artifactStorageID(job *model.Job, name string) string {
+	if reference, exists := job.ArtifactRefs[name]; exists {
+		return reference.StorageID
+	}
+	return job.ID
+}
+
 func (s *Server) downloadFullJobLog(w http.ResponseWriter, r *http.Request) {
 	job, err := s.store.GetJobForScope(requestScope(r), r.PathValue("id"))
 	if err != nil {
@@ -211,7 +258,7 @@ func (s *Server) downloadFullJobLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.artifacts.Enabled() {
-		reader, item, openErr := s.artifacts.Open(r.Context(), job.ID, "training.log")
+		reader, item, openErr := s.artifacts.Open(r.Context(), artifactStorageID(job, "training.log"), "training.log")
 		if openErr != nil {
 			writeError(w, http.StatusNotFound, "complete job log not found")
 			return

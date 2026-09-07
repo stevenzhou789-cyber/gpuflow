@@ -110,6 +110,18 @@ func objectName(jobID, name string) (string, error) {
 
 const stagingDirectory = ".gpuflow-staging"
 
+const versionDirectory = ".gpuflow-versions"
+
+// NewUploadStorageID isolates every upload, including uploads of the same file
+// from superseded attempts. Only a durable job reference makes a version visible.
+func NewUploadStorageID(jobID string) (string, error) {
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return "", fmt.Errorf("create artifact version key: %w", err)
+	}
+	return jobID + "/" + versionDirectory + "/" + hex.EncodeToString(random), nil
+}
+
 func stagedObjectName(jobID, name string) (Staged, error) {
 	destinationKey, err := objectName(jobID, name)
 	if err != nil {
@@ -162,7 +174,7 @@ func (s *minioStore) List(ctx context.Context, jobID string) ([]Item, error) {
 			return nil, obj.Err
 		}
 		name := strings.TrimPrefix(obj.Key, jobID+"/")
-		if strings.HasPrefix(name, stagingDirectory+"/") {
+		if strings.HasPrefix(name, stagingDirectory+"/") || strings.HasPrefix(name, versionDirectory+"/") {
 			continue
 		}
 		items = append(items, Item{Name: name, Size: obj.Size, LastModified: obj.LastModified})

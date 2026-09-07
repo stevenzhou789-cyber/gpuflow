@@ -66,10 +66,14 @@ type SchedulingDecisionPage = store.SchedulingDecisionPage
 type JobSchedulingExplanation = model.JobSchedulingExplanation
 type SchedulingNodeCounts = model.SchedulingNodeCounts
 type ProjectSchedulingState = model.ProjectSchedulingState
+type Node = model.Node
 
 const (
-	ProjectActive   = model.ProjectActive
-	ProjectDisabled = model.ProjectDisabled
+	ProjectActive           = model.ProjectActive
+	ProjectDisabled         = model.ProjectDisabled
+	NodeMaintenanceActive   = model.NodeMaintenanceActive
+	NodeMaintenanceDraining = model.NodeMaintenanceDraining
+	NodeMaintenanceDrained  = model.NodeMaintenanceDrained
 )
 
 var (
@@ -101,6 +105,7 @@ const (
 	SchedulingReasonRequirementsUnmatched = store.SchedulingReasonRequirementsUnmatched
 	SchedulingReasonLicenseUnavailable    = store.SchedulingReasonLicenseUnavailable
 	SchedulingReasonNodesNotReady         = store.SchedulingReasonNodesNotReady
+	SchedulingReasonNodesInMaintenance    = store.SchedulingReasonNodesInMaintenance
 	SchedulingReasonInsufficientCapacity  = store.SchedulingReasonInsufficientCapacity
 	SchedulingReasonProjectQueueOrder     = store.SchedulingReasonProjectQueueOrder
 	SchedulingReasonFairShareWait         = store.SchedulingReasonFairShareWait
@@ -124,6 +129,12 @@ type SchedulingObserver interface {
 	ListProjectSchedulingStates() []ProjectSchedulingState
 }
 
+// NodeMaintenanceController lets Enterprise stop new assignments without
+// interrupting existing attempts. Clearing maintenance is always explicit.
+type NodeMaintenanceController interface {
+	SetNodeMaintenance(string, bool) (*Node, error)
+}
+
 // Runtime owns the composed HTTP handler and its supported live controls.
 // Callers should retain Runtime instead of asserting private methods on the
 // returned http.Handler.
@@ -133,6 +144,10 @@ type Runtime struct {
 }
 
 func (r *Runtime) Handler() http.Handler { return r.handler }
+
+func (r *Runtime) SetNodeMaintenance(id string, enabled bool) (*Node, error) {
+	return r.state.SetNodeMaintenance(id, enabled)
+}
 
 func (r *Runtime) CreateProject(in ProjectCreate) (*Project, error) {
 	return r.state.CreateProject(in)
