@@ -1,0 +1,20 @@
+# Keep local credentials, data and temporary worktrees out of the build context.
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!pkg/
+!pkg/**
+!web/
+!web/**
+web/node_modules/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+**/.env
+**/.env.*
+**/*.key
+**/*.pem

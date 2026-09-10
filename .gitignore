@@ -12,3 +12,5 @@ scripts/agents.conf
 .gpuflow/
 /.issuer/
 *.exe
+/.local-gitlab/
+/.gitlab-migration-work/

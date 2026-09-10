@@ -1,0 +1,110 @@
+name: gpuflow-devops
+
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:19.3.1-ce.0@sha256:f63df4c43029fe91db370609c0b40a1e3585cebd06e3e9637d93a9a3030eb86e
+    container_name: gpuflow-gitlab
+    hostname: gitlab.gpuflow.test
+    restart: unless-stopped
+    shm_size: 256m
+    mem_limit: 3584m
+    cpus: 4
+    ports:
+      - "127.0.0.1:8088:8088"
+      - "127.0.0.1:2224:22"
+      - "127.0.0.1:5055:5055"
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://gitlab.gpuflow.test:8088'
+        letsencrypt['enable'] = false
+        gitlab_rails['gitlab_shell_ssh_port'] = 2224
+        nginx['listen_port'] = 8088
+        nginx['listen_https'] = false
+        registry_external_url 'http://gitlab.gpuflow.test:5055'
+        registry_nginx['listen_port'] = 5055
+        registry_nginx['listen_https'] = false
+        puma['worker_processes'] = 0
+        puma['min_threads'] = 1
+        puma['max_threads'] = 2
+        sidekiq['concurrency'] = 5
+        postgresql['shared_buffers'] = '128MB'
+        postgresql['work_mem'] = '4MB'
+        prometheus_monitoring['enable'] = false
+        prometheus['enable'] = false
+        alertmanager['enable'] = false
+        gitlab_exporter['enable'] = false
+        node_exporter['enable'] = false
+        postgres_exporter['enable'] = false
+        redis_exporter['enable'] = false
+        gitlab_kas['enable'] = false
+        puma['exporter_enabled'] = false
+        sidekiq['metrics_enabled'] = false
+        gitlab_rails['env'] = { 'MALLOC_CONF' => 'dirty_decay_ms:1000,muzzy_decay_ms:1000' }
+        gitaly['env'] = { 'MALLOC_CONF' => 'dirty_decay_ms:1000,muzzy_decay_ms:1000', 'GITALY_COMMAND_SPAWN_MAX_PARALLEL' => '2' }
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+    networks:
+      devops:
+        ipv4_address: 172.30.88.2
+        aliases:
+          - gitlab.gpuflow.test
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8088/-/readiness"]
+      interval: 30s
+      timeout: 10s
+      retries: 30
+      start_period: 10m
+
+  builder:
+    image: docker:29.3.1-dind
+    container_name: gpuflow-gitlab-builder
+    restart: unless-stopped
+    privileged: true
+    mem_limit: 2048m
+    cpus: 2
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    command:
+      - "--host=tcp://0.0.0.0:2375"
+      - "--host=unix:///var/run/docker.sock"
+      - "--insecure-registry=gitlab.gpuflow.test:5055"
+      - "--max-concurrent-downloads=2"
+    volumes:
+      - builder-data:/var/lib/docker
+    networks:
+      devops:
+        ipv4_address: 172.30.88.3
+    # No host socket mounts or published Docker API ports. This daemon is only
+    # for trusted local CI jobs, never for untrusted contributions.
+
+  runner:
+    image: gitlab/gitlab-runner:alpine-v19.3.0
+    container_name: gpuflow-gitlab-runner
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 1
+    volumes:
+      - runner-config:/etc/gitlab-runner
+    networks:
+      - devops
+
+networks:
+  devops:
+    name: gpuflow-devops
+    ipam:
+      config:
+        - subnet: 172.30.88.0/24
+
+volumes:
+  gitlab-config:
+    name: gpuflow-gitlab-config
+  gitlab-logs:
+    name: gpuflow-gitlab-logs
+  gitlab-data:
+    name: gpuflow-gitlab-data
+  builder-data:
+    name: gpuflow-gitlab-builder-data
+  runner-config:
+    name: gpuflow-gitlab-runner-config
