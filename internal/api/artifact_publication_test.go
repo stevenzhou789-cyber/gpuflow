@@ -27,11 +27,12 @@ import (
 // publicationS3 implements the small S3 surface exercised by the real MinIO
 // artifact store. Its first CopyObject can stall independently of API requests.
 type publicationS3 struct {
-	mu          sync.Mutex
-	objects     map[string][]byte
-	copyStarted chan struct{}
-	releaseCopy chan struct{}
-	copyCount   int
+	mu           sync.Mutex
+	objects      map[string][]byte
+	copyStarted  chan struct{}
+	releaseCopy  chan struct{}
+	copyCount    int
+	failCopyName string
 }
 
 func (s *publicationS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -74,6 +75,7 @@ func (s *publicationS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.copyCount++
 		first := s.copyCount == 1
+		failCopy := s.failCopyName != "" && strings.HasSuffix(key, "/"+s.failCopyName)
 		s.mu.Unlock()
 		if first {
 			close(s.copyStarted)
@@ -82,6 +84,12 @@ func (s *publicationS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case <-r.Context().Done():
 				return
 			}
+		}
+		if failCopy {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>injected copy failure</Message></Error>`)
+			return
 		}
 		source, _ = url.PathUnescape(source)
 		source = strings.TrimPrefix(strings.TrimPrefix(source, "/"), "artifacts/")
@@ -160,9 +168,14 @@ func publicationETag(payload []byte) string {
 
 func publicationUpload(t *testing.T, server *httptest.Server, jobID, nodeID, session, token, content string) *http.Request {
 	t.Helper()
+	return publicationUploadFile(t, server, jobID, nodeID, session, token, "training.log", content)
+}
+
+func publicationUploadFile(t *testing.T, server *httptest.Server, jobID, nodeID, session, token, name, content string) *http.Request {
+	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("file", "training.log")
+	part, err := writer.CreateFormFile("file", name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +314,7 @@ func TestArtifactSlowCopyDoesNotBlockHeartbeatsAndStaleCopyCannotPublish(t *test
 	case <-time.After(5 * time.Second):
 		t.Fatal("stale upload did not finish")
 	}
-	for endpoint, want := range map[string]string{"/artifacts/training.log": "replacement log", "/logs/full": "replacement log", "/artifacts/legacy.txt": "legacy file"} {
+	for endpoint, want := range map[string]string{"/artifacts/training.log": "replacement log", "/logs/full": "replacement log"} {
 		get, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/jobs/"+job.ID+endpoint, nil)
 		get.Header.Set("Authorization", "Bearer test-token")
 		response, err := http.DefaultClient.Do(get)
@@ -314,10 +327,13 @@ func TestArtifactSlowCopyDoesNotBlockHeartbeatsAndStaleCopyCannotPublish(t *test
 			t.Fatalf("%s returned %d %q", endpoint, response.StatusCode, payload)
 		}
 	}
+	if status := request(t, server, http.MethodGet, "/v1/jobs/"+job.ID+"/artifacts/legacy.txt", nil, nil); status != http.StatusNotFound {
+		t.Fatalf("unattributed legacy artifact returned %d after retry", status)
+	}
 	var listed struct {
 		Items []artifact.Item `json:"items"`
 	}
-	if status := request(t, server, http.MethodGet, "/v1/jobs/"+job.ID+"/artifacts", nil, &listed); status != http.StatusOK || len(listed.Items) != 2 {
+	if status := request(t, server, http.MethodGet, "/v1/jobs/"+job.ID+"/artifacts", nil, &listed); status != http.StatusOK || len(listed.Items) != 1 || listed.Items[0].Name != "training.log" {
 		t.Fatalf("listing: %d %+v", status, listed)
 	}
 	for _, item := range listed.Items {

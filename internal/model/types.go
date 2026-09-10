@@ -79,6 +79,9 @@ type ArtifactReference struct {
 	StorageID    string    `json:"storage_id"`
 	Size         int64     `json:"size"`
 	LastModified time.Time `json:"last_modified"`
+	// Attempt is assigned by the control plane when publishing. Zero denotes
+	// legacy data whose execution cannot be identified after a retry.
+	Attempt int `json:"attempt,omitempty"`
 }
 
 // AcceleratorUsageRecord is an immutable pricing snapshot for one execution

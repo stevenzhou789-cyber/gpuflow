@@ -122,7 +122,7 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	if _, err := s.UpdateJobLease(job.ID, node.ID, node.SessionEpoch, artifactDispatch.AttemptToken, model.JobUpdate{Status: model.JobRunning, Output: "partial"}); err != nil {
 		t.Fatal(err)
 	}
-	artifactReference := model.ArtifactReference{StorageID: job.ID + "/.gpuflow-versions/mysql-roundtrip", Size: 7, LastModified: time.Now().UTC().Truncate(time.Microsecond)}
+	artifactReference := model.ArtifactReference{StorageID: job.ID + "/.gpuflow-versions/mysql-roundtrip", Size: 7, LastModified: time.Now().UTC().Truncate(time.Microsecond), Attempt: 1}
 	if err := s.PublishJobArtifact(job.ID, node.ID, node.SessionEpoch, artifactDispatch.AttemptToken, "training.log", artifactReference); err != nil {
 		t.Fatal(err)
 	}

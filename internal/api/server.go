@@ -203,19 +203,26 @@ func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		handleStoreError(w, err)
 		return
 	}
-	items, err := s.artifacts.List(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
+	var items []artifact.Item
+	if legacyJobArtifactsAllowed(job) {
+		items, err = s.artifacts.List(r.Context(), job.ID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
 	}
-	// Legacy canonical objects remain readable. Published references override
-	// matching names without exposing hidden versions or staging objects.
+	// Unattributed legacy objects remain readable only before a job has retried.
+	// A missing current-attempt upload must never fall back to an older result.
 	merged := make(map[string]artifact.Item, len(items)+len(job.ArtifactRefs))
 	for _, item := range items {
 		merged[item.Name] = item
 	}
 	for name, reference := range job.ArtifactRefs {
-		merged[name] = artifact.Item{Name: name, Size: reference.Size, LastModified: reference.LastModified}
+		if artifactReferenceIsCurrent(job, reference) {
+			merged[name] = artifact.Item{Name: name, Size: reference.Size, LastModified: reference.LastModified}
+		} else {
+			delete(merged, name)
+		}
 	}
 	items = make([]artifact.Item, 0, len(merged))
 	for _, item := range merged {
@@ -232,7 +239,12 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	reader, item, err := s.artifacts.Open(r.Context(), artifactStorageID(job, name), name)
+	storageID, exists := artifactStorageID(job, name)
+	if !exists {
+		writeError(w, http.StatusNotFound, "artifact not found for current attempt")
+		return
+	}
+	reader, item, err := s.artifacts.Open(r.Context(), storageID, name)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "artifact not found")
 		return
@@ -244,11 +256,22 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, reader)
 }
 
-func artifactStorageID(job *model.Job, name string) string {
-	if reference, exists := job.ArtifactRefs[name]; exists {
-		return reference.StorageID
+func legacyJobArtifactsAllowed(job *model.Job) bool {
+	return job.Attempts <= 1
+}
+
+func artifactReferenceIsCurrent(job *model.Job, reference model.ArtifactReference) bool {
+	if reference.Attempt == 0 {
+		return legacyJobArtifactsAllowed(job)
 	}
-	return job.ID
+	return reference.Attempt == job.Attempts
+}
+
+func artifactStorageID(job *model.Job, name string) (string, bool) {
+	if reference, exists := job.ArtifactRefs[name]; exists {
+		return reference.StorageID, artifactReferenceIsCurrent(job, reference)
+	}
+	return job.ID, legacyJobArtifactsAllowed(job)
 }
 
 func (s *Server) downloadFullJobLog(w http.ResponseWriter, r *http.Request) {
@@ -258,7 +281,12 @@ func (s *Server) downloadFullJobLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.artifacts.Enabled() {
-		reader, item, openErr := s.artifacts.Open(r.Context(), artifactStorageID(job, "training.log"), "training.log")
+		storageID, exists := artifactStorageID(job, "training.log")
+		if !exists {
+			writeError(w, http.StatusNotFound, "complete job log not found for current attempt")
+			return
+		}
+		reader, item, openErr := s.artifacts.Open(r.Context(), storageID, "training.log")
 		if openErr != nil {
 			writeError(w, http.StatusNotFound, "complete job log not found")
 			return

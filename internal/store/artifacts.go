@@ -35,6 +35,9 @@ func (s *Store) PublishJobArtifact(id, nodeID, session, attemptToken, name strin
 	}
 	before := cloneSnapshot(s.state)
 	job := s.state.Jobs[id]
+	// Never trust caller-supplied attribution. Validation, attribution, and
+	// publication use the same lock and durable transaction as job transitions.
+	reference.Attempt = job.Attempts
 	// Copy on write also keeps previously returned Job snapshots immutable.
 	job.ArtifactRefs = cloneArtifactReferences(job.ArtifactRefs)
 	if job.ArtifactRefs == nil {
