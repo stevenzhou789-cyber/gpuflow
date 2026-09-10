@@ -71,5 +71,5 @@ restore_control_image() {
   local install_dir=$1 saved_env=$2
   log "restoring the previous control-plane image"
   cp "$saved_env" "$install_dir/.env"
-  docker compose --project-directory "$install_dir" up -d --no-deps --pull never control-plane
+  docker compose --project-directory "$install_dir" up -d --no-deps --pull never --no-build control-plane
 }

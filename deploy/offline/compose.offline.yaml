@@ -1,0 +1,8 @@
+# Used together with the original compose.yaml. No source builds or pulls.
+services:
+  control-plane:
+    pull_policy: never
+  mysql:
+    pull_policy: never
+  minio:
+    pull_policy: never

@@ -17,6 +17,9 @@ Options:
   --inventory FILE           Upgrade agents listed in FILE after the control plane
   --skip-agents              Upgrade only the control plane
   --skip-backup              Do not create a MySQL/configuration backup
+  --offline                 Load only a signed offline package; never pull
+  --offline-package DIR     Matching full offline package directory
+  --public-key FILE         Separately trusted Cosign public key
 EOF
 }
 
@@ -29,6 +32,9 @@ IMAGE_REPOSITORY=${GPUFLOW_IMAGE_REPOSITORY:-ghcr.io/stevenzhou789-cyber/gpuflow
 INVENTORY=
 SKIP_AGENTS=false
 SKIP_BACKUP=false
+OFFLINE=false
+OFFLINE_PACKAGE=
+PUBLIC_KEY=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -37,6 +43,9 @@ while [ "$#" -gt 0 ]; do
     --inventory) [ "$#" -ge 2 ] || die "--inventory requires a file"; INVENTORY=$2; shift 2 ;;
     --skip-agents) SKIP_AGENTS=true; shift ;;
     --skip-backup) SKIP_BACKUP=true; shift ;;
+    --offline) OFFLINE=true; shift ;;
+    --offline-package) [ "$#" -ge 2 ] || die "--offline-package requires a directory"; OFFLINE_PACKAGE=$2; shift 2 ;;
+    --public-key) [ "$#" -ge 2 ] || die "--public-key requires a file"; PUBLIC_KEY=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -57,7 +66,20 @@ BACKUP_DIR="$STATE_DIR/backups/$TIMESTAMP"
 mkdir -p "$STATE_DIR/backups"
 
 log "checking image $TARGET_IMAGE"
-docker pull "$TARGET_IMAGE"
+if [ "$OFFLINE" = true ]; then
+  . "$SCRIPT_DIR/offline-lib.sh"
+  [ -n "$OFFLINE_PACKAGE" ] && [ -n "$PUBLIC_KEY" ] || die "--offline requires --offline-package and --public-key"
+  OFFLINE_PACKAGE=$(cd -- "$OFFLINE_PACKAGE" && pwd)
+  architecture=$(offline_architecture)
+  offline_verify_package "$OFFLINE_PACKAGE" "$PUBLIC_KEY" "$architecture"
+  [ "$(cat "$OFFLINE_PACKAGE/VERSION")" = "$VERSION" ] || die "offline package version does not match"
+  [ "$(awk -F '\t' '$1=="app" {print $2}' "$OFFLINE_PACKAGE/IMAGE-MANIFEST.tsv")" = "$TARGET_IMAGE" ] || die "--image-repository does not match the signed offline package"
+  offline_load_images "$OFFLINE_PACKAGE" "$architecture"
+  offline_clear_compose_overrides
+else
+  [ -z "$OFFLINE_PACKAGE" ] && [ -z "$PUBLIC_KEY" ] || die "offline package options require --offline"
+  docker pull "$TARGET_IMAGE"
+fi
 
 if [ "$SKIP_BACKUP" = false ]; then
   backup_installation "$INSTALL_DIR" "$BACKUP_DIR"
@@ -74,14 +96,17 @@ printf '%s\n' "$TARGET_IMAGE" > "$BACKUP_DIR/target-image"
 
 set_env_value "$INSTALL_DIR/.env" GPUFLOW_IMAGE "$TARGET_IMAGE"
 set_env_value "$INSTALL_DIR/.env" GPUFLOW_AGENT_IMAGE "$TARGET_IMAGE"
+if [ "$OFFLINE" = true ]; then
+  set_env_value "$INSTALL_DIR/.env" GPUFLOW_PROBE_IMAGE "$(awk -F '\t' '$1=="probe" {print $2}' "$OFFLINE_PACKAGE/IMAGE-MANIFEST.tsv")"
+fi
 
 log "upgrading control plane to $VERSION"
-if ! docker compose --project-directory "$INSTALL_DIR" up -d --no-deps --pull never control-plane; then
+if ! docker compose --project-directory "$INSTALL_DIR" up -d --no-deps --pull never --no-build control-plane; then
   restore_control_image "$INSTALL_DIR" "$BACKUP_DIR/.env"
   die "control-plane replacement failed; previous image restored"
 fi
 
-if ! wait_for_control_plane "$INSTALL_DIR" 30; then
+if ! wait_for_control_plane "$INSTALL_DIR" 30 || { [ "$OFFLINE" = true ] && ! offline_health_checks "$INSTALL_DIR"; }; then
   docker compose --project-directory "$INSTALL_DIR" logs --tail 100 control-plane >&2 || true
   restore_control_image "$INSTALL_DIR" "$BACKUP_DIR/.env"
   die "health check failed; previous control-plane image restored (database was not restored)"
@@ -89,10 +114,15 @@ fi
 
 printf '%s\n' "$VERSION" > "$STATE_DIR/current-version"
 printf '%s\n' "$BACKUP_DIR" > "$STATE_DIR/last-backup"
+if [ "$OFFLINE" = true ]; then
+  cp "$OFFLINE_PACKAGE/IMAGE-MANIFEST.tsv" "$STATE_DIR/offline-images.tsv"
+fi
 
 if [ "$SKIP_AGENTS" = false ]; then
   if [ -f "$INVENTORY" ]; then
-    bash "$SCRIPT_DIR/upgrade-agents.sh" "$VERSION" --inventory "$INVENTORY" --image-repository "$IMAGE_REPOSITORY"
+    offline_args=()
+    if [ "$OFFLINE" = true ]; then offline_args=(--offline --offline-package "$OFFLINE_PACKAGE" --public-key "$PUBLIC_KEY"); fi
+    bash "$SCRIPT_DIR/upgrade-agents.sh" "$VERSION" --inventory "$INVENTORY" --image-repository "$IMAGE_REPOSITORY" "${offline_args[@]}"
   else
     log "agent inventory not found; control plane upgraded, agents skipped ($INVENTORY)"
   fi

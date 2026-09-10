@@ -4,30 +4,38 @@ stages:
 workflow:
   rules:
     - if: '$CI_COMMIT_TAG'
-    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 default:
-  image: docker:29-cli
+  image:
+    name: $GPUFLOW_CI_IMAGE
+    entrypoint: [""]
   tags:
     - linux-docker
-  interruptible: true
+  interruptible: false
 
 variables:
   GOMAXPROCS: "2"
   DOCKER_BUILDKIT: "1"
+  GPUFLOW_CI_IMAGE: gitlab.gpuflow.test:5055/gpuflow/gpuflow/ci-tools@sha256:3a0babf52685e4b98d4711b5c62537f6ce8a55657b0a42da6cc777a18b8b6399
+  BUILDKIT_IMAGE: moby/buildkit:v0.28.1@sha256:a82d1ab899cda51aade6fe818d71e4b58c4079e047a0cf29dbb93b2b0465ea69
+  OFFLINE_DIND_IMAGE: docker:29.3.1-dind@sha256:686d2c5464787b0ca42420e0aa03a94fc9781ff9bf8b5ff947614b9fa4c3c3e0
   # DOCKER_HOST is supplied by the isolated local runner, never a host socket.
 
-development-build:
+full-signed-build:
   stage: build
-  resource_group: gpuflow-development-build
-  timeout: 1h
+  resource_group: gpuflow-full-signed-build
+  environment:
+    name: release-signing
+    action: prepare
+  timeout: 2h
   script:
-    - sh scripts/gitlab-build.sh
+    - bash scripts/gitlab-full-build.sh
   artifacts:
-    name: "gpuflow-development-unsigned-$CI_COMMIT_SHORT_SHA-$CI_JOB_ID"
+    name: "gpuflow-full-signed-$CI_COMMIT_SHORT_SHA-$CI_JOB_ID"
     when: always
-    expire_in: 3 days
+    expire_in: 90 days
     access: developer
     paths:
       - gitlab-logs/
-      - gitlab-artifacts/
+      - gitlab-artifacts/full/
