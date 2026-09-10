@@ -1,6 +1,6 @@
 # GPUFlow 本地 GitLab 运维
 
-本配置用于 Windows Docker Desktop（WSL2 / Linux 容器）的本机开发与交付验证，不是生产部署或团队高可用代码服务器。社区版、企业版、许可证工具均为私有项目。**当前工作流只向 GitLab 推送并运行 GitLab CI，不再向 GitHub 推送或触发 GitHub Actions。** 每个仓库的 `origin`、原 GitHub workflows 和已有 tag 仅保留记录；它们不是自动回退通道。
+本配置用于 Windows Docker Desktop（WSL2 / Linux 容器）的本机开发与交付验证，不是生产部署或团队高可用代码服务器。本地 GitLab 中的社区版、企业版、许可证工具均为私有项目。**社区版和企业版按当前用户要求同步到 GitHub 与 GitLab，保留两端 CI 并分别报告结果。** 其他项目遵循各自用户授权；任一服务的配额或构建失败都不等于两端代码同步失败，也不能据此放宽发布门禁。
 
 本机停机、休眠、Docker Desktop 关闭或磁盘故障都会影响 GitLab。下文说明配置和验收要求；只有对应流水线、报告及下载后的产物验证全部成功，才能宣布本次构建完成。
 
@@ -95,19 +95,19 @@ Registry 当前为本机 HTTP，builder 只为 `gitlab.gpuflow.test:5055` 配置
 
 缺工具、缺架构、扫描出错、报告缺失、批准过期、签名不匹配、往返或包校验失败都必须失败，不能静默降级、忽略错误或只上传日志后声称交付完成。既有 `v1.1.3` 风险批准只覆盖文档中精确依赖 Digest 且有期限，不能为新版本、新 Digest 或新问题自动续批。扫描报告与完整交付证据按 CI 配置保留 90 天；许可证开发程序包按其 CI 配置保留 7 天。必须核对 artifact 上传成功且能下载，构建容器内生成文件并不等于交付完成。
 
-SHA 构建即使镜像和校验和已签名，也不等于批准发布新的 `v*` 正式版本。正式 tag 发布事务尚未完整迁移时，tag 流水线明确失败；不要创建、移动、删除、重打或重放已有 `v1.1.3`，也不回退触发 GitHub Actions。镜像有独立生命周期，应配置 SHA 镜像清理规则，不能删除正在部署或仍需回滚的 Digest。
+SHA 构建即使镜像和校验和已签名，也不等于批准发布新的 `v*` 正式版本。社区版的正式 tag 发布事务尚未完整迁移，tag 流水线明确失败；企业版的正式发布由其独立的标签、审批、验证和发布证据门禁控制。不要移动、删除、重打或重放已有 `v1.1.3`。镜像有独立生命周期，应配置 SHA 镜像清理规则，不能删除正在部署或仍需回滚的 Digest。
 
-## 日常 GitLab-only 工作流
+## 日常双端同步工作流
 
-保留现有 GitHub `origin` 记录，另设单一推送 URL 的 `gitlab` 远端。每个仓库都自带推送脚本，无需依赖兄弟仓库布局。提交前审查 diff、运行测试、显式选择源码文件；本地 commit 经授权完成后，在该仓库执行：
+配置单一推送 URL 的 GitHub `origin` 和本地 `gitlab` 两个远端。社区版和企业版均自带双端推送脚本，无需依赖兄弟仓库布局。提交前审查 diff、运行测试、显式选择源码文件；本地 commit 经授权完成后，在该仓库执行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\push-gitlab.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\push-all.ps1
 ```
 
-也可显式指定实际仓库的 `-RepoPath`。迁移阶段使用隔离副本的真实路径，不能混入原始仓库。脚本不 stage/commit，不处理未跟踪文件，不创建 tag、不强推；它冻结当前提交 SHA、使用显式 refspec，并逐个查询 GitLab 核验远端 SHA。tracked 文件未提交时会阻止推送，失败时不会请求 GitHub或自动切换 `origin`。
+也可显式指定实际仓库的 `-RepoPath`。迁移阶段使用隔离副本的真实路径，不能混入原始仓库。脚本不 stage/commit，不处理未跟踪文件，不创建 tag、不强推；它冻结当前提交 SHA、使用显式 refspec，并分别核验两端远端 SHA。tracked 文件未提交时会阻止推送；两端推送不是跨服务原子事务，必须明确报告部分失败。CI 状态也应按服务分别报告，推送成功不等于构建成功。
 
-旧 `push-all.ps1` 已成为明确提示的 GitLab-only 兼容入口；显式传入旧 `-GitHubRemote` 参数会直接拒绝，而不是偷偷忽略。仅在明确要求推送一个已存在且获准的 tag 时才使用 `-Tag <已有tag>`，这不会绕过 CI 的正式发布门禁。
+`push-all.ps1` 是默认双端入口；`push-gitlab.ps1` 保留为获得明确授权时的单端辅助工具。仅在明确要求推送一个已存在且获准的 tag 时才使用 `push-all.ps1 -Tag <已有tag>`，这不会绕过 CI 的正式发布门禁。
 
 规范域名的 Git 访问使用以下仓库级配置（`.git/config`），不改全局 Git 或 hosts。迁移初始化应设置并核验它；不要在 PowerShell 5.1 中依赖原生命令的空字符串传参来设置空代理：
 
@@ -147,4 +147,4 @@ docker exec gpuflow-gitlab gitlab-backup create
 
 备份默认位于容器 `/var/opt/gitlab/backups`。还需单独备份 `/etc/gitlab`，尤其 `gitlab-secrets.json`、本目录配置和 Linux Runner 配置；本机 `.local-gitlab` 与 Windows Runner 私有状态也需要受控备份，DPAPI 文件不是可任意跨机器移植的明文恢复凭据。备份不能只留在同一命名卷或 Docker 数据盘中。
 
-应用备份不是运行中卷的随意文件复制；全卷快照应先停止相关服务、保证一致性。详见 [备份范围与排除项](https://docs.gitlab.com/administration/backup_restore/backup_gitlab/)。升级前保存确切版本和可恢复备份，遵循 GitLab 升级路径，并定期在隔离环境验证恢复。历史 GitHub 副本不会随当前 GitLab-only 工作流更新，也不能替代 GitLab 数据库、项目配置、产物和凭据备份。
+应用备份不是运行中卷的随意文件复制；全卷快照应先停止相关服务、保证一致性。详见 [备份范围与排除项](https://docs.gitlab.com/administration/backup_restore/backup_gitlab/)。升级前保存确切版本和可恢复备份，遵循 GitLab 升级路径，并定期在隔离环境验证恢复。GitHub 代码副本不能替代 GitLab 数据库、项目配置、产物和凭据备份。

@@ -1,8 +1,9 @@
 # Local GitLab full signed CI
 
 The current pipeline is `full-signed-build`, not the superseded unsigned
-development-only script. GitHub workflows remain historical contract references
-and are not pushed or invoked. Only protected main uses `release-signing`;
+development-only script. Code is synchronized to GitHub and GitLab with
+`scripts/push-all.ps1`; existing GitHub workflows also run normally, and their
+results are reported separately. Only protected main uses `release-signing`;
 all tag runs fail closed before publication.
 
 `gitlab-full-build.sh` builds Node 22 UI assets and runs complete Go test/vet,

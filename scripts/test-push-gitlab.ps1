@@ -1,7 +1,6 @@
 # Windows PowerShell 5.1 mock tests. No network, real pushes, commits, or config writes.
 $ErrorActionPreference = 'Stop'
 $pushScript = Join-Path $PSScriptRoot 'push-gitlab.ps1'
-$compatibilityScript = Join-Path $PSScriptRoot 'push-all.ps1'
 $testRepo = Split-Path -Parent $PSScriptRoot
 $priorGit = Get-Item Function:\git -ErrorAction SilentlyContinue
 $global:GitLabPushAllCalls = @()
@@ -130,19 +129,10 @@ try {
     $captured = @(& $pushScript -GitLabRemote origin *>&1)
     Assert-True ($LASTEXITCODE -ne 0 -and $global:GitLabPushMock.Calls.Count -eq 0) 'Explicit origin must fail without any Git request.'
 
-    Reset-TestState
-    $captured = @(& $compatibilityScript *>&1)
-    Assert-True ($LASTEXITCODE -eq 0 -and @(Get-PushCalls).Count -eq 1) 'Old push-all command must delegate to GitLab only.'
-    Assert-True (($captured -join "`n") -match 'GitLab-only compatibility') 'Compatibility command must disclose changed behavior.'
-
-    Reset-TestState
-    $captured = @(& $compatibilityScript -GitHubRemote origin *>&1)
-    Assert-True ($LASTEXITCODE -ne 0 -and $global:GitLabPushMock.Calls.Count -eq 0) 'Explicit legacy GitHub intent must be rejected, never silently ignored.'
-
     $networkCalls = @($global:GitLabPushAllCalls | Where-Object { $_ -contains 'push' -or $_ -contains 'ls-remote' })
     Assert-True (@($networkCalls | Where-Object { ($_ -join ' ') -match 'github\.com|origin' }).Count -eq 0) 'ZERO GitHub requests are permitted across all cases.'
     Assert-True (@($global:GitLabPushAllCalls | Where-Object { $_ -contains 'add' -or $_ -contains 'commit' -or $_ -contains 'config' }).Count -eq 0) 'Script must not stage, commit, or change config.'
-    Write-Host 'PASS: 17 GitLab-only cases; ZERO GitHub network requests (fully mocked).'
+    Write-Host 'PASS: 15 explicit GitLab-only cases; ZERO GitHub network requests (fully mocked).'
     exit 0
 }
 finally {
