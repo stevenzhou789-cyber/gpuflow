@@ -1,20 +1,14 @@
-# GPUFlow
-
-> v1.1.0 兼容说明：Community 内部统一使用自动创建的 `default` 项目，升级前任务自动归入该项目；不开放项目管理或项目 Token 接口，也不增加部署和 Agent 配置。
-
-> v1.1.1 兼容说明：Community 仅提供企业版所需的共享模型与调度内核，项目公平调度能力保持关闭，继续使用单一 `default` 项目和原有 FIFO 行为。
-
-> v1.1.2 兼容说明：Community 仅增加企业版复用的调度解释模型和持久化决策内核，`scheduling_observability` 默认关闭；不会记录调度决策，不开放调度解释页面，也不改变 FIFO、Agent 或部署配置。
-
-> 版本边界：共享内核允许公开和二次开发；Community 按裁剪版小步维护，Enterprise 在私有仓库提供完整治理与交付。官方 API、页面和构建产物的具体约束见 [社区与企业版本边界](docs/EDITION-BOUNDARY.md)。
+# GPUFlow Community
 
 轻量级 BYOC（Bring Your Own Compute）GPU 批任务调度器。
 
 GPUFlow 把分散在本地工作站、实验室服务器和自建机房中的 GPU 节点接入同一个控制面，统一完成任务提交、资源匹配、执行监控、失败重试与日志查看。算力仍由使用者自己提供，GPUFlow 不转售算力，也不介入云厂商计费。
 
-> 当前状态：社区稳定维护版。节点接入、批任务调度、日志、重试、产物和持久化已形成完整闭环；后续以小步维护、可靠性修复和必要底层能力为主，企业治理能力不会下放到本仓库。
+Community 是面向个人、实验室和可信小团队的开源基础版，提供节点接入、批任务调度、日志、重试、产物和持久化。社区主线以小步维护、可靠性修复和共享内核兼容为主；完整的团队治理、运营报表与商业交付由私有仓库中的 Enterprise 提供。
 
-> **从一台机器跑通，到一组 GPU 高效协作：** Community 负责把批任务闭环交到你手里；当节点增多、团队开始共用算力时，[GPUFlow Enterprise](#从开源验证到企业落地) 可进一步提供 GPU 粒度并发调度、内置镜像分发、角色权限与审计能力。
+共享内核允许公开和二次开发。官方社区发行版的功能范围不因底层存在共享模型或算法而自动扩大；具体 API、页面和构建边界见 [社区与企业版本边界](docs/EDITION-BOUNDARY.md)。
+
+> 本页说明当前 `main` 源码。已发布的 `stable` 镜像和安装包以对应 Release 为准，可能落后于主线；企业版的版本标签不会自动更新社区包。控制面与 Agent 应使用同一发行版、同一源码提交的配套产物。
 
 ## 为什么使用 GPUFlow
 
@@ -33,8 +27,9 @@ flowchart LR
     A2 --> D2["Docker GPU 任务"]
 ```
 
-## 已有能力
+## 社区版能力
 
+- FIFO 任务队列、整节点独占调度；同一节点同时只执行一个任务
 - 节点注册、心跳、在线状态、安全删除、搜索与分页
 - 运行任务中的节点禁止删除
 - `lowest_cost`、`most_vram` 调度策略
@@ -49,6 +44,8 @@ flowchart LR
 - 响应式 Web 控制台
 - 从 Python 或 Shell 脚本构建任务镜像，并支持搜索、分页和删除
 - Windows、Linux 和 Docker Agent 接入指引
+
+社区版展示节点的 GPU 型号、数量和显存汇总，不提供逐卡清单、驱动/Docker 版本详情或现成的企业管理页面。项目管理、角色权限、项目配额、公平调度、调度解释、节点维护、使用报表及镜像自动分发属于 [Enterprise 产品能力](#从开源验证到企业落地)。
 
 ## 快速开始
 
@@ -131,18 +128,20 @@ MySQL 和 MinIO/S3 都是必需依赖。MySQL DSN、S3 endpoint 或 S3 access/se
 
 ## 原地升级与回滚
 
-正式部署使用不可变的 `v*` 镜像后，可以在控制面服务器执行一条命令完成原地升级：
+升级前确认目标社区镜像已成功构建、验签，并核对数据兼容性。当前社区发布使用 `stable` 和主线的 `sha-*` 镜像，不应套用企业版的 `v*` 标签。为便于复现和回退，记录目标及当前镜像的 Digest，并使用实际存在的 `sha-*` 标签执行脚本：
 
 ```bash
-./scripts/upgrade.sh v1.0.1
+# 将占位符替换为已发布、已核验的社区镜像标签
+TARGET_VERSION='sha-<目标提交短SHA>'
+./scripts/upgrade.sh "$TARGET_VERSION"
 ```
 
 脚本会先确认目标镜像存在，把 `.env`、`compose.yaml` 和 MySQL 备份到 `.gpuflow/backups/`，然后替换控制面容器并检查 `/healthz`。MySQL 与 MinIO Volume 不会被删除。健康检查失败时会自动切回原控制面镜像，但不会自动覆盖数据库。
 
-默认镜像仓库为 `ghcr.io/stevenzhou789-cyber/gpuflow`。使用企业私有仓库时可以指定：
+默认镜像仓库为 `ghcr.io/stevenzhou789-cyber/gpuflow`。将社区镜像同步到自有私有仓库后可以指定：
 
 ```bash
-./scripts/upgrade.sh v1.0.1 \
+./scripts/upgrade.sh "$TARGET_VERSION" \
   --image-repository harbor.example.com/gpuflow/gpuflow
 ```
 
@@ -178,14 +177,15 @@ SSH 密钥、堡垒机和 `ProxyJump` 应配置在控制面服务器的 `~/.ssh/
 只升级控制面或只升级 Agent：
 
 ```bash
-./scripts/upgrade.sh v1.0.1 --skip-agents
-./scripts/upgrade-agents.sh v1.0.1
+./scripts/upgrade.sh "$TARGET_VERSION" --skip-agents
+./scripts/upgrade-agents.sh "$TARGET_VERSION"
 ```
 
 程序版本回滚同样从控制面执行：
 
 ```bash
-./scripts/rollback.sh stable
+ROLLBACK_VERSION='sha-<升级前已记录的提交短SHA>'
+./scripts/rollback.sh "$ROLLBACK_VERSION"
 ```
 
 回滚脚本只切换控制面和 Agent 镜像，不恢复 MySQL 或 MinIO 数据。跨越不兼容数据库迁移之前，应先根据对应版本的升级说明判断旧程序是否能够读取当前数据库；需要恢复数据库备份时必须单独安排维护窗口，并接受备份时间点之后的数据会丢失。
@@ -229,7 +229,7 @@ GPUFLOW_PUBLIC_URL=http://127.0.0.1:18080
 
 GPUFlow 不区分“CLI 程序”和“Agent 程序”。控制端、Agent 和命令行工具都由同一个 `gpuflow` 可执行文件提供，通过 `server`、`agent`、`submit` 等子命令选择运行模式。
 
-Windows x64 节点可以从 [GPUFlow Releases](https://github.com/stevenzhou789-cyber/gpuflow/releases) 下载所需 `v*` 版本的 `gpuflow-windows-amd64.zip`，解压后得到 `gpuflow.exe`。也可以在源码根目录自行构建：
+Windows x64 节点可以从 [Community Stable Release](https://github.com/stevenzhou789-cyber/gpuflow/releases/tag/stable) 下载 `gpuflow-windows-amd64.zip`，解压后得到 `gpuflow.exe`。若控制面使用当前主线或自定义构建，应从与控制面相同的源码提交构建 Agent：
 
 ```powershell
 New-Item -ItemType Directory -Force .\bin
@@ -269,7 +269,7 @@ Windows Agent 的启动方式如下；实际使用时，应优先复制控制台
 | 可访问互联网的 Linux 节点 | 从 GHCR 拉取明确的版本镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:stable` |
 | 多节点或企业内网 | 将同一版本的 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:stable` |
 | 无法访问外网的离线节点 | 在联网机器拉取对应架构镜像，使用 `docker save` 导出后传入离线环境并执行 `docker load` | 导入后的本地镜像标签 |
-| Windows 原生 Agent | 下载对应 `v*` Release 中的 Windows 压缩包，或使用 Go 从源码构建 | `gpuflow.exe`，不需要 Agent 镜像 |
+| Windows 原生 Agent | 使用与控制面配套的 Community Stable 程序包，或从同一源码提交构建 | `gpuflow.exe`，不需要 Agent 镜像 |
 | 修改源码后的自定义部署 | 在仓库根目录执行 `docker build` | 自定义镜像标签 |
 
 可联网的 Linux/Docker 环境直接拉取：
@@ -331,9 +331,9 @@ docker run -d \
   -name "lab-gpu-01"
 ```
 
-Agent 自动采用控制面下发的独立 glibc Probe 镜像：Windows/Linux 原生 Agent 先读取宿主机 `nvidia-smi`，容器 Agent 无法读取宿主机命令时会通过 Docker Socket 自动拉取并运行 Probe。探测或 Docker Runtime 暂时失败时，Agent 仍会以 `DEGRADED` 注册并周期重试，不会在注册前退出；同一节点 DEGRADED 重连时控制面会保留最后一次已知 GPU 清单，恢复后自动转为 `HEALTHY`。
+Agent 默认采用控制面下发的独立 glibc Probe 镜像：Windows/Linux 原生 Agent 先读取宿主机 `nvidia-smi`，容器 Agent 无法读取宿主机命令时会通过 Docker Socket 自动拉取并运行 Probe。社区版在启动时探测资源并上报节点汇总，默认不执行周期设备复检；GPU 环境变更或探测失败后，修复环境并重启 Agent 重新探测。周期复检、逐卡清单和自动健康恢复由企业版的节点健康治理提供。
 
-正式节点应使用明确的 `v*` 版本、`sha-*` 镜像或 Digest；与控制端共用 Docker 的本地开发节点可以使用 Compose 自动构建的 `gpuflow:local`。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
+正式节点应使用已核验的社区 `sha-*` 镜像并记录 Digest，或直接固定 Digest；与控制端共用 Docker 的本地开发节点可以使用 Compose 自动构建的 `gpuflow:local`。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
 
 Agent 应使用稳定且唯一的 `-id`。任务执行期间 Agent 会持续发送心跳。同一 ID 的 Agent 重启后，会先清理遗留容器；清理确认和 cleanup 回执完成后，任务才会在剩余重试预算内从头重新执行并记录恢复次数，预算耗尽时任务会失败。节点永久离线且无法确认容器已经停止时，活动任务会保持“待清理”并占用原节点，不会自动转移到其他节点；这是为了避免同一任务容器并行执行。显式重试的语义仍是 at-least-once，可能重复执行；非幂等任务应保持默认“不重试”。
 
@@ -456,23 +456,26 @@ docker compose up --build -d
 
 ## 自动构建与发布
 
-仓库内置 GitHub Actions 工作流，不需要在开发机手工制作发布产物：
+仓库内置 GitHub Actions 工作流；以下产物仅在对应测试、构建及签名步骤成功后可用：
 
 - Pull Request 会运行 Go 测试、构建 Web，并验证 Docker 镜像能够构建，但不会发布。
 - 推送到 `main` 会发布 `linux/amd64`、`linux/arm64` 的 `sha-<commit>` 镜像。
-- 更新 `stable` Git 标签会发布 `stable` 镜像，并创建或更新唯一的 Community Stable GitHub Release。
+- `stable` 标签事件会触发 `stable` 镜像和 Community Stable GitHub Release 构建；推送 `main` 不会自动更新它。标签操作按仓库授权流程执行。
 - Stable Release 提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`。
 - Stable Release 还会生成 `gpuflow-deployment-stable.tar.gz`，其中包含面向客户运维的独立 `README.md`、Compose、升级/回滚脚本和 Agent 部署模板。
-- 发布镜像会按不可变 Digest 进行 Cosign 签名；Release 中的程序包和 `checksums.txt` 会附带 `.sigstore.json` 签名 bundle，并提供 `cosign.pub` 公钥。
+- 发布镜像会按不可变 Digest 进行 Cosign 签名；Release 中的程序包、部署包和 `checksums.txt` 会附带 `.sigstore.json` 签名 bundle，并提供 `cosign.pub` 公钥。
 - Community 只维护 `stable` 发布标识；日常 main 构建保留 `sha-*` 镜像用于定位和审计。
+- 仓库边界检查覆盖跟踪文件、构建源码和新生成的前端；私有产品代码、本地配置、密钥与运行数据不得进入社区产物。
 
-推送完成后可以直接拉取：
+需要 Stable 版本时，确认对应工作流和 Release 成功后拉取：
 
 ```bash
 docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
 ```
 
-工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release，不需要额外创建个人访问令牌。生产部署建议记录镜像 Digest，获得比版本标签更严格的产物固定。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置。
+工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release；签名还需要仓库已配置的 `COSIGN_PRIVATE_KEY` 和 `COSIGN_PASSWORD`。生产部署应记录并核验镜像 Digest。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置。
+
+GitHub 与 GitLab 各自保留构建检查，推送成功不等于构建或发布成功。GitLab 的社区 SHA 开发构建即使带签名，也不等于已发布的 Community Stable 安装包。
 
 下载 Release 中的 `cosign.pub` 和对应 bundle 后，可以验证镜像或安装包：
 
@@ -484,6 +487,8 @@ cosign verify-blob --key cosign.pub \
 ```
 
 ## 从源码开发
+
+共享内核内部使用自动创建的 `default` 项目，已有任务归入该项目。官方社区版保持 FIFO 与整节点独占，不开放项目管理、项目 Token、公平调度或调度解释，也不记录企业调度决策。共享模型与算法可用于自行研发；启用公开能力字段不会提供私有仓库中的完整企业产品。
 
 环境要求：
 
@@ -537,29 +542,34 @@ GPUFlow Agent 通过 Docker Socket 启动任务容器，这等同于拥有宿主
 
 ## 从开源验证到企业落地
 
-GPUFlow Community 不是只能观看的演示版：它完整覆盖节点接入、批任务调度、实时日志、失败重试、产物归档以及 MySQL/MinIO 持久化，适合个人、实验室和小型团队在可信网络中真正跑任务。
+GPUFlow Community 提供完整的基础任务闭环，适合个人、实验室和小型团队在可信网络中运行任务。官方社区产品保留整节点独占、共享 Token 和自助运维的边界。
 
-> **核心区别：Community 按整台节点调度，Enterprise 按单张 GPU 调度。** Community 中一个任务占用节点后，该节点不会再接收其他任务；Enterprise 可把任务分配到明确的物理 GPU 索引，并通过 `CUDA_VISIBLE_DEVICES` 隔离可见设备，因此一台多卡服务器可以安全地并发运行多个任务。
+Enterprise 在私有仓库中提供逐卡并发调度，以及项目身份与配额、角色权限、节点维护、调度解释、历史使用报表、操作审计和镜像自动分发。企业产品的价值来自这些能力与受支持交付的完整组合；共享调度内核可以继续公开和复用。
 
-Enterprise 中申请 `0` 张 GPU 的 CPU-only 任务仍按整台节点独占，既不会与另一个 CPU-only 任务并发，也不会与 GPU 任务混跑。这样可在 CPU 核数尚未纳入细粒度分配前避免节点过量承诺。
+Community 中一个任务占用节点后，该节点不会再接收其他任务。Enterprise 将 GPU 任务绑定到分配的物理设备，通过容器运行时限制可见设备，使一台多卡服务器能够并发运行多个任务。Enterprise 中申请 `0` 张 GPU 的 CPU-only 任务仍按整节点独占，不与其他任务混跑。
 
-当 GPU 从“有人能用”走向“多人高效、安全地共用”，瓶颈通常不再是提交任务，而是资源利用率、镜像交付和团队治理。GPUFlow Enterprise 在同一套任务闭环之上补齐这些能力，无需迁移到另一套调度系统：
+以下对比说明当前产品代码边界；实际企业交付范围以对应正式发布版本为准：
 
 | 对比维度 | Community 社区版 | Enterprise 企业版 |
 | --- | --- | --- |
-| **调度粒度** | **按节点调度；一个任务运行时独占整台节点** | **按 GPU 调度；任务绑定具体物理 GPU 索引** |
-| GPU 资源识别 | 启动时识别型号、数量和单卡显存汇总 | 识别 GPU UUID、索引、型号、显存、驱动和 Docker 环境 |
-| 节点健康治理 | 启动校验、基础健康状态更新、心跳/离线与安全恢复；默认关闭逐卡详情及 Agent 周期设备复检 | 周期复检；异常节点标记 `DEGRADED`，持久化原因并停止接收新任务 |
+| **调度粒度** | **FIFO、整节点独占；同一节点同时只执行一个任务** | **逐卡并发、按项目权重公平调度与项目内任务优先级** |
+| GPU 资源识别 | 启动时识别型号、数量和显存汇总；不提供逐卡/驱动/Docker 明细 | GPU UUID、索引、型号、显存及驱动、Docker 环境明细 |
+| 节点健康治理 | 启动探测、基础健康状态处理、心跳/离线与会话清理；默认关闭周期设备复检 | 周期复检、异常原因留存、停止新分配及复检恢复 |
 | 多卡利用率 | 多卡节点同一时间只运行一个任务 | 按任务申请的 GPU 数分配，同一节点可并发运行多个任务 |
-| 设备隔离 | 不区分节点内部的 GPU 索引 | 通过 `CUDA_VISIBLE_DEVICES` 向容器暴露已分配的 GPU |
-| 任务镜像 | 对接外部共享 Registry，由管理员配置凭据 | 内置轻量 OCI Registry，自动完成构建、推送、凭据下发与节点拉取 |
-| 任务可观测性 | 实时查看运行日志和任务产物 | 继承实时日志与产物能力，适合纳入企业交付和运维流程 |
+| 设备可见范围 | 不按任务分配节点内部的 GPU 索引 | 通过容器运行时向任务暴露已分配设备 |
+| 项目治理 | 内部单一 `default` 项目，无项目管理与项目 Token 接口 | 项目管理、项目 Token、项目范围校验及队列、并发任务、GPU 配额 |
+| 任务镜像 | 控制面本地构建；管理员负责向外部 Registry 分发及配置节点凭据 | 内置 OCI Registry，自动推送、凭据下发与节点拉取 |
+| 调度观测与维护 | 任务状态、日志和产物；无调度解释和维护管理入口 | 排队原因、分配决策、项目公平状态；人工排空、停止新分配与恢复 |
+| 使用量与运营 | 节点报价用于资源选择，无企业使用报表和独立历史账本 | 历史设备占用量、估算成本、项目/时间范围汇总及 CSV |
 | 访问控制 | 共享 Bearer Token，适合可信团队 | Admin、Operator、Viewer、Agent 分角色授权 |
-| 审计与交付 | MIT 开源、自助部署 | JSONL 操作审计、离线 Ed25519 License、私有化交付与商业支持 |
+| 操作审计 | 无企业业务操作审计 | HTTP 业务操作审计与角色控制 |
+| 交付方式 | MIT 开源、自助部署和社区维护 | 离线授权、签名离线部署包与商业交付 |
 
-Enterprise Agent 会按能力开关周期复检 Docker、NVIDIA Runtime 和逐卡清单。复检失败时节点进入 `DEGRADED` 并持久化原因，停止接收新任务；复检恢复后自动重新参与调度。License 到期不会中断正在执行的任务，已有节点仍可按原容量重连，但控制面会拒绝新增容量和新任务调度；降配或服务重启后，只有当前授权节点数与 GPU 数范围内的节点继续接收新任务。
+设备可见范围和项目访问控制不等于完整的多租户安全隔离。节点维护不表示自动滚动升级，使用量与成本参考也不等于财务结算。
 
-如果你已经遇到以下任一情况，Enterprise 通常能直接带来价值：多卡节点只能同时跑一个任务；每台节点都要手工配置镜像仓库；共享 Token 无法区分人员权限；客户要求私有部署、操作留痕或交付支持。
+Enterprise Agent 会按能力开关周期复检设备清单和对应的容器运行环境。复检失败时节点进入 `DEGRADED` 并持久化原因，停止接收新任务；复检恢复后自动重新参与调度。License 到期不会中断正在执行的任务，已有节点仍可按原容量重连，但控制面会拒绝新增容量和新任务调度；降配或服务重启后，只有当前授权节点数与 GPU 数范围内的节点继续接收新任务。
+
+当团队需要共享多卡节点、按项目管理配额、区分人员权限、查看使用报表，或统一镜像分发与离线交付时，可以评估 Enterprise。
 
 > **先用 Community 验证任务，再让 Enterprise 接住规模化。** [提交 Enterprise 试用、私有化部署或合作需求](https://github.com/stevenzhou789-cyber/gpuflow/issues/new)，Issue 标题可注明 `[Enterprise]`，便于优先跟进。
 
@@ -571,6 +581,8 @@ Enterprise Agent 会按能力开关周期复检 Docker、NVIDIA Runtime 和逐�
 - 尚未提供跨控制面高可用和多租户隔离。
 
 ## 参与贡献
+
+社区主线优先接受缺陷修复、可靠性与文档改进、必要的共享内核兼容调整。新增官方产品能力需先明确版本边界。开发者仍可按 [MIT License](LICENSE) 自行修改和扩展公开代码；私有企业产品实现不包含在本仓库中。
 
 欢迎提交 Issue 和 Pull Request。报告问题时，请尽量附上：
 
