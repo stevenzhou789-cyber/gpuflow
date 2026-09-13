@@ -94,6 +94,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/task-images/build", s.buildTaskImage)
 	s.mux.HandleFunc("GET /v1/task-images", s.listTaskImages)
 	s.mux.HandleFunc("DELETE /v1/task-images/{id}", s.deleteTaskImage)
+	// API namespaces must never fall through to the SPA. Enterprise composes
+	// its private routes outside this shared handler before delegating here.
+	for _, path := range []string{"/v1", "/v1/", "/enterprise/v1", "/enterprise/v1/"} {
+		s.mux.HandleFunc(path, func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusNotFound, "API endpoint not available")
+		})
+	}
 	s.mux.Handle("/", webui.Handler())
 }
 
@@ -465,13 +472,17 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	if !s.acceptsNodeInventory(n.Devices, n.DriverVersion, n.DockerVersion) {
+		writeError(w, http.StatusBadRequest, "per_gpu_inventory is not enabled")
+		return
+	}
 	saved, err := s.store.RegisterNodeSession(n, r.Header.Get(model.HeaderAgentSession))
 	if err != nil {
 		handleStoreError(w, err)
 		return
 	}
 	s.scheduleBestEffort()
-	writeJSON(w, 200, saved)
+	writeJSON(w, 200, s.projectNode(saved))
 }
 func (s *Server) confirmNodeCleanup(w http.ResponseWriter, r *http.Request) {
 	saved, err := s.store.ConfirmNodeCleanupSession(r.PathValue("id"), r.Header.Get(model.HeaderAgentSession))
@@ -480,7 +491,7 @@ func (s *Server) confirmNodeCleanup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.scheduleBestEffort()
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, s.projectNode(saved))
 }
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.HeartbeatNodeSession(r.PathValue("id"), r.Header.Get(model.HeaderAgentSession)); err != nil {
@@ -496,23 +507,29 @@ func (s *Server) updateNodeHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if !s.acceptsNodeInventory(update.Devices, update.DriverVersion, update.DockerVersion) {
+		writeError(w, http.StatusBadRequest, "per_gpu_inventory is not enabled")
+		return
+	}
 	node, err := s.store.UpdateNodeHealthSession(r.PathValue("id"), r.Header.Get(model.HeaderAgentSession), update)
 	if err != nil {
 		handleStoreError(w, err)
 		return
 	}
 	s.scheduleBestEffort()
-	writeJSON(w, http.StatusOK, node)
+	writeJSON(w, http.StatusOK, s.projectNode(node))
 }
 func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	s.scheduleBestEffort()
 	if r.URL.RawQuery == "" {
-		writeJSON(w, 200, s.store.ListNodes())
+		writeJSON(w, 200, s.projectNodes(s.store.ListNodes()))
 		return
 	}
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
-	writeJSON(w, 200, s.store.QueryNodes(store.NodeQuery{Search: r.URL.Query().Get("q"), Page: page, PageSize: pageSize}))
+	result := s.store.QueryNodes(store.NodeQuery{Search: r.URL.Query().Get("q"), Page: page, PageSize: pageSize})
+	result.Items = s.projectNodes(result.Items)
+	writeJSON(w, 200, result)
 }
 func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) {
 	s.scheduleBestEffort()

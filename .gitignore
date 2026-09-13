@@ -14,3 +14,16 @@ scripts/agents.conf
 *.exe
 /.local-gitlab/
 /.gitlab-migration-work/
+
+# Local review worktrees, build caches and delivery archives are never source.
+/.enterprise-*/
+/.review-enterprise-*/
+/.tmp-*
+/.go-cache-*/
+/.build-cache/
+/*.tar
+/*.tar.gz
+/*.zip
+.env.*
+!.env.example
+*.credential.xml

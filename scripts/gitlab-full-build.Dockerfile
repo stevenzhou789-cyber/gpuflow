@@ -4,7 +4,15 @@ WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
-RUN mkdir -p ../internal/webui && npm run build
+COPY go.mod go.sum /src/
+COPY cmd/ /src/cmd/
+COPY internal/ /src/internal/
+COPY pkg/ /src/pkg/
+COPY scripts/check-community-boundary.mjs /src/scripts/
+# Both binary and runtime targets depend on the audited source and fresh UI.
+RUN node /src/scripts/check-community-boundary.mjs --source-tree /src && \
+    mkdir -p ../internal/webui && npm run build && \
+    node /src/scripts/check-community-boundary.mjs --source-tree /src
 
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS verified
 ENV CGO_ENABLED=0 GOMAXPROCS=2 GOMEMLIMIT=768MiB

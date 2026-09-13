@@ -35,11 +35,26 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Verify tracked Community product boundary
+        run: |
+          node --test scripts/check-community-boundary.test.mjs
+          node scripts/check-community-boundary.mjs
+
+      - name: Set up Docker Buildx for context boundary tests
+        uses: docker/setup-buildx-action@v4
+
+      - name: Test Docker context boundaries with synthetic fixtures
+        run: python3 scripts/test-build-context.py
+
       - name: Build web interface
         working-directory: web
         run: |
           npm ci
           npm run build
+
+      - name: Verify freshly built Community UI boundary
+        run: |
+          node scripts/check-community-boundary.mjs --source-tree .
 
       - name: Test
         run: go test ./...

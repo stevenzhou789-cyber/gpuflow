@@ -33,6 +33,7 @@ cp "$base/README.md" "$base/PROJECT-README.md"
 cp "$base/deploy/README.md" "$base/README.md"
 printf '%s\n' "$version" > "$base/VERSION"
 chmod +x "$base"/scripts/*.sh
+node "$script_dir/check-community-boundary.mjs" --delivery-tree "$base"
 cp "$public_key" "$dist/cosign.pub"
 cp "$trusted_root" "$dist/trusted_root.json"
 tar -C "$binaries/linux-amd64" -czf "$dist/gpuflow-linux-amd64.tar.gz" gpuflow

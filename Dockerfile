@@ -3,7 +3,16 @@ WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
-RUN mkdir -p ../internal/webui && npm run build
+COPY go.mod go.sum /src/
+COPY cmd/ /src/cmd/
+COPY internal/ /src/internal/
+COPY pkg/ /src/pkg/
+COPY scripts/check-community-boundary.mjs /src/scripts/
+# Check original copied source and the fresh embedded bundle. The Go stage
+# depends on this stage, so image publication cannot bypass either check.
+RUN node /src/scripts/check-community-boundary.mjs --source-tree /src && \
+    mkdir -p ../internal/webui && npm run build && \
+    node /src/scripts/check-community-boundary.mjs --source-tree /src
 
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS go-build
 ARG TARGETOS
@@ -15,6 +24,7 @@ COPY cmd ./cmd
 COPY internal ./internal
 COPY pkg ./pkg
 COPY --from=web-build /src/internal/webui/dist ./internal/webui/dist
+RUN CGO_ENABLED=0 go test ./...
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/gpuflow ./cmd/gpuflow
 

@@ -16,6 +16,7 @@ on:
       - "internal/**"
       - "pkg/**"
       - "web/**"
+      - "scripts/check-community-boundary*"
   workflow_dispatch:
 
 permissions:
@@ -31,6 +32,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Set up Node.js for Community boundary verification
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Verify tracked Community product boundary
+        run: |
+          node --test scripts/check-community-boundary.test.mjs
+          node scripts/check-community-boundary.mjs
 
       - name: Normalize image name
         id: image
@@ -118,6 +129,11 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Verify tracked Community release boundary
+        run: |
+          node --test scripts/check-community-boundary.test.mjs
+          node scripts/check-community-boundary.mjs
+
       - name: Build web interface
         working-directory: web
         run: |
@@ -126,6 +142,10 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      - name: Verify freshly built Community UI boundary
+        run: |
+          node scripts/check-community-boundary.mjs --source-tree .
 
       - name: Build release archives
         shell: bash
@@ -150,6 +170,7 @@ jobs:
           cp -R scripts deploy "$package_dir/"
           chmod +x "$package_dir"/scripts/*.sh
           printf '%s\n' "$GITHUB_REF_NAME" > "$package_dir/VERSION"
+          node scripts/check-community-boundary.mjs --delivery-tree "$package_dir"
           tar -C build -czf "dist/gpuflow-deployment-${GITHUB_REF_NAME}.tar.gz" \
             "gpuflow-deployment-${GITHUB_REF_NAME}"
 

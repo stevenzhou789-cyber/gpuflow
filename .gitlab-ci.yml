@@ -30,6 +30,8 @@ full-signed-build:
     action: prepare
   timeout: 2h
   script:
+    - node --test scripts/check-community-boundary.test.mjs
+    - node scripts/check-community-boundary.mjs
     - bash scripts/gitlab-full-build.sh
   artifacts:
     name: "gpuflow-full-signed-$CI_COMMIT_SHORT_SHA-$CI_JOB_ID"
