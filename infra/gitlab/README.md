@@ -15,7 +15,7 @@
 
 三个端口仅绑定回环地址，不对局域网或公网开放。浏览器可直接用 IP 登录；无需管理员权限或修改 Windows hosts。页面生成的部分 clone / Registry 地址使用规范域名，按下面的仓库级解析配置处理，不要因此更改全局 DNS、代理或 hosts。
 
-Docker 内网为 `gpuflow-devops` / `172.30.88.0/24`，GitLab 为 `.2`，builder 为 `.3`；如与 VPN/已有网络冲突，应先审查并一致调整 Compose 和 Runner 配置，不能只改一处。
+Docker 内网为 `gpuflow-devops` / `172.30.88.0/24`，GitLab 固定为 `.2`，builder 为 `.3`，Linux Runner 为 `.4`；如与 VPN/已有网络冲突，应先审查并一致调整 Compose 和 Runner 配置，不能只改一处。三个容器均固定地址，避免 Docker Desktop 重启时，先启动的 Runner 动态占用 GitLab 或 builder 的地址；仅设置 Compose 启动依赖不能保证 Docker daemon 重启后的顺序。
 
 容器上限：GitLab 3.5 GiB / 4 CPU，builder 2 GiB / 2 CPU，Linux Runner 256 MiB / 1 CPU。Linux Runner 串行执行一个作业，单作业上限 1.5 GiB / 2 CPU；Go 编译并发为 2，Node 堆上限 768 MiB。Windows Runner 另有一个串行槽，两个 Runner 可能同时运行；Windows shell 作业不受 Docker 内存上限保护。还需给 Windows、WSL2 和 Docker 留余量。这是低资源本地配置，不代表生产规格；OOM 时先检查资源，不能跳过架构、测试或安全门禁来换取成功状态。
 
@@ -38,6 +38,8 @@ docker compose -f .\infra\gitlab\compose.yaml ps
 ```
 
 `bootstrap.ps1` 关闭公开注册，校验三个私有项目，配置企业版读取固定社区提交的 Job Token allowlist，创建受限 Git 推送凭据与 group Runner。`register-runner.ps1` 启动 builder 并注册 `linux-docker` Runner。凭据目录默认位于该社区仓库的 `.local-gitlab`；如从隔离迁移副本调用而要复用原工作区的私有状态，先查看脚本参数，显式使用正确的状态目录，不能重新创建一套无关凭据。
+
+Linux Runner 已运行时，注册脚本核对 Compose 所属项目后，使用 `exec -T` 检查现有配置，不再创建会争用 `.4` 的临时 Runner。有配置则复用原注册信息，不读取注册凭据；只有明确确认配置文件不存在时才注册。Docker/网络检查失败、空配置或无法读取的配置都会停止，不会被当成需要重新注册。可使用 `powershell -NoProfile -File .\infra\gitlab\test-register-runner.ps1` 运行完全模拟的回归，不连接 Docker、不读取真实凭据。
 
 项目路径为 `gpuflow/gpuflow`、`gpuflow/gpuflow-enterprise`、`gpuflow/gpuflow-license-issuer`。保持项目和产物访问私有、最新产物不无限期保留。只同步审查后的源码，不将未跟踪的环境文件、密钥、许可证或缓存加入 Git。
 

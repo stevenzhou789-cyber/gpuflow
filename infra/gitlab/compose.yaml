@@ -88,7 +88,10 @@ services:
     volumes:
       - runner-config:/etc/gitlab-runner
     networks:
-      - devops
+      devops:
+        # Docker daemon restarts do not honor Compose startup order. Keep this
+        # static so an early Runner cannot claim GitLab's .2 or builder's .3.
+        ipv4_address: 172.30.88.4
 
 networks:
   devops:
