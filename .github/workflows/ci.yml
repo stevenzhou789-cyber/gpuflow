@@ -43,6 +43,12 @@ jobs:
       - name: Set up Docker Buildx for context boundary tests
         uses: docker/setup-buildx-action@v4
 
+      - name: Test version publication and deployment packaging
+        run: |
+          node --test scripts/community-release.test.mjs
+          python3 scripts/test-package-community-release.py
+          python3 scripts/test-community-release-workflow.py
+
       - name: Test Docker context boundaries with synthetic fixtures
         run: python3 scripts/test-build-context.py
 

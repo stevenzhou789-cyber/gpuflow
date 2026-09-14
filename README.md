@@ -8,7 +8,7 @@ Community 是面向个人、实验室和可信小团队的开源基础版，提�
 
 共享内核允许公开和二次开发。官方社区发行版的功能范围不因底层存在共享模型或算法而自动扩大；具体 API、页面和构建边界见 [社区与企业版本边界](docs/EDITION-BOUNDARY.md)。
 
-> 本页说明当前 `main` 源码。已发布的 `stable` 镜像和安装包以对应 Release 为准，可能落后于主线；企业版的版本标签不会自动更新社区包。控制面与 Agent 应使用同一发行版、同一源码提交的配套产物。
+> 本页说明当前 `main` 源码。社区编号版本使用独立的 `vX.Y.Z` 标签，镜像和安装包以对应 Community Release 为准，可能落后于主线；企业版的同名标签不代表相同产品或配套产物。控制面与 Agent 应使用同一发行版、同一源码提交的配套产物。
 
 ## 为什么使用 GPUFlow
 
@@ -48,6 +48,8 @@ flowchart LR
 社区版展示节点的 GPU 型号、数量和显存汇总，不提供逐卡清单、驱动/Docker 版本详情或现成的企业管理页面。项目管理、角色权限、项目配额、公平调度、调度解释、节点维护、使用报表及镜像自动分发属于 [Enterprise 产品能力](#从开源验证到企业落地)。
 
 ## 快速开始
+
+已有 Docker 环境且无需修改源码时，可从 [Community Releases](https://github.com/stevenzhou789-cyber/gpuflow/releases) 选择编号版本，下载部署包、`checksums.txt`、对应签名 bundle 和 `cosign.pub`，按包内 README 验签并部署。编号部署包已将控制面和 Agent 固定到同一镜像 Digest。标准部署包需要联网拉取系统及依赖镜像，不包含离线镜像归档。以下步骤适用于源码体验。
 
 ### 环境要求
 
@@ -128,11 +130,11 @@ MySQL 和 MinIO/S3 都是必需依赖。MySQL DSN、S3 endpoint 或 S3 access/se
 
 ## 原地升级与回滚
 
-升级前确认目标社区镜像已成功构建、验签，并核对数据兼容性。当前社区发布使用 `stable` 和主线的 `sha-*` 镜像，不应套用企业版的 `v*` 标签。为便于复现和回退，记录目标及当前镜像的 Digest，并使用实际存在的 `sha-*` 标签执行脚本：
+升级前确认目标社区编号版本已成功发布、验签，并核对数据兼容性。社区 `vX.Y.Z`、历史 `stable` 和主线 `sha-*` 镜像各自独立；升级脚本接受编号版本，不能直接传入 `stable` 或 `sha-*`。记录当前镜像和目标镜像的 Digest，并使用目标社区部署包中的版本号：
 
 ```bash
-# 将占位符替换为已发布、已核验的社区镜像标签
-TARGET_VERSION='sha-<目标提交短SHA>'
+# 在已下载并核验的目标社区部署包目录执行
+TARGET_VERSION="$(cat VERSION)"
 ./scripts/upgrade.sh "$TARGET_VERSION"
 ```
 
@@ -184,7 +186,7 @@ SSH 密钥、堡垒机和 `ProxyJump` 应配置在控制面服务器的 `~/.ssh/
 程序版本回滚同样从控制面执行：
 
 ```bash
-ROLLBACK_VERSION='sha-<升级前已记录的提交短SHA>'
+ROLLBACK_VERSION='v<升级前已记录的社区版本号>'
 ./scripts/rollback.sh "$ROLLBACK_VERSION"
 ```
 
@@ -229,7 +231,7 @@ GPUFLOW_PUBLIC_URL=http://127.0.0.1:18080
 
 GPUFlow 不区分“CLI 程序”和“Agent 程序”。控制端、Agent 和命令行工具都由同一个 `gpuflow` 可执行文件提供，通过 `server`、`agent`、`submit` 等子命令选择运行模式。
 
-Windows x64 节点可以从 [Community Stable Release](https://github.com/stevenzhou789-cyber/gpuflow/releases/tag/stable) 下载 `gpuflow-windows-amd64.zip`，解压后得到 `gpuflow.exe`。若控制面使用当前主线或自定义构建，应从与控制面相同的源码提交构建 Agent：
+Windows x64 节点可以从与控制面版本一致的 [Community Release](https://github.com/stevenzhou789-cyber/gpuflow/releases) 下载 `gpuflow-windows-amd64.zip`，解压后得到 `gpuflow.exe`。若控制面使用当前主线或自定义构建，应从与控制面相同的源码提交构建 Agent：
 
 ```powershell
 New-Item -ItemType Directory -Force .\bin
@@ -266,43 +268,43 @@ Windows Agent 的启动方式如下；实际使用时，应优先复制控制台
 | 部署环境 | 推荐获取方式 | 使用的程序或镜像 |
 | --- | --- | --- |
 | 本机源码体验 | 执行 `docker compose up --build -d`，由 Compose 从当前源码构建 | `gpuflow:local` |
-| 可访问互联网的 Linux 节点 | 从 GHCR 拉取明确的版本镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:stable` |
-| 多节点或企业内网 | 将同一版本的 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:stable` |
+| 可访问互联网的 Linux 节点 | 从 GHCR 拉取明确的版本镜像 | `ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0` |
+| 多节点或企业内网 | 将同一版本的 GHCR 镜像同步到所有节点可访问的 Harbor 或其他私有仓库 | `harbor.example.com/gpuflow/gpuflow:v1.0.0` |
 | 无法访问外网的离线节点 | 在联网机器拉取对应架构镜像，使用 `docker save` 导出后传入离线环境并执行 `docker load` | 导入后的本地镜像标签 |
-| Windows 原生 Agent | 使用与控制面配套的 Community Stable 程序包，或从同一源码提交构建 | `gpuflow.exe`，不需要 Agent 镜像 |
+| Windows 原生 Agent | 使用与控制面配套的 Community 对应版本程序包，或从同一源码提交构建 | `gpuflow.exe`，不需要 Agent 镜像 |
 | 修改源码后的自定义部署 | 在仓库根目录执行 `docker build` | 自定义镜像标签 |
 
 可联网的 Linux/Docker 环境直接拉取：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
 ```
 
 同步到私有仓库：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
-docker tag ghcr.io/stevenzhou789-cyber/gpuflow:stable \
-  harbor.example.com/gpuflow/gpuflow:stable
-docker push harbor.example.com/gpuflow/gpuflow:stable
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
+docker tag ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 \
+  harbor.example.com/gpuflow/gpuflow:v1.0.0
+docker push harbor.example.com/gpuflow/gpuflow:v1.0.0
 ```
 
 同步完成后，在控制端 `.env` 中设置镜像地址，Web 控制台生成的 Docker Agent 命令就会使用该地址：
 
 ```env
-GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:stable
+GPUFLOW_AGENT_IMAGE=harbor.example.com/gpuflow/gpuflow:v1.0.0
 ```
 
 离线环境应明确选择目标 CPU 架构。以下示例导出 Linux amd64 镜像：
 
 ```bash
 # 在可联网机器执行
-docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:stable
-docker save -o gpuflow-stable-linux-amd64.tar \
-  ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker pull --platform linux/amd64 ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
+docker save -o gpuflow-v1.0.0-linux-amd64.tar \
+  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
 
 # 将 tar 文件复制到离线节点后执行
-docker load -i gpuflow-stable-linux-amd64.tar
+docker load -i gpuflow-v1.0.0-linux-amd64.tar
 ```
 
 ARM64 节点将 `linux/amd64` 改为 `linux/arm64`。如果修改过源码，可以在仓库根目录构建本地镜像：
@@ -324,7 +326,7 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/lib/gpuflow/artifacts:/var/lib/gpuflow/artifacts \
   -e GPUFLOW_ARTIFACT_WORKDIR=/var/lib/gpuflow/artifacts \
-  ghcr.io/stevenzhou789-cyber/gpuflow:stable agent \
+  ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0 agent \
   -server "http://control-plane.example.com:8080" \
   -token "replace-with-your-token" \
   -id "lab-gpu-01" \
@@ -333,7 +335,7 @@ docker run -d \
 
 Agent 默认采用控制面下发的独立 glibc Probe 镜像：Windows/Linux 原生 Agent 先读取宿主机 `nvidia-smi`，容器 Agent 无法读取宿主机命令时会通过 Docker Socket 自动拉取并运行 Probe。社区版在启动时探测资源并上报节点汇总，默认不执行周期设备复检；GPU 环境变更或探测失败后，修复环境并重启 Agent 重新探测。周期复检、逐卡清单和自动健康恢复由企业版的节点健康治理提供。
 
-正式节点应使用已核验的社区 `sha-*` 镜像并记录 Digest，或直接固定 Digest；与控制端共用 Docker 的本地开发节点可以使用 Compose 自动构建的 `gpuflow:local`。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
+正式节点应使用已核验的社区编号版本并记录 Digest，或直接固定 Digest；与控制端共用 Docker 的本地开发节点可以使用 Compose 自动构建的 `gpuflow:local`。产物工作目录必须以相同绝对路径挂载到 Agent 容器；Agent 直接作为宿主机进程运行时不需要设置该目录。实际接入时，建议优先复制控制台根据当前配置生成的完整命令。
 
 Agent 应使用稳定且唯一的 `-id`。任务执行期间 Agent 会持续发送心跳。同一 ID 的 Agent 重启后，会先清理遗留容器；清理确认和 cleanup 回执完成后，任务才会在剩余重试预算内从头重新执行并记录恢复次数，预算耗尽时任务会失败。节点永久离线且无法确认容器已经停止时，活动任务会保持“待清理”并占用原节点，不会自动转移到其他节点；这是为了避免同一任务容器并行执行。显式重试的语义仍是 at-least-once，可能重复执行；非幂等任务应保持默认“不重试”。
 
@@ -460,22 +462,23 @@ docker compose up --build -d
 
 - Pull Request 会运行 Go 测试、构建 Web，并验证 Docker 镜像能够构建，但不会发布。
 - 推送到 `main` 会发布 `linux/amd64`、`linux/arm64` 的 `sha-<commit>` 镜像。
+- 首次推送新的 `vX.Y.Z` 标签会触发社区编号版本发布：检查原始标签事件和提交、完成测试、构建及验签，再发布 GitHub Release 和同名镜像。编号版本拒绝替换已有发布资产或不同 Digest 的版本镜像。
 - `stable` 标签事件会触发 `stable` 镜像和 Community Stable GitHub Release 构建；推送 `main` 不会自动更新它。标签操作按仓库授权流程执行。
-- Stable Release 提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`。
-- Stable Release 还会生成 `gpuflow-deployment-stable.tar.gz`，其中包含面向客户运维的独立 `README.md`、Compose、升级/回滚脚本和 Agent 部署模板。
+- Community Release 提供 Linux amd64、Linux arm64、Windows amd64 程序包和 `checksums.txt`。
+- 部署包命名为 `gpuflow-deployment-<标签>.tar.gz`，其中包含独立运维 `README.md`、Compose、升级/回滚脚本和 Agent 部署模板；生成时固定本次镜像 Digest，并检查交付文件边界。
 - 发布镜像会按不可变 Digest 进行 Cosign 签名；Release 中的程序包、部署包和 `checksums.txt` 会附带 `.sigstore.json` 签名 bundle，并提供 `cosign.pub` 公钥。
-- Community 只维护 `stable` 发布标识；日常 main 构建保留 `sha-*` 镜像用于定位和审计。
+- 编号发布中断后只重试原工作流的失败任务；已有草稿仅允许原运行补齐经核验的缺失文件。不得移动、删除或重建版本标签来重试。
 - 仓库边界检查覆盖跟踪文件、构建源码和新生成的前端；私有产品代码、本地配置、密钥与运行数据不得进入社区产物。
 
-需要 Stable 版本时，确认对应工作流和 Release 成功后拉取：
+选择社区版本时，确认对应工作流和 Release 成功后拉取，例如：
 
 ```bash
-docker pull ghcr.io/stevenzhou789-cyber/gpuflow:stable
+docker pull ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.0
 ```
 
 工作流使用仓库自动提供的 `GITHUB_TOKEN` 写入 GHCR 和 GitHub Release；签名还需要仓库已配置的 `COSIGN_PRIVATE_KEY` 和 `COSIGN_PASSWORD`。生产部署应记录并核验镜像 Digest。首次发布后需要在 GitHub Packages 中确认镜像包的公开访问设置。
 
-GitHub 与 GitLab 各自保留构建检查，推送成功不等于构建或发布成功。GitLab 的社区 SHA 开发构建即使带签名，也不等于已发布的 Community Stable 安装包。
+GitHub 与 GitLab 各自保留构建检查，推送成功不等于构建或发布成功。GitLab 当前仍拒绝 tag 发布；其社区 SHA 开发构建即使带签名，也不等于 GitHub 已发布的 Community 编号安装包。
 
 下载 Release 中的 `cosign.pub` 和对应 bundle 后，可以验证镜像或安装包：
 

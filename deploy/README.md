@@ -17,6 +17,22 @@ VERSION                     当前交付包版本
 
 客户的真实 `.env`、`scripts/agents.conf`、SSH 私钥和数据库备份不属于交付包，请勿提交或传回公共仓库。
 
+## 核验部署包
+
+从同一个 Community Release 下载部署包、`checksums.txt`、它们各自的 `.sigstore.json` 和 `cosign.pub`。先通过已信任的渠道核对签名公钥，再使用 Cosign 核验；仅从同一下载位置获取公钥不能独立确认发布者身份。
+
+```bash
+cosign verify-blob --key cosign.pub --bundle checksums.txt.sigstore.json checksums.txt
+# 将版本号替换为下载的 Community 版本
+PACKAGE=gpuflow-deployment-v1.0.0.tar.gz
+cosign verify-blob --key cosign.pub --bundle "$PACKAGE.sigstore.json" "$PACKAGE"
+sha256sum --check --ignore-missing checksums.txt
+tar -xzf "$PACKAGE"
+cd "${PACKAGE%.tar.gz}"
+```
+
+Release 同时提供 Linux amd64、Linux arm64 和 Windows amd64 原生程序包，各有独立签名。标准部署包包含配置和运维脚本，需要联网拉取 GPUFlow、MySQL、MinIO 和 Probe 镜像，不包含离线镜像归档。社区编号版本与企业版分别发布，不可混用。
+
 ## 首次部署控制面
 
 环境要求：Linux、Bash、Docker 和 Docker Compose v2。
@@ -26,12 +42,7 @@ cp .env.example .env
 chmod +x scripts/*.sh
 ```
 
-编辑 `.env`，至少替换 Token、MySQL 密码、MinIO 密码和公开访问地址。正式环境还应把下面两个变量设置为当前交付版本对应的镜像，例如：
-
-```env
-GPUFLOW_IMAGE=ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.1
-GPUFLOW_AGENT_IMAGE=ghcr.io/stevenzhou789-cyber/gpuflow:v1.0.1
-```
+编辑 `.env`，至少替换 Token、MySQL 密码、MinIO 密码和公开访问地址。编号部署包的 `GPUFLOW_IMAGE`、`GPUFLOW_AGENT_IMAGE` 和 Agent 配置模板已固定为本次构建的同一镜像 Digest；保留这些值即可拉取配套镜像。包内 Compose 无需本地源码构建。首次运行前也应使用已信任公钥执行 `cosign verify --key /path/to/cosign.pub <GPUFLOW_IMAGE的完整值>` 核验镜像。
 
 启动并检查服务：
 
@@ -44,22 +55,23 @@ curl --fail http://127.0.0.1:18080/healthz
 
 ## 一键升级
 
-升级前确认目标 `v*` 镜像已经发布，并且控制面磁盘有足够空间保存 MySQL 备份。然后在现有安装目录执行新交付包中的脚本：
+升级前确认目标社区 `vX.Y.Z` 镜像已经发布并完成验签，并且控制面磁盘有足够空间保存 MySQL 备份。升级脚本检查版本格式并拉取镜像，不会自动调用 Cosign。先在已核验的新交付包目录读取目标版本，再指定现有安装目录：
 
 ```bash
-./scripts/upgrade.sh v1.0.1
+TARGET_VERSION="$(cat VERSION)"
+./scripts/upgrade.sh "$TARGET_VERSION" --install-dir /opt/gpuflow
 ```
 
 如果脚本位于新交付包、实际安装目录位于其他位置：
 
 ```bash
-/path/to/new-package/scripts/upgrade.sh v1.0.1 \
+/path/to/new-package/scripts/upgrade.sh "$TARGET_VERSION" \
   --install-dir /opt/gpuflow
 ```
 
 脚本会依次完成：
 
-1. 验证并拉取目标镜像。
+1. 检查版本格式并拉取目标镜像。
 2. 备份 `.env`、`compose.yaml` 和 MySQL。
 3. 更新控制面和控制台生成的 Agent 镜像版本。
 4. 重建控制面并检查 `/healthz`。
@@ -70,14 +82,14 @@ MySQL 和 MinIO 使用持久化 Volume，升级不会删除其中的数据。备
 私有镜像仓库使用：
 
 ```bash
-./scripts/upgrade.sh v1.0.1 \
+./scripts/upgrade.sh "$TARGET_VERSION" \
   --image-repository harbor.example.com/gpuflow/gpuflow
 ```
 
 只升级控制面：
 
 ```bash
-./scripts/upgrade.sh v1.0.1 --skip-agents
+./scripts/upgrade.sh "$TARGET_VERSION" --skip-agents
 ```
 
 ## 配置 Agent 集中升级
@@ -92,7 +104,7 @@ cd /opt/gpuflow-agent
 mv .env.example .env
 ```
 
-编辑 `.env` 中的 Agent 镜像、控制面地址、Token 和唯一节点 ID。Agent 会自动采用控制面下发的 Probe 镜像，不需要在节点重复配置镜像地址；在线节点需能拉取该镜像，离线节点需提前导入交付镜像。Agent 会自动识别 GPU 型号、数量和显存汇总信息，并自动上报进程可见的逻辑 CPU 核数；仅在容器 CPU 限额或探测结果不准确时设置 `GPUFLOW_CPU_CORES`：
+编辑 `.env` 中的控制面地址、Token 和唯一节点 ID，保留包内已固定的 Agent 镜像 Digest。Agent 会自动采用控制面下发的 Probe 镜像，不需要在节点重复配置镜像地址；在线节点需能拉取该镜像，离线节点需自行准备并提前导入对应架构镜像。Agent 会自动识别 GPU 型号、数量和显存汇总信息，并自动上报进程可见的逻辑 CPU 核数；仅在容器 CPU 限额或探测结果不准确时设置 `GPUFLOW_CPU_CORES`：
 
 ```bash
 docker compose up -d
