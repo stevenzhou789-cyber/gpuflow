@@ -72,6 +72,7 @@ upgrade_remote_agent() {
     cat <<'REMOTE_SCRIPT'
 set -Eeuo pipefail
 install_dir=$1
+umask 077
 target_image=$2
 offline=$3
 expected_image_id=$4
@@ -82,6 +83,19 @@ env_file="$install_dir/.env"
 [ -f "$install_dir/compose.yaml" ] || { echo "compose.yaml not found in $install_dir" >&2; exit 1; }
 [ -f "$env_file" ] || { echo ".env not found in $install_dir" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || { echo "docker is not installed" >&2; exit 1; }
+command -v flock >/dev/null 2>&1 || { echo 'flock is required for an exclusive Agent upgrade.' >&2; exit 1; }
+exec 9>"$install_dir/.gpuflow-upgrade.lock"
+flock -n 9 || { echo 'Another Agent upgrade owns this node.' >&2; exit 1; }
+
+old_container=$(docker compose --project-directory "$install_dir" ps -q agent)
+[ -n "$old_container" ] || { echo 'No running Agent to perform a verified handoff.' >&2; exit 1; }
+old_id=$(docker inspect -f '{{.Image}}' "$old_container")
+[[ "$old_id" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo 'Cannot identify the previous Agent image.' >&2; exit 1; }
+# Old versions cannot prove that a claimed attempt has finished. Do not replace
+# them automatically; the first migration requires a scheduled offline window.
+docker exec "$old_container" gpuflow agent-handoff --timeout 10s ready || {
+  echo 'Agent does not support safe handoff or is not ready; use a planned offline migration.' >&2; exit 1;
+}
 
 if [ -n "$(docker ps -q --filter label=gpuflow.job)" ]; then
   echo "running GPUFlow job containers found; refusing to interrupt them" >&2
@@ -98,10 +112,25 @@ if [ "$offline" = true ]; then
 else
   docker pull "$target_image"
 fi
+target_id=$(docker image inspect "$target_image" --format '{{.Id}}')
+[[ "$target_id" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo 'Cannot identify the prepared Agent image.' >&2; exit 1; }
+quiesced=true
+resume_old() {
+  if [ "$quiesced" = true ]; then
+    docker exec "$old_container" gpuflow agent-handoff --timeout 10s resume >&2 || true
+  fi
+}
+trap resume_old EXIT
+docker exec "$old_container" gpuflow agent-handoff --timeout 30m quiesce || {
+  echo 'Agent did not finish its claimed attempts; replacement refused.' >&2; exit 1;
+}
+# The acknowledged process cannot claim again. Include a physical check for
+# unmanaged leftovers, while preserving existing session/attempt fencing.
+[ -z "$(docker ps -q --filter label=gpuflow.job)" ] || { echo 'Job containers remain after handoff; replacement refused.' >&2; exit 42; }
 backup_env=$(mktemp)
 cp "$env_file" "$backup_env"
 temporary="${env_file}.tmp.$$"
-awk -v value="$target_image" '
+awk -v value="$target_id" '
   BEGIN { updated = 0 }
   index($0, "GPUFLOW_AGENT_IMAGE=") == 1 {
     if (!updated) print "GPUFLOW_AGENT_IMAGE=" value
@@ -113,25 +142,56 @@ awk -v value="$target_image" '
 ' "$env_file" > "$temporary"
 mv "$temporary" "$env_file"
 
-if ! docker compose --project-directory "$install_dir" up -d --no-deps --pull never --no-build agent; then
+if ! docker compose --project-directory "$install_dir" stop agent; then
   cp "$backup_env" "$env_file"
-  docker compose --project-directory "$install_dir" up -d --no-deps --pull never --no-build agent || true
+  echo 'Old Agent could not be stopped; replacement refused and environment restored.' >&2
+  exit 1
+fi
+# The control plane retains the old session lease. Let it expire before the
+# replacement registers; a successful process start alone is not registration.
+sleep 35
+
+wait_ready() {
+  local expected=$1 current attempt
+  for attempt in $(seq 1 30); do
+    current=$(docker compose --project-directory "$install_dir" ps -q agent)
+    if [ -n "$current" ] && [ "$(docker inspect -f '{{.Image}}' "$current")" = "$expected" ] && docker exec "$current" gpuflow agent-handoff --timeout 5s ready; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
+restore_previous() {
+  local current
+  current=$(docker compose --project-directory "$install_dir" ps -q agent)
+  if [ -n "$current" ] && [ "$(docker inspect -f '{{.State.Running}}' "$current")" = true ]; then
+    docker exec "$current" gpuflow agent-handoff --timeout 30m quiesce || { echo "Cannot safely stop the replacement; previous environment retained at $backup_env" >&2; return 1; }
+    docker compose --project-directory "$install_dir" stop agent || return 1
+    sleep 35
+  fi
+  # The old tag may have moved too. Restore the captured immutable image.
+  awk -v value="$old_id" 'index($0,"GPUFLOW_AGENT_IMAGE=")==1 {print "GPUFLOW_AGENT_IMAGE=" value;next} {print}' "$backup_env" > "$temporary"
+  mv "$temporary" "$env_file"
+  docker compose --project-directory "$install_dir" up -d --no-deps --pull never --no-build agent && wait_ready "$old_id" || {
+    echo "Previous Agent could not be verified ready; environment retained at $backup_env" >&2; return 1;
+  }
+  quiesced=false
   rm -f "$backup_env"
-  echo "agent replacement failed; previous image restored" >&2
+  echo 'Previous Agent image, registration, cleanup and heartbeat restored.' >&2
+}
+
+if ! docker compose --project-directory "$install_dir" up -d --no-deps --pull never --no-build agent; then
+  restore_previous || exit 1
+  echo 'Agent replacement failed.' >&2
   exit 1
 fi
 container=$(docker compose --project-directory "$install_dir" ps -q agent)
-[ -n "$container" ] || { echo "agent container was not created" >&2; exit 1; }
-sleep 3
-running=$(docker inspect -f '{{.State.Running}}' "$container")
-if [ "$running" != true ]; then
-  docker logs --tail 100 "$container" >&2 || true
-  cp "$backup_env" "$env_file"
-  docker compose --project-directory "$install_dir" up -d --no-deps --pull never --no-build agent || true
-  rm -f "$backup_env"
-  echo "new agent did not remain running; previous image restored" >&2
+if ! wait_ready "$target_id"; then
+  [ -z "$container" ] || docker logs --tail 100 "$container" >&2 || true
+  restore_previous || exit 1
+  echo 'New Agent did not become ready.' >&2
   exit 1
 fi
+quiesced=false
 rm -f "$backup_env"
 REMOTE_SCRIPT
   } | ssh -o BatchMode=yes "$ssh_target" bash -s -- "$install_dir" "$TARGET_IMAGE" "$OFFLINE" "$EXPECTED_IMAGE_ID" "$EXPECTED_ARCHITECTURE"
@@ -150,4 +210,4 @@ while IFS='|' read -r ssh_target install_dir extra || [ -n "${ssh_target:-}" ]; 
   count=$((count + 1))
 done < "$INVENTORY"
 
-log "agent upgrade completed on $count node(s): $VERSION"
+log "agent handoff, registration, cleanup and heartbeat verified on $count node(s): $VERSION"

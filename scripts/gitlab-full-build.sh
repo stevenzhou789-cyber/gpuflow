@@ -15,8 +15,13 @@ signing_key=$(gpuflow_signing_key)
 : "${OFFLINE_DIND_IMAGE:?Provide the approved immutable fresh-daemon test image}" "${GPUFLOW_CI_IMAGE:?}"
 [[ "$CI_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
 [[ "$CI_JOB_ID" =~ ^[0-9]+$ && "$BUILDKIT_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]
-[[ -z ${CI_COMMIT_TAG:-} ]] || { echo 'Tag publication is fail-closed; existing stable tags/assets are not replaced.' >&2; exit 1; }
-[[ "${CI_COMMIT_BRANCH:-}" == "${CI_DEFAULT_BRANCH:?}" ]] || { echo 'Only the protected default branch may access release signing.' >&2; exit 1; }
+if [[ -n ${CI_COMMIT_TAG:-} ]]; then
+  python3 scripts/gitlab-release.py check
+  : "${COSIGN_PUBLIC_KEY_FILE:?Formal releases require an independent trusted Community public key}"
+  test -s "$COSIGN_PUBLIC_KEY_FILE"
+else
+  [[ "${CI_COMMIT_BRANCH:-}" == "${CI_DEFAULT_BRANCH:?}" ]] || { echo 'Only the default branch or a guarded protected tag may build.' >&2; exit 1; }
+fi
 [[ "$CI_REGISTRY" == gitlab.gpuflow.test:5055 && "$CI_REGISTRY_IMAGE" == "$CI_REGISTRY/gpuflow/gpuflow" && "$DOCKER_HOST" == tcp://builder:2375 ]] || { echo 'Publishing is restricted to the isolated local GitLab project and builder.' >&2; exit 1; }
 for command in docker cosign git jq bash tar gzip zip sha256sum; do command -v "$command" >/dev/null; done
 [[ "$(git rev-parse HEAD)" == "$CI_COMMIT_SHA" ]] || { echo 'The checked-out commit does not match CI_COMMIT_SHA.' >&2; exit 1; }
@@ -35,8 +40,11 @@ builder_created=false
 cleanup() { if [[ "$builder_created" == true ]]; then docker buildx rm "$builder" >/dev/null 2>&1 || true; fi; docker logout "$CI_REGISTRY" >/dev/null 2>&1 || true; rm -rf -- "$work"; }
 trap cleanup EXIT
 version="v0.0.0-git.${CI_COMMIT_SHA:0:12}"
-image="$CI_REGISTRY_IMAGE:$version"
-probe="$CI_REGISTRY_IMAGE/probe:$version"
+[[ -z ${CI_COMMIT_TAG:-} ]] || version=$CI_COMMIT_TAG
+# The numbered image tags are attached only by the final publisher after the
+# exact signed package has passed its installation gate.
+image="$CI_REGISTRY_IMAGE:candidate-$CI_JOB_ID"
+probe="$CI_REGISTRY_IMAGE/probe:candidate-$CI_JOB_ID"
 builder_args=(--builder "$builder")
 registry_args=(--allow-http-registry)
 export DOCKER_CONFIG="$work/docker-config"
@@ -51,6 +59,7 @@ builder_created=true
 docker buildx inspect "$builder" --bootstrap > gitlab-logs/buildkit.txt
 grep -Eq 'Platforms:.*linux/arm64([,/[:space:]]|$)' gitlab-logs/buildkit.txt || { echo 'arm64 builder support is required; dropping the architecture is forbidden.' >&2; exit 1; }
 cosign public-key --key "$signing_key" > "$work/cosign.pub"
+if [[ -n ${CI_COMMIT_TAG:-} ]]; then cp "$COSIGN_PUBLIC_KEY_FILE" "$work/cosign.pub"; fi
 printf '%s\n' "$CI_COMMIT_SHA" > "$work/signing-preflight.txt"
 cosign sign-blob --yes --key "$signing_key" --bundle "$work/signing-preflight.sigstore.json" "$work/signing-preflight.txt"
 cosign verify-blob --offline --trusted-root "$SIGSTORE_TRUSTED_ROOT_FILE" --key "$work/cosign.pub" \
@@ -90,4 +99,10 @@ docker pull --platform linux/amd64 "$OFFLINE_DIND_IMAGE" 2>&1 | tee gitlab-logs/
 bash scripts/gitlab-verify-offline.sh "$version" "$work/signed-artifacts" \
   "$work/cosign.pub" "$SIGSTORE_TRUSTED_ROOT_FILE" 2>&1 | tee gitlab-logs/offline-real-install.log
 mv "$work/signed-artifacts" gitlab-artifacts/full
+if [[ -n ${CI_COMMIT_TAG:-} ]]; then
+  python3 scripts/gitlab-release.py record --assets-dir gitlab-artifacts/full \
+    --app "$CI_REGISTRY_IMAGE@$app_digest" --probe "$CI_REGISTRY_IMAGE/probe@$probe_digest"
+  cosign sign-blob --yes --key "$signing_key" \
+    --bundle gitlab-artifacts/full/RELEASE-EVIDENCE.json.sigstore.json gitlab-artifacts/full/RELEASE-EVIDENCE.json
+fi
 printf 'Full signed build and real amd64 offline installation passed for %s (ARM package verified, no ARM hardware/GPU claim).\n' "$CI_COMMIT_SHA"

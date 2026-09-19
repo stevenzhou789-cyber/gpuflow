@@ -1,5 +1,27 @@
 # Dual-remote development workflow
 
+## Community tag channel
+
+The default branch produces signed `v0.0.0-git.<sha>` development artifacts.
+A new protected `vX.Y.Z` tag follows `formal-tag-guard -> full-signed-build ->
+publish-version`, without manual stages. Missing signing or offline acceptance
+blocks publication. Images remain candidates until final package acceptance;
+the publisher promotes their exact digest without rebuilding or replacing an
+existing version.
+
+Configure the existing Community key/password and independent
+`COSIGN_PUBLIC_KEY_FILE` / `SIGSTORE_TRUSTED_ROOT_FILE` as protected inputs.
+Scope `GITLAB_RELEASE_TOKEN` to `release-publishing`, with tag/event/pipeline
+read and package/release publication permissions. Build jobs use the frozen
+guard and repository-read access, not the publication API credential.
+The publisher verifies the successful build's exact archives, checksums,
+signature bundles and signed `RELEASE-EVIDENCE.json`.
+
+These changes add no Enterprise License, RBAC, billing, managed Registry,
+node maintenance or per-device governance to Community. The Enterprise
+repository separately pins a committed Community SHA. See also
+[local Agent upgrade handoff](../deploy/AGENT-UPGRADE-SAFETY.md).
+
 The current user instruction requires committed changes to be synchronized to
 GitHub (`origin`) and local GitLab (`gitlab`). Preserve both CI definitions and
 report each server's build result separately. A quota or build failure does not

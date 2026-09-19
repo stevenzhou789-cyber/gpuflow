@@ -54,7 +54,7 @@ func envBool(name string, fallback bool) bool {
 	return parsed
 }
 func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: gpuflow <server|agent|submit|jobs|nodes|get> [options]")
+	fmt.Fprintln(os.Stderr, "Usage: gpuflow <server|agent|agent-handoff|submit|jobs|nodes|get> [options]")
 }
 
 func main() {
@@ -68,6 +68,8 @@ func main() {
 		err = runServer(os.Args[2:])
 	case "agent":
 		err = runAgent(os.Args[2:])
+	case "agent-handoff":
+		err = runAgentHandoff(os.Args[2:])
 	case "submit":
 		err = submit(os.Args[2:])
 	case "jobs", "nodes", "get":
@@ -121,6 +123,9 @@ func runServer(args []string) error {
 func runAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	cfg := agent.Config{}
+	if runtime.GOOS == "linux" {
+		cfg.LocalControl = "/run/gpuflow-agent.sock"
+	}
 	fs.StringVar(&cfg.Server, "server", env("GPUFLOW_SERVER", "http://localhost:8080"), "control plane URL")
 	fs.StringVar(&cfg.Token, "token", env("GPUFLOW_TOKEN", ""), "bearer token")
 	fs.StringVar(&cfg.ID, "id", env("GPUFLOW_NODE_ID", ""), "stable node ID")

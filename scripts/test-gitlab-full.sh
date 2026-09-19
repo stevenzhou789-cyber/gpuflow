@@ -72,6 +72,11 @@ printf 'mock-node|%s\n' "$test_root/agent" > "$test_root/agents.conf"
 agent_upgrader=(bash "$package/scripts/upgrade-agents.sh" "$version" --inventory "$test_root/agents.conf" --image-repository gpuflow-offline/app --offline --offline-package "$package" --public-key "$test_root/cosign.pub")
 "${agent_upgrader[@]}" > "$test_root/agents.log"
 before=$(sha256sum "$test_root/agent/.env")
+up_count=$(awk '/^docker compose .* up / {n++} END {print n+0}' "$MOCK_CALLS")
+expect_failure env MOCK_HANDOFF_UNSUPPORTED=true "${agent_upgrader[@]}"
+expect_failure env MOCK_HANDOFF_BUSY=true "${agent_upgrader[@]}"
+[[ $(awk '/^docker compose .* up / {n++} END {print n+0}' "$MOCK_CALLS") == "$up_count" ]]
+[[ $(sha256sum "$test_root/agent/.env") == "$before" ]]
 expect_failure env MOCK_RUNNING_JOBS=true "${agent_upgrader[@]}"
 [[ $(sha256sum "$test_root/agent/.env") == "$before" ]]
 # The offline upgrade paths must not pull. Earlier pulls belong to packaging.

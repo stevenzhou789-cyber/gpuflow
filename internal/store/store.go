@@ -1099,6 +1099,9 @@ func (s *Store) registerNode(in model.Node, session string, forceTakeover, requi
 	if in.ID == "" {
 		in.ID = newID("node")
 	}
+	if !model.ValidNodeID(in.ID) {
+		return nil, errors.New("node ID must be 1-64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit")
+	}
 	if in.Name == "" {
 		in.Name = in.ID
 	}

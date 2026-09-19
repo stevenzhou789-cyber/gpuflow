@@ -83,7 +83,13 @@ case "$command_name" in
         elif [[ "$*" == *'SELECT 1'* ]]; then [[ ${MOCK_FAIL_MYSQL:-false} != true ]] || exit 1; printf '1\n'
         elif [[ "$*" == *mysqldump* ]]; then printf 'MOCK SQL BACKUP\n'; fi
         ;;
-      'inspect -f') printf 'true\n';;
+      'inspect -f') if [[ "$3" == '{{.Image}}' ]]; then printf 'sha256:'; printf '%064d\n' 0 | tr 0 a; else printf 'true\n'; fi;;
+      'exec mock-container')
+        if [[ "$3" == wget ]]; then exit 0; fi
+        [[ "$3" == gpuflow && "$4" == agent-handoff && "$5" == --timeout && "$#" == 7 ]] || exit 87
+        [[ ${MOCK_HANDOFF_UNSUPPORTED:-false} != true ]] || exit 1
+        [[ ${MOCK_HANDOFF_BUSY:-false} != true || "$7" != quiesce ]] || exit 1
+        ;;
       'ps -q') if [[ ${MOCK_RUNNING_JOBS:-false} == true ]]; then printf 'mock-running-task\n'; fi;;
     esac
     exit 0

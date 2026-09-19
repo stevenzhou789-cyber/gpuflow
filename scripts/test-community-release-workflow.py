@@ -134,9 +134,15 @@ def check_contract(workflow, gitlab_ci, gitlab_build):
                 == "v3.1.3", "Keep the tested Cosign version for signing and verification")
 
     require("- if: '$CI_COMMIT_TAG'" in gitlab_ci and "bash scripts/gitlab-full-build.sh" in gitlab_ci,
-            "GitLab tag pipelines must still reach their explicit refusal gate")
-    require(re.search(r"^\[\[ -z \$\{CI_COMMIT_TAG:-\} \]\] \|\| \{[^\n]*exit 1; \}",
-                      gitlab_build, re.M), "GitLab must retain fail-closed tag publication")
+            "GitLab tag pipelines must reach the verified build")
+    require('python3 scripts/gitlab-release.py guard' in gitlab_ci and
+            'python3 scripts/gitlab-release.py check' in gitlab_build and
+            'bash scripts/gitlab-publish-version.sh' in gitlab_ci and
+            '- job: full-signed-build' in gitlab_ci, "Formal GitLab publication requires tag provenance and the successful build")
+    require("default branch or a guarded protected tag may build.' >&2; exit 1; }" in gitlab_build,
+            "Unguarded branches must fail closed")
+    require(gitlab_build.index('bash scripts/gitlab-verify-offline.sh') < gitlab_build.index('python3 scripts/gitlab-release.py record'),
+            "Release evidence must follow real offline installation")
 
 
 class ReleaseWorkflowTests(unittest.TestCase):

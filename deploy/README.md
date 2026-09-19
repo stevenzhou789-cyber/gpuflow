@@ -1,5 +1,8 @@
 # GPUFlow 部署与升级说明
 
+Agent 批量升级的排空、就绪判定及旧版首次迁移边界见
+[Agent 升级交接](AGENT-UPGRADE-SAFETY.md)。
+
 本文档面向 GPUFlow 控制面服务器管理员。所有升级和回滚命令均在控制面服务器执行；Linux/Docker Agent 可以通过 SSH 从控制面集中更新。
 
 ## 目录说明

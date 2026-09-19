@@ -1,5 +1,7 @@
 stages:
+  - release-context
   - build
+  - release
 
 workflow:
   rules:
@@ -22,6 +24,20 @@ variables:
   OFFLINE_DIND_IMAGE: docker:29.3.1-dind@sha256:686d2c5464787b0ca42420e0aa03a94fc9781ff9bf8b5ff947614b9fa4c3c3e0
   # DOCKER_HOST is supplied by the isolated local runner, never a host socket.
 
+formal-tag-guard:
+  stage: release-context
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  environment:
+    name: release-publishing
+    action: prepare
+  script:
+    - python3 scripts/gitlab-release.py guard
+  artifacts:
+    access: developer
+    expire_in: 90 days
+    paths: [gitlab-evidence/formal-tag-guard.json]
+
 full-signed-build:
   stage: build
   resource_group: gpuflow-full-signed-build
@@ -29,9 +45,14 @@ full-signed-build:
     name: release-signing
     action: prepare
   timeout: 2h
+  needs:
+    - job: formal-tag-guard
+      optional: true
+      artifacts: true
   script:
     - node --test scripts/check-community-boundary.test.mjs
     - node scripts/check-community-boundary.mjs
+    - python3 scripts/test-gitlab-release.py
     - bash scripts/gitlab-full-build.sh
   artifacts:
     name: "gpuflow-full-signed-$CI_COMMIT_SHORT_SHA-$CI_JOB_ID"
@@ -41,3 +62,18 @@ full-signed-build:
     paths:
       - gitlab-logs/
       - gitlab-artifacts/full/
+
+publish-version:
+  stage: release
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  resource_group: gpuflow-full-signed-build
+  needs:
+    - job: formal-tag-guard
+      artifacts: true
+    - job: full-signed-build
+      artifacts: true
+  environment:
+    name: release-publishing
+  script:
+    - bash scripts/gitlab-publish-version.sh

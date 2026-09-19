@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 )
 
 type Config struct {
+	LocalControl                                                                                             string
 	Server, Token, ID, Name, Provider, Pool, Executor, ArtifactDir, ProbeImage, GPUProbe, AcceleratorBackend string
 	CPUCores                                                                                                 int
 	HourlyPrice                                                                                              float64
@@ -34,6 +36,10 @@ type Config struct {
 	ExecuteCommand                                                                                           func(context.Context, string, ...string) *exec.Cmd
 }
 type Agent struct {
+	handoffMu          sync.Mutex
+	draining           bool
+	activeTicks        int
+	ready              bool
 	cfg                Config
 	client             *client.Client
 	session            string
@@ -77,6 +83,9 @@ func New(cfg Config) *Agent {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
+	if a.cfg.ID != "" && !model.ValidNodeID(a.cfg.ID) {
+		return errors.New("invalid node ID: use 1-64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit")
+	}
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	a.failStop = cancel
@@ -134,7 +143,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		return fmt.Errorf("clean managed containers before session takeover: %w", err)
 	}
-	if _, err := a.doContext(cleanupCtx, http.MethodPost, "/v1/nodes/"+a.cfg.ID+"/cleanup-complete", nil, nil, a.sessionHeaders()); err != nil {
+	if _, err := a.doContext(cleanupCtx, http.MethodPost, "/v1/nodes/"+url.PathEscape(a.cfg.ID)+"/cleanup-complete", nil, nil, a.sessionHeaders()); err != nil {
 		cleanupCancel()
 		if cause := context.Cause(runCtx); cause != nil {
 			return cause
@@ -158,7 +167,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		requestTimeout = remaining
 	}
 	heartbeatCtx, heartbeatCancel := context.WithTimeout(runCtx, requestTimeout)
-	_, heartbeatErr := a.doContext(heartbeatCtx, http.MethodPost, "/v1/nodes/"+a.cfg.ID+"/heartbeat", nil, nil, a.sessionHeaders())
+	_, heartbeatErr := a.doContext(heartbeatCtx, http.MethodPost, "/v1/nodes/"+url.PathEscape(a.cfg.ID)+"/heartbeat", nil, nil, a.sessionHeaders())
 	heartbeatCancel()
 	if heartbeatErr != nil {
 		if cause := context.Cause(runCtx); cause != nil {
@@ -167,6 +176,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("confirm agent session heartbeat: %w", heartbeatErr)
 	}
 	a.setSessionLeaseDeadline(requestStarted.Add(a.sessionTTL))
+	a.handoffMu.Lock()
+	a.ready = probeErr == nil
+	a.handoffMu.Unlock()
+	closeControl, err := a.serveLocalControl(runCtx)
+	if err != nil {
+		return err
+	}
+	defer closeControl()
 	workers := n.GPUCount
 	if workers < 1 {
 		workers = 1
@@ -262,7 +279,7 @@ func (a *Agent) healthLoop(ctx context.Context) {
 			if err != nil {
 				update.Status, update.Reason = "DEGRADED", err.Error()
 			}
-			if _, updateErr := a.doContext(ctx, http.MethodPost, "/v1/nodes/"+a.cfg.ID+"/health", update, nil, a.sessionHeaders()); updateErr != nil && ctx.Err() == nil {
+			if _, updateErr := a.doContext(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(a.cfg.ID)+"/health", update, nil, a.sessionHeaders()); updateErr != nil && ctx.Err() == nil {
 				fmt.Printf("agent health update warning: %v\n", updateErr)
 			} else if updateErr == nil && err == nil {
 				a.baseline = node
@@ -358,8 +375,18 @@ func (a *Agent) runWorker(ctx context.Context) {
 }
 
 func (a *Agent) tick(ctx context.Context) error {
+	// Cover the entire claim, pre-container preparation, execution, uploads and
+	// terminal acknowledgement. A container listing alone misses these stages.
+	a.handoffMu.Lock()
+	if a.draining {
+		a.handoffMu.Unlock()
+		return nil
+	}
+	a.activeTicks++
+	a.handoffMu.Unlock()
+	defer func() { a.handoffMu.Lock(); a.activeTicks--; a.handoffMu.Unlock() }()
 	var dispatched model.AgentJob
-	status, err := a.doContext(ctx, http.MethodPost, "/v1/nodes/"+a.cfg.ID+"/next", nil, &dispatched, a.sessionHeaders())
+	status, err := a.doContext(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(a.cfg.ID)+"/next", nil, &dispatched, a.sessionHeaders())
 	if err != nil {
 		return err
 	}
@@ -444,7 +471,7 @@ func (a *Agent) failStartedJob(ctx context.Context, job *model.Job, attemptToken
 }
 
 func (a *Agent) updateJobStatusUntilAccepted(ctx context.Context, job *model.Job, attemptToken string, update model.JobUpdate) error {
-	path := "/v1/jobs/" + job.ID + "/status?node_id=" + a.cfg.ID
+	path := "/v1/jobs/" + job.ID + "/status?node_id=" + url.QueryEscape(a.cfg.ID)
 	deadline := time.Now().Add(model.AgentSessionTTL)
 	for {
 		status, err := a.doContext(ctx, http.MethodPost, path, update, nil, a.jobHeaders(attemptToken))
@@ -540,7 +567,7 @@ func (a *Agent) uploadArtifact(parent context.Context, jobID, attemptToken, bund
 			}
 		}
 	}()
-	_, err := a.uploadArtifactFile(ctx, "/v1/jobs/"+jobID+"/artifacts?node_id="+a.cfg.ID, bundle, a.jobHeaders(attemptToken))
+	_, err := a.uploadArtifactFile(ctx, "/v1/jobs/"+jobID+"/artifacts?node_id="+url.QueryEscape(a.cfg.ID), bundle, a.jobHeaders(attemptToken))
 	cancel()
 	<-monitorDone
 	return err
@@ -588,7 +615,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 			}
 			requestStarted := time.Now()
 			requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
-			_, err := a.doContext(requestCtx, http.MethodPost, "/v1/nodes/"+a.cfg.ID+"/heartbeat", nil, nil, a.sessionHeaders())
+			_, err := a.doContext(requestCtx, http.MethodPost, "/v1/nodes/"+url.PathEscape(a.cfg.ID)+"/heartbeat", nil, nil, a.sessionHeaders())
 			cancel()
 			if err == nil {
 				leaseDeadline = requestStarted.Add(ttl)
@@ -793,7 +820,7 @@ func legacyJobContainerName(jobID string) string {
 }
 
 func (a *Agent) validateAttemptOwnership(ctx context.Context, jobID, attemptToken string) error {
-	path := "/v1/jobs/" + jobID + "/attempt?node_id=" + a.cfg.ID
+	path := "/v1/jobs/" + jobID + "/attempt?node_id=" + url.QueryEscape(a.cfg.ID)
 	if _, err := a.doContext(ctx, http.MethodGet, path, nil, nil, a.jobHeaders(attemptToken)); err != nil {
 		return fmt.Errorf("validate Docker attempt ownership: %w", err)
 	}
