@@ -27,12 +27,9 @@ class DependencyTests(unittest.TestCase):
                     {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "42"}):
             with self.subTest(provider=env), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "reports"
-                def run(args, check):
-                    self.assertFalse(check)
-                    self.assertEqual(args[args.index("--image-src") + 1], "remote")
-                    self.assertNotIn("--ignore-unfixed", args)
-                    report = self.report(args[-1], args[args.index("--platform") + 1].split("/")[1])
-                    Path(args[args.index("--output") + 1]).write_text(json.dumps(report), encoding="utf-8")
+                def run(reference, arch, output):
+                    report = self.report(reference, arch)
+                    output.write_text(json.dumps(report), encoding="utf-8")
                     return SimpleNamespace(returncode=42)
                 scan.scan(output, run, env)
                 summary = json.loads((output / "DEPENDENCY-FINDINGS.json").read_text())

@@ -19,3 +19,10 @@ Scanner failures, absent or malformed reports, wrong image/platform and Secret
 findings still fail. Existing image/package signing and immutable publication
 checks remain in place. No approval keys, records or per-tag Runner changes
 are needed for this policy.
+
+Both providers use `scripts/scan-dependency-image.py`: Docker pulls the fixed
+digest for the requested architecture, saves that platform to a temporary
+single-image archive, and Trivy scans the complete local archive. The helper
+checks the archive and report platform and retains source/config/archive
+digests in the report. It never retags or deletes cached images. This avoids
+repeated remote-layer EOF failures without suppressing scan errors or findings.

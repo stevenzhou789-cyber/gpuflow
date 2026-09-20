@@ -46,6 +46,7 @@ dependency-scan:
       optional: true
       artifacts: true
   script:
+    - python3 scripts/test-scan-dependency-image.py
     - python3 scripts/test-scan-dependencies.py
     - python3 scripts/scan-dependencies.py
   artifacts:

@@ -22,6 +22,7 @@ on:
       - "scripts/*package-community-release.py"
       - "scripts/test-community-release-workflow.py"
       - "scripts/*scan-dependencies.py"
+      - "scripts/*scan-dependency-image.py"
       - "scripts/test-build-context.py"
       - "scripts/gitlab-*.Dockerfile.dockerignore"
       - "compose.yaml"
@@ -86,7 +87,9 @@ jobs:
         with:
           version: v0.74.0
       - name: Verify report-only dependency policy
-        run: python3 scripts/test-scan-dependencies.py
+        run: |
+          python3 scripts/test-scan-dependency-image.py
+          python3 scripts/test-scan-dependencies.py
       - name: Record third-party findings without approval
         run: python3 scripts/scan-dependencies.py
       - name: Retain actual dependency reports

@@ -3,11 +3,17 @@
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
-import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("image_scanner", Path(__file__).with_name("scan-dependency-image.py"))
+image_scanner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(image_scanner)
 
 IMAGES = {
     "mysql": "mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb",
@@ -52,20 +58,16 @@ def inspect(report, reference, arch, status):
     return counts
 
 
-def scan(output, run=subprocess.run, environment=None):
+def scan(output, image_scan=image_scanner.scan_image, environment=None):
     env = os.environ if environment is None else environment
     output.mkdir(parents=True, exist_ok=False)
     rows = []
     with tempfile.TemporaryDirectory(prefix="gpuflow-dependency-scan-") as temporary:
-        config, raw = Path(temporary) / "trivy.yaml", Path(temporary) / "raw.json"
-        config.write_text("{}\n", encoding="utf-8")
+        raw = Path(temporary) / "raw.json"
         for name, reference in IMAGES.items():
             for arch in ("amd64", "arm64"):
                 raw.unlink(missing_ok=True)
-                result = run(["trivy", "image", "--config", str(config), "--ignorefile", os.devnull,
-                              "--image-src", "remote", "--platform", "linux/" + arch, "--scanners", "vuln,secret",
-                              "--severity", "HIGH,CRITICAL", "--format", "json", "--output", str(raw),
-                              "--exit-code", "42", "--timeout", "20m", reference], check=False)
+                result = image_scan(reference, arch, raw)
                 report = redact(json.loads(raw.read_text(encoding="utf-8")))
                 data = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
                 (output / f"{name}-{arch}.json").write_bytes(data)
