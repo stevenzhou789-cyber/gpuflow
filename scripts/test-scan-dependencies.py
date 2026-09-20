@@ -70,6 +70,13 @@ class DependencyTests(unittest.TestCase):
             self.assertNotIn("RISK_APPROVAL", workflow)
             self.assertNotIn("allow_failure:", workflow)
             self.assertNotIn("continue-on-error:", workflow)
+        github = (ROOT / ".github/workflows/container-image.yml").read_text(encoding="utf-8")
+        job = github.split("  dependency-scan:", 1)[1].split("\n  build:", 1)[0]
+        self.assertIn("docker/setup-docker-action@e43656e248c0bd0647d3f5c195d116aacf6fcaf4", job)
+        self.assertIn('"containerd-snapshotter":true', job)
+        self.assertIn("version: v29.3.1", job)
+        self.assertIn("set-host: true", job)
+        self.assertLess(job.index("docker/setup-docker-action@"), job.index("python3 scripts/scan-dependencies.py"))
 
 
 if __name__ == "__main__":

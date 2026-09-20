@@ -26,3 +26,6 @@ single-image archive, and Trivy scans the complete local archive. The helper
 checks the archive and report platform and retains source/config/archive
 digests in the report. It never retags or deletes cached images. This avoids
 repeated remote-layer EOF failures without suppressing scan errors or findings.
+GitHub prepares Docker 29.3.1 with the containerd image store in the job, matching
+the GitLab builder; the default single-platform store cannot retain both index
+variants under one digest. This is automatic workflow setup, not per-tag input.
