@@ -1,5 +1,6 @@
 stages:
   - release-context
+  - scan
   - build
   - release
 
@@ -38,6 +39,21 @@ formal-tag-guard:
     expire_in: 90 days
     paths: [gitlab-evidence/formal-tag-guard.json]
 
+dependency-scan:
+  stage: scan
+  needs:
+    - job: formal-tag-guard
+      optional: true
+      artifacts: true
+  script:
+    - python3 scripts/test-scan-dependencies.py
+    - python3 scripts/scan-dependencies.py
+  artifacts:
+    access: developer
+    expire_in: 90 days
+    when: always
+    paths: [dependency-reports/]
+
 full-signed-build:
   stage: build
   resource_group: gpuflow-full-signed-build
@@ -46,6 +62,8 @@ full-signed-build:
     action: prepare
   timeout: 2h
   needs:
+    - job: dependency-scan
+      artifacts: false
     - job: formal-tag-guard
       optional: true
       artifacts: true

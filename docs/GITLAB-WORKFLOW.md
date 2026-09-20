@@ -3,11 +3,15 @@
 ## Community tag channel
 
 The default branch produces signed `v0.0.0-git.<sha>` development artifacts.
-A new protected `vX.Y.Z` tag follows `formal-tag-guard -> full-signed-build ->
+A new protected `vX.Y.Z` tag follows `formal-tag-guard -> dependency-scan -> full-signed-build ->
 publish-version`, without manual stages. Missing signing or offline acceptance
 blocks publication. Images remain candidates until final package acceptance;
 the publisher promotes their exact digest without rebuilding or replacing an
 existing version.
+
+Both providers collect third-party dependency reports before building. HIGH/CRITICAL
+findings do not require approval and do not block building or publication; scan
+execution and evidence errors still fail. See [dependency records](DEPENDENCY-SCANS.md).
 
 Configure the existing Community key/password and independent
 `COSIGN_PUBLIC_KEY_FILE` / `SIGSTORE_TRUSTED_ROOT_FILE` as protected inputs.

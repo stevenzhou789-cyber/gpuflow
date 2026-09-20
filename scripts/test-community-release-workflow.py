@@ -57,7 +57,7 @@ def check_contract(workflow, gitlab_ci, gitlab_build):
     release = section(workflow, "release", 2)
     require('      - "v*"' in section(section(workflow, "on", 0), "push", 2),
             "Numbered tag pushes must reach the release guard")
-    require(field(build, "needs", 4) == "validate", "Image build must depend on validation")
+    require(field(build, "needs", 4) == "[validate, dependency-scan]", "Image build must depend on validation")
     require(set(field(release, "needs", 4).strip("[]").replace(" ", "").split(","))
             == {"validate", "build"}, "Release must depend on both validation and signed build")
     require(field(release, "if", 4) == f"{STABLE_IF} || {VERSION_IF}",

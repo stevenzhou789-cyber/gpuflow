@@ -21,6 +21,7 @@ on:
       - "scripts/community-release*"
       - "scripts/*package-community-release.py"
       - "scripts/test-community-release-workflow.py"
+      - "scripts/*scan-dependencies.py"
       - "scripts/test-build-context.py"
       - "scripts/gitlab-*.Dockerfile.dockerignore"
       - "compose.yaml"
@@ -73,8 +74,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/community-release.mjs guard
 
-  build:
+  dependency-scan:
     needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: v0.74.0
+      - name: Verify report-only dependency policy
+        run: python3 scripts/test-scan-dependencies.py
+      - name: Record third-party findings without approval
+        run: python3 scripts/scan-dependencies.py
+      - name: Retain actual dependency reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dependency-scans-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dependency-reports/
+          if-no-files-found: error
+          retention-days: 90
+
+  build:
+    needs: [validate, dependency-scan]
     runs-on: ubuntu-latest
     outputs:
       image_name: ${{ steps.image.outputs.name }}

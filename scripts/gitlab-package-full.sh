@@ -42,7 +42,7 @@ zip -j "$dist/gpuflow-windows-amd64.zip" "$binaries/windows-amd64/gpuflow.exe"
 tar -C "$work" -czf "$dist/$package_name.tar.gz" "$package_name"
 
 mysql_source='mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb'
-minio_source='minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e'
+minio_source='quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e'
 for architecture in amd64 arm64; do
   offline_name="gpuflow-offline-$version-linux-$architecture"
   offline="$work/$offline_name"

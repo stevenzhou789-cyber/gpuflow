@@ -27,3 +27,4 @@ scripts/agents.conf
 .env.*
 !.env.example
 *.credential.xml
+/dependency-reports/

@@ -26,7 +26,7 @@ services:
     restart: unless-stopped
 
   mysql:
-    image: ${GPUFLOW_MYSQL_IMAGE:-mysql:8.4}
+    image: ${GPUFLOW_MYSQL_IMAGE:-mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb}
     environment:
       MYSQL_DATABASE: gpuflow
       MYSQL_USER: gpuflow
@@ -44,7 +44,7 @@ services:
     restart: unless-stopped
 
   minio:
-    image: ${GPUFLOW_MINIO_IMAGE:-minio/minio:latest}
+    image: ${GPUFLOW_MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e}
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: ${GPUFLOW_MINIO_ROOT_USER:-gpuflow}
