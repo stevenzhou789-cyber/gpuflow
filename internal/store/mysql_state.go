@@ -306,6 +306,8 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), provider=VALUES(provider), pool=VALUE
   current_job=VALUES(current_job), last_heartbeat=VALUES(last_heartbeat)`
 
 type nodeDetails struct {
+	HostResourceLimits   bool              `json:"host_resource_limits,omitempty"`
+	MemoryMiB            int64             `json:"memory_mib,omitempty"`
 	Devices              []model.GPUDevice `json:"devices,omitempty"`
 	DriverVersion        string            `json:"driver_version,omitempty"`
 	DockerVersion        string            `json:"docker_version,omitempty"`
@@ -320,10 +322,12 @@ type nodeDetails struct {
 
 func detailsFromNode(node *model.Node) nodeDetails {
 	cleanupPending := node.CleanupPending
-	return nodeDetails{Devices: node.Devices, DriverVersion: node.DriverVersion, DockerVersion: node.DockerVersion, HealthStatus: node.HealthStatus, HealthReason: node.HealthReason, LastHealthCheck: node.LastHealthCheck, SessionEpoch: node.SessionEpoch, CleanupPending: &cleanupPending, Maintenance: node.Maintenance, MaintenanceUpdatedAt: cloneTime(node.MaintenanceUpdatedAt)}
+	return nodeDetails{HostResourceLimits: node.HostResourceLimits, MemoryMiB: node.MemoryMiB, Devices: node.Devices, DriverVersion: node.DriverVersion, DockerVersion: node.DockerVersion, HealthStatus: node.HealthStatus, HealthReason: node.HealthReason, LastHealthCheck: node.LastHealthCheck, SessionEpoch: node.SessionEpoch, CleanupPending: &cleanupPending, Maintenance: node.Maintenance, MaintenanceUpdatedAt: cloneTime(node.MaintenanceUpdatedAt)}
 }
 
 func (details nodeDetails) apply(node *model.Node) {
+	node.MemoryMiB = details.MemoryMiB
+	node.HostResourceLimits = details.HostResourceLimits
 	node.Devices, node.DriverVersion, node.DockerVersion = details.Devices, details.DriverVersion, details.DockerVersion
 	node.HealthStatus, node.HealthReason, node.LastHealthCheck = details.HealthStatus, details.HealthReason, details.LastHealthCheck
 	node.SessionEpoch = details.SessionEpoch

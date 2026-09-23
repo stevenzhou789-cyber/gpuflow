@@ -56,6 +56,9 @@ func TestProbeNodeAllowsNativeCPUOnlyNode(t *testing.T) {
 
 func TestProbeNodeValidatesContainerRuntime(t *testing.T) {
 	a := New(Config{ProbeImage: "ghcr.io/example/gpu-probe:v1", GPUProbe: "docker", ProbeCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "info" {
+			return []byte("8 17179869184 true true true"), nil
+		}
 		if len(args) > 0 && args[0] == "version" {
 			return []byte("27.0.0"), nil
 		}

@@ -1,6 +1,7 @@
 package artifact
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -16,6 +17,13 @@ import (
 )
 
 var ErrDisabled = errors.New("artifact storage is not configured")
+
+// MaxSize bounds each artifact at 1 TiB. The API separately allows a small
+// multipart envelope for older clients; S3 multipart uploads use bounded memory.
+const MaxSize int64 = 1 << 40
+
+const uploadPartSize = 128 << 20
+const copyPartSize int64 = 5 << 30
 
 type Config struct {
 	Endpoint, AccessKey, SecretKey, Bucket, Region string
@@ -34,6 +42,8 @@ type Item struct {
 type Staged struct {
 	sourceKey      string
 	destinationKey string
+	size           int64
+	etag           string
 }
 
 type Store interface {
@@ -138,25 +148,78 @@ func stagedObjectName(jobID, name string) (Staged, error) {
 }
 
 func (s *minioStore) Stage(ctx context.Context, jobID, name string, r io.Reader, size int64) (Staged, error) {
+	if size > MaxSize || size < -1 {
+		return Staged{}, errors.New("invalid artifact size (maximum 1 TiB)")
+	}
 	staged, err := stagedObjectName(jobID, name)
 	if err != nil {
 		return Staged{}, err
 	}
-	_, err = s.client.PutObject(ctx, s.bucket, staged.sourceKey, r, size, minio.PutObjectOptions{ContentType: "application/gzip"})
+	// Legacy multipart uploads have no file length. Buffer at most 64 KiB so
+	// small logs can still use a single PUT, then stream larger files onward.
+	if size < 0 {
+		prefix, err := io.ReadAll(io.LimitReader(r, 64<<10))
+		if err != nil {
+			return staged, err
+		}
+		if len(prefix) < 64<<10 {
+			size = int64(len(prefix))
+		}
+		r = io.MultiReader(bytes.NewReader(prefix), r)
+	}
+	opts := minio.PutObjectOptions{ContentType: "application/gzip"}
+	if size < 0 || size >= uploadPartSize {
+		// 8192 parts cover the full 1 TiB limit within S3's 10000-part cap.
+		// Sequential streaming holds one reusable part buffer, never the file.
+		opts.PartSize = uploadPartSize
+	}
+	info, err := s.client.PutObject(ctx, s.bucket, staged.sourceKey, r, size, opts)
+	staged.size, staged.etag = info.Size, info.ETag
+	if err == nil && (info.Size > MaxSize || (size >= 0 && info.Size != size)) {
+		err = errors.New("artifact storage did not save the expected byte count")
+	}
 	return staged, err
 }
 
-// Commit promotes a fully uploaded staging object with a single S3 CopyObject
-// operation. S3-compatible stores replace the destination object atomically,
-// so a failed or fenced upload never partially overwrites the prior artifact.
+// Commit atomically promotes a fully uploaded staging object. Multipart copy is
+// required above S3's 5 GiB CopyObject limit; incomplete copies remain invisible.
 func (s *minioStore) Commit(ctx context.Context, staged Staged) error {
 	if staged.sourceKey == "" || staged.destinationKey == "" {
 		return errors.New("invalid staged artifact")
 	}
-	_, err := s.client.CopyObject(ctx,
-		minio.CopyDestOptions{Bucket: s.bucket, Object: staged.destinationKey},
-		minio.CopySrcOptions{Bucket: s.bucket, Object: staged.sourceKey},
-	)
+	if staged.size <= copyPartSize {
+		_, err := s.client.CopyObject(ctx,
+			minio.CopyDestOptions{Bucket: s.bucket, Object: staged.destinationKey},
+			minio.CopySrcOptions{Bucket: s.bucket, Object: staged.sourceKey, MatchETag: staged.etag},
+		)
+		return err
+	}
+	core := minio.Core{Client: s.client}
+	options := minio.PutObjectOptions{ContentType: "application/gzip"}
+	uploadID, err := core.NewMultipartUpload(ctx, s.bucket, staged.destinationKey, options)
+	if err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		if !complete {
+			cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = core.AbortMultipartUpload(cleanup, s.bucket, staged.destinationKey, uploadID)
+		}
+	}()
+	var parts []minio.CompletePart
+	for offset := int64(0); offset < staged.size; offset += copyPartSize {
+		length := min(copyPartSize, staged.size-offset)
+		part, err := core.CopyObjectPart(ctx, s.bucket, staged.sourceKey, s.bucket, staged.destinationKey, uploadID,
+			len(parts)+1, offset, length, map[string]string{"x-amz-copy-source-if-match": staged.etag})
+		if err != nil {
+			return err
+		}
+		parts = append(parts, part)
+	}
+	_, err = core.CompleteMultipartUpload(ctx, s.bucket, staged.destinationKey, uploadID, parts, options)
+	complete = err == nil
 	return err
 }
 

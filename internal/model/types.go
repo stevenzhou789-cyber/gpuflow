@@ -33,8 +33,12 @@ const (
 )
 
 type Requirements struct {
-	GPUCount  int               `json:"gpu_count"`
-	MinVRAMGB int               `json:"min_vram_gb"`
+	GPUCount  int `json:"gpu_count"`
+	MinVRAMGB int `json:"min_vram_gb"`
+	// Positive host resources are both scheduler reservations and container limits.
+	// Zero preserves the legacy unreserved, unlimited behavior.
+	CPUCores  float64           `json:"cpu_cores,omitempty"`
+	MemoryMiB int64             `json:"memory_mib,omitempty"`
 	GPUModels []string          `json:"gpu_models,omitempty"`
 	Providers []string          `json:"providers,omitempty"`
 	Pools     []string          `json:"pools,omitempty"`
@@ -239,29 +243,33 @@ type ProjectSchedulingState struct {
 }
 
 type Node struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	Provider        string            `json:"provider"`
-	Pool            string            `json:"pool"`
-	GPUModel        string            `json:"gpu_model"`
-	GPUCount        int               `json:"gpu_count"`
-	CPUCores        int               `json:"cpu_cores"`
-	VRAMGB          int               `json:"vram_gb"`
-	HourlyPrice     float64           `json:"hourly_price"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	Busy            bool              `json:"busy"`
-	CurrentJob      string            `json:"current_job,omitempty"`
-	ActiveJobs      []string          `json:"active_jobs,omitempty"`
-	AllocatedGPUs   int               `json:"allocated_gpu_count"`
-	Devices         []GPUDevice       `json:"devices,omitempty"`
-	DriverVersion   string            `json:"driver_version,omitempty"`
-	DockerVersion   string            `json:"docker_version,omitempty"`
-	HealthStatus    string            `json:"health_status,omitempty"`
-	HealthReason    string            `json:"health_reason,omitempty"`
-	LastHealthCheck *time.Time        `json:"last_health_check,omitempty"`
-	LastHeartbeat   time.Time         `json:"last_heartbeat"`
-	CleanupPending  bool              `json:"cleanup_pending,omitempty"`
-	SessionEpoch    string            `json:"-"`
+	ID                 string            `json:"id"`
+	Name               string            `json:"name"`
+	Provider           string            `json:"provider"`
+	Pool               string            `json:"pool"`
+	GPUModel           string            `json:"gpu_model"`
+	GPUCount           int               `json:"gpu_count"`
+	CPUCores           int               `json:"cpu_cores"`
+	MemoryMiB          int64             `json:"memory_mib"`
+	HostResourceLimits bool              `json:"host_resource_limits,omitempty"`
+	AllocatedCPUCores  float64           `json:"allocated_cpu_cores"`
+	AllocatedMemoryMiB int64             `json:"allocated_memory_mib"`
+	VRAMGB             int               `json:"vram_gb"`
+	HourlyPrice        float64           `json:"hourly_price"`
+	Labels             map[string]string `json:"labels,omitempty"`
+	Busy               bool              `json:"busy"`
+	CurrentJob         string            `json:"current_job,omitempty"`
+	ActiveJobs         []string          `json:"active_jobs,omitempty"`
+	AllocatedGPUs      int               `json:"allocated_gpu_count"`
+	Devices            []GPUDevice       `json:"devices,omitempty"`
+	DriverVersion      string            `json:"driver_version,omitempty"`
+	DockerVersion      string            `json:"docker_version,omitempty"`
+	HealthStatus       string            `json:"health_status,omitempty"`
+	HealthReason       string            `json:"health_reason,omitempty"`
+	LastHealthCheck    *time.Time        `json:"last_health_check,omitempty"`
+	LastHeartbeat      time.Time         `json:"last_heartbeat"`
+	CleanupPending     bool              `json:"cleanup_pending,omitempty"`
+	SessionEpoch       string            `json:"-"`
 
 	Maintenance          bool       `json:"maintenance,omitempty"`
 	MaintenanceState     string     `json:"maintenance_state,omitempty"`
@@ -294,20 +302,25 @@ type GPUDevice struct {
 }
 
 type NodeHealthUpdate struct {
-	Status        string      `json:"status"`
-	Reason        string      `json:"reason,omitempty"`
-	Devices       []GPUDevice `json:"devices,omitempty"`
-	GPUModel      string      `json:"gpu_model,omitempty"`
-	GPUCount      int         `json:"gpu_count"`
-	VRAMGB        int         `json:"vram_gb"`
-	DriverVersion string      `json:"driver_version,omitempty"`
-	DockerVersion string      `json:"docker_version,omitempty"`
+	HostResourceLimits *bool       `json:"host_resource_limits,omitempty"`
+	CPUCores           *int        `json:"cpu_cores,omitempty"`
+	MemoryMiB          *int64      `json:"memory_mib,omitempty"`
+	Status             string      `json:"status"`
+	Reason             string      `json:"reason,omitempty"`
+	Devices            []GPUDevice `json:"devices,omitempty"`
+	GPUModel           string      `json:"gpu_model,omitempty"`
+	GPUCount           int         `json:"gpu_count"`
+	VRAMGB             int         `json:"vram_gb"`
+	DriverVersion      string      `json:"driver_version,omitempty"`
+	DockerVersion      string      `json:"docker_version,omitempty"`
 }
 
 type JobUpdate struct {
 	Status JobStatus `json:"status"`
 	Output string    `json:"output,omitempty"`
 	Error  string    `json:"error,omitempty"`
+	// Retryable applies only to failed results. Omitted retains the retry budget policy.
+	Retryable *bool `json:"retryable,omitempty"`
 }
 
 type JobLogUpdate struct {

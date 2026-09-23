@@ -9,7 +9,6 @@ import (
 	"log"
 	"mime"
 	"net/http"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -142,14 +141,12 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		handleStoreError(w, err)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
-	file, header, err := r.FormFile("file")
+	upload, err := readArtifactUpload(w, r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeArtifactUploadError(w, err, http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
-	name := filepath.Base(header.Filename)
+	name := upload.name
 	storageID, err := artifact.NewUploadStorageID(jobID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -157,13 +154,19 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	// Every upload writes its own hidden namespace. A delayed copy can only
 	// change that version, never the canonical file exposed to readers.
-	staged, err := s.artifacts.Stage(r.Context(), storageID, name, file, header.Size)
+	staged, err := s.artifacts.Stage(r.Context(), storageID, name, upload.reader, upload.size)
 	if err != nil {
 		s.discardArtifact(staged)
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeArtifactUploadError(w, err, http.StatusBadGateway)
 		return
 	}
 	defer s.discardArtifact(staged)
+	// Some object stores stop after the declared length. Require the complete
+	// body and multipart closing boundary before making any version visible.
+	if err := upload.finish(); err != nil {
+		writeArtifactUploadError(w, err, http.StatusBadRequest)
+		return
+	}
 	if err := s.store.ValidateJobAttempt(jobID, nodeID, session, attemptToken); err != nil {
 		handleStoreError(w, err)
 		return
@@ -174,7 +177,7 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modified := time.Now().UTC()
-	if err := s.store.PublishJobArtifact(jobID, nodeID, session, attemptToken, name, model.ArtifactReference{StorageID: storageID, Size: header.Size, LastModified: modified}); err != nil {
+	if err := s.store.PublishJobArtifact(jobID, nodeID, session, attemptToken, name, model.ArtifactReference{StorageID: storageID, Size: upload.reader.bytes, LastModified: modified}); err != nil {
 		// A database commit error can have an uncertain outcome. Keep the
 		// immutable object in that case: a successfully committed reference must
 		// remain readable after restart. Unreferenced versions stay hidden and
@@ -185,7 +188,7 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		handleStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, artifact.Item{Name: name, Size: header.Size, LastModified: modified})
+	writeJSON(w, http.StatusCreated, artifact.Item{Name: name, Size: upload.reader.bytes, LastModified: modified})
 }
 
 func (s *Server) discardArtifactVersion(storageID string) {

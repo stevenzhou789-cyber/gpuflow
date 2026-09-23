@@ -110,7 +110,7 @@ docker compose logs -f control-plane mysql minio
 
 不要随意添加 `-v`，否则会删除 MySQL 和 MinIO 数据卷。
 
-任务脚本只需把需要保留的文件写入 `$GPUFLOW_ARTIFACT_DIR`。目录中存在文件时，Agent 会在任务结束后生成 `artifacts.tar.gz` 并上传；在任务队列点击任务即可通过“下载产物”按钮获取。产物打包或上传失败会写入任务输出作为 warning，不改变任务程序本身的成功或失败状态。
+任务脚本只需把需要保留的文件写入 `$GPUFLOW_ARTIFACT_DIR`。Agent 在每次执行独有的目录归档结果并上传完整日志和 `artifacts.tar.gz`。上传中断会自动重试；打包或最终交付失败时任务明确报错，保留本地结果供回收，不自动重跑已经完成的计算。只有上传和最终状态均确认后才清理目录。重试窗口、大文件限制和恢复步骤见 [任务结果可靠性](docs/RESULT-RELIABILITY.md)。
 
 使用已有 MySQL 和 MinIO/S3 时，为控制端设置：
 
@@ -346,6 +346,8 @@ Agent 应使用稳定且唯一的 `-id`。任务执行期间 Agent 会持续发�
 ## 提交任务
 
 最简单的方式是在 Web 控制台的 **任务** 页面创建任务。仓库也提供了一个 CPU 示例：[examples/job.json](examples/job.json)。
+
+创建任务时可指定 CPU 核数和主机内存 MiB，正值同时用于调度预留与容器运行限制。新建表单默认 1 核、2048 MiB；旧 API 省略或设为 0 时保持未限制行为。详细边界见 [CPU 与内存资源控制](docs/HOST-RESOURCES.md)。
 
 获取或构建上述完整 GPUFlow 程序后，也可以通过同一个可执行文件提交任务：
 

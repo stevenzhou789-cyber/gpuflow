@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,8 +29,10 @@ func TestRequestHelpersAttachHeaders(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/artifact" {
-			if _, _, err := r.FormFile("file"); err != nil {
-				t.Errorf("read multipart upload: %v", err)
+			body, err := io.ReadAll(r.Body)
+			_, params, dispositionErr := mime.ParseMediaType(r.Header.Get("Content-Disposition"))
+			if err != nil || string(body) != "artifact" || r.ContentLength != 8 || r.Header.Get("Content-Type") != "application/octet-stream" || dispositionErr != nil || params["filename"] != "artifact.tar.gz" {
+				t.Errorf("invalid streaming upload: length=%d disposition=%v body=%q err=%v", r.ContentLength, params, body, err)
 			}
 			w.WriteHeader(http.StatusCreated)
 			return
@@ -47,6 +52,34 @@ func TestRequestHelpersAttachHeaders(t *testing.T) {
 	}
 	if _, err := New(server.URL, "").UploadArtifactWithHeaders("/artifact", filePath, headers); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type artifactRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f artifactRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestUploadArtifactEarlyRejectionClosesFile(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "模型 权重.tar.gz")
+	if err := os.WriteFile(filePath, []byte("weights"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var body io.ReadCloser
+	c := New("http://upload.invalid", "token")
+	c.HTTP.Transport = artifactRoundTripper(func(r *http.Request) (*http.Response, error) {
+		body = r.Body
+		_, params, err := mime.ParseMediaType(r.Header.Get("Content-Disposition"))
+		if err != nil || params["filename"] != filepath.Base(filePath) || r.ContentLength != 7 {
+			t.Errorf("stream metadata: filename=%q length=%d err=%v", params["filename"], r.ContentLength, err)
+		}
+		return &http.Response{StatusCode: http.StatusConflict, Status: "409 Conflict", Body: io.NopCloser(strings.NewReader("stale attempt")), Header: make(http.Header)}, nil
+	})
+	status, err := c.UploadArtifact("/upload", filePath)
+	if status != http.StatusConflict || err == nil || !strings.Contains(err.Error(), "stale attempt") {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if _, err := body.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("file retained after server rejection: %v", err)
 	}
 }
 

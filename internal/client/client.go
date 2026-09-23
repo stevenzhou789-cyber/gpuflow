@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -37,24 +37,26 @@ func (c *Client) UploadArtifactContextWithHeaders(ctx context.Context, path, fil
 		return 0, err
 	}
 	defer file.Close()
-	pipeReader, pipeWriter := io.Pipe()
-	writer := multipart.NewWriter(pipeWriter)
-	go func() {
-		part, createErr := writer.CreateFormFile("file", filepath.Base(filePath))
-		if createErr == nil {
-			_, createErr = io.Copy(part, file)
-		}
-		if closeErr := writer.Close(); createErr == nil {
-			createErr = closeErr
-		}
-		_ = pipeWriter.CloseWithError(createErr)
-	}()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, pipeReader)
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("artifact must be a regular file")
+	}
+	// Stream the file directly with a known size. There is no pipe writer to
+	// leave blocked when the server rejects an upload before reading its body.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, file)
 	if err != nil {
 		return 0, err
 	}
 	copyHeaders(req.Header, headers)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.ContentLength = info.Size()
+	if info.Size() == 0 {
+		req.Body = http.NoBody
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(filePath)}))
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}

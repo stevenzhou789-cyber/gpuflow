@@ -136,11 +136,15 @@ func runAgent(args []string) error {
 	fs.Float64Var(&cfg.HourlyPrice, "hourly-price", envFloat("GPUFLOW_HOURLY_PRICE", 0), "estimated hourly price")
 	fs.StringVar(&cfg.Executor, "executor", env("GPUFLOW_EXECUTOR", "docker"), "docker or mock")
 	fs.StringVar(&cfg.ArtifactDir, "artifact-dir", env("GPUFLOW_ARTIFACT_WORKDIR", ""), "host-visible artifact work directory")
+	fs.DurationVar(&cfg.ArtifactUploadTimeout, "artifact-upload-timeout", 30*time.Minute, "total retry window per result file (for example 2h)")
 	fs.StringVar(&cfg.ProbeImage, "probe-image", env("GPUFLOW_PROBE_IMAGE", ""), "dedicated glibc image used to validate NVIDIA container runtime")
 	fs.StringVar(&cfg.GPUProbe, "gpu-probe", env("GPUFLOW_GPU_PROBE", "auto"), "GPU probe mode: auto, host, or docker")
 	fs.StringVar(&cfg.AcceleratorBackend, "accelerator-backend", env("GPUFLOW_ACCELERATOR_BACKEND", "nvidia"), "accelerator backend: nvidia, ascend, or auto")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if cfg.ArtifactUploadTimeout <= 0 {
+		return fmt.Errorf("artifact-upload-timeout must be positive")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

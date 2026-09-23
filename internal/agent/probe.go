@@ -14,11 +14,12 @@ import (
 
 var gpuQueryArgs = []string{"--query-gpu=index,uuid,name,memory.total,driver_version", "--format=csv,noheader,nounits"}
 
-func (a *Agent) probeNode(ctx context.Context) (model.Node, error) {
+func (a *Agent) probeNode(ctx context.Context) (node model.Node, probeErr error) {
+	defer func() { a.probeHostCapacity(ctx, &node) }()
 	if a.acceleratorBackend == "ascend" {
 		return a.probeAscendNode(ctx)
 	}
-	node := model.Node{
+	node = model.Node{
 		ID: a.cfg.ID, Name: a.cfg.Name, Provider: a.cfg.Provider, Pool: a.cfg.Pool,
 		GPUModel: "none", CPUCores: a.cfg.CPUCores, HourlyPrice: a.cfg.HourlyPrice,
 	}

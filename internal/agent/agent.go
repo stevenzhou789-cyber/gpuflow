@@ -275,7 +275,7 @@ func (a *Agent) healthLoop(ctx context.Context) {
 				// last healthy inventory for DEGRADED updates.
 				updateNode = a.baseline
 			}
-			update := model.NodeHealthUpdate{Status: "HEALTHY", Devices: updateNode.Devices, GPUModel: updateNode.GPUModel, GPUCount: updateNode.GPUCount, VRAMGB: updateNode.VRAMGB, DriverVersion: updateNode.DriverVersion, DockerVersion: updateNode.DockerVersion}
+			update := model.NodeHealthUpdate{Status: "HEALTHY", Devices: updateNode.Devices, GPUModel: updateNode.GPUModel, GPUCount: updateNode.GPUCount, VRAMGB: updateNode.VRAMGB, DriverVersion: updateNode.DriverVersion, DockerVersion: updateNode.DockerVersion, CPUCores: &updateNode.CPUCores, MemoryMiB: &updateNode.MemoryMiB, HostResourceLimits: &updateNode.HostResourceLimits}
 			if err != nil {
 				update.Status, update.Reason = "DEGRADED", err.Error()
 			}
@@ -412,54 +412,12 @@ func (a *Agent) tick(ctx context.Context) error {
 	if err := a.validateJobAccelerator(&job); err != nil {
 		return a.failStartedJob(ctx, &job, attemptToken, err)
 	}
-	if a.cfg.ArtifactDir != "" {
-		if err := os.MkdirAll(a.cfg.ArtifactDir, 0o755); err != nil {
-			return a.failStartedJob(ctx, &job, attemptToken, fmt.Errorf("create artifact work directory: %w", err))
-		}
-	}
-	artifactDir, err := os.MkdirTemp(a.cfg.ArtifactDir, "gpuflow-artifacts-"+job.ID+"-")
+	workspace, err := newResultWorkspace(a.cfg.ArtifactDir, a.cfg.ID, &job)
 	if err != nil {
-		return a.failStartedJob(ctx, &job, attemptToken, fmt.Errorf("create artifact directory: %w", err))
+		return a.failStartedJob(ctx, &job, attemptToken, err)
 	}
-	defer os.RemoveAll(artifactDir)
-	logDir, err := os.MkdirTemp(a.cfg.ArtifactDir, "gpuflow-log-"+job.ID+"-")
-	if err != nil {
-		return a.failStartedJob(ctx, &job, attemptToken, fmt.Errorf("create log directory: %w", err))
-	}
-	defer os.RemoveAll(logDir)
-	logPath := filepath.Join(logDir, "training.log")
-	output, runErr := a.execute(ctx, &job, attemptToken, artifactDir, logPath)
-	if errors.Is(runErr, errJobCanceled) {
-		// The container is already stopped and waited. Release its GPU lease
-		// immediately; a slow object store must not hold cancellation open.
-		return a.ackCanceled(ctx, job.ID, job.Attempts, attemptToken, output)
-	}
-	if uploadErr := a.uploadCompleteLog(ctx, job.ID, attemptToken, logPath); uploadErr != nil {
-		output = appendOutput(output, "complete log upload warning: "+uploadErr.Error())
-	}
-	var latest model.Job
-	if statusErr := a.getJob(ctx, job.ID, attemptToken, &latest); statusErr == nil && latest.Status == model.JobCanceling {
-		return a.ackCanceled(ctx, job.ID, job.Attempts, attemptToken, output)
-	}
-	if bundle, bundleErr := archiveArtifacts(artifactDir); bundleErr != nil {
-		output = appendOutput(output, "artifact packaging warning: "+bundleErr.Error())
-	} else if bundle != "" {
-		defer os.Remove(bundle)
-		if uploadErr := a.uploadArtifact(ctx, job.ID, attemptToken, bundle); uploadErr != nil {
-			output = appendOutput(output, "artifact upload warning: "+uploadErr.Error())
-		} else {
-			output = appendOutput(output, "artifact uploaded: artifacts.tar.gz")
-		}
-	}
-	if statusErr := a.getJob(ctx, job.ID, attemptToken, &latest); statusErr == nil && latest.Status == model.JobCanceling {
-		return a.ackCanceled(ctx, job.ID, job.Attempts, attemptToken, output)
-	}
-	update := model.JobUpdate{Status: model.JobSucceeded, Output: output}
-	if runErr != nil {
-		update.Status = model.JobFailed
-		update.Error = runErr.Error()
-	}
-	return a.updateJobStatusUntilAccepted(ctx, &job, attemptToken, update)
+	output, runErr := a.execute(ctx, &job, attemptToken, workspace.artifacts, workspace.log)
+	return a.finishResult(ctx, &job, attemptToken, workspace, output, runErr)
 }
 
 func (a *Agent) failStartedJob(ctx context.Context, job *model.Job, attemptToken string, cause error) error {
@@ -567,7 +525,7 @@ func (a *Agent) uploadArtifact(parent context.Context, jobID, attemptToken, bund
 			}
 		}
 	}()
-	_, err := a.uploadArtifactFile(ctx, "/v1/jobs/"+jobID+"/artifacts?node_id="+url.QueryEscape(a.cfg.ID), bundle, a.jobHeaders(attemptToken))
+	err := a.retryArtifactUpload(ctx, jobID, attemptToken, bundle)
 	cancel()
 	<-monitorDone
 	return err
@@ -673,6 +631,11 @@ func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, ar
 		"--label", "gpuflow.job=" + job.ID,
 		"--label", "gpuflow.session=" + a.session,
 	}
+	hostArgs, hostErr := dockerHostResourceArgs(job.Requirements)
+	if hostErr != nil {
+		return "", hostErr
+	}
+	createArgs = append(createArgs, hostArgs...)
 	createArgs = append(createArgs, "--mount", "type=bind,source="+artifactDir+",target=/gpuflow/artifacts", "-e", "GPUFLOW_ARTIFACT_DIR=/gpuflow/artifacts")
 	createArgs = append(createArgs, "-e", "PYTHONUNBUFFERED=1")
 	if job.Requirements.GPUCount > 0 {
@@ -697,7 +660,13 @@ func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, ar
 	if logErr != nil {
 		return "", fmt.Errorf("create complete job log: %w", logErr)
 	}
-	defer logFile.Close()
+	defer func() {
+		// A completed process is not enough when its full log could not be
+		// persisted. Surface disk/full/close failures before delivering results.
+		if err := errors.Join(logFile.Sync(), logFile.Close()); err != nil {
+			resultErr = errors.Join(resultErr, errResultCapture, err)
+		}
+	}()
 
 	// docker create is deliberately synchronous. The daemon atomically owns the
 	// deterministic attempt name before any workload can run. A delayed create
@@ -712,11 +681,7 @@ func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, ar
 	// takeover removed and reused the deterministic name.
 	defer func() {
 		if cleanupErr := a.cleanupContainerUntilDone(containerID); cleanupErr != nil {
-			if resultErr == nil {
-				resultErr = cleanupErr
-			} else {
-				resultErr = fmt.Errorf("%v; cleanup container %s: %w", resultErr, containerID, cleanupErr)
-			}
+			resultErr = errors.Join(resultErr, fmt.Errorf("cleanup container %s: %w", containerID, cleanupErr))
 		}
 	}()
 
@@ -735,6 +700,9 @@ func (a *Agent) execute(parent context.Context, job *model.Job, attemptToken, ar
 	}
 	cmd := command(ctx, "docker", "start", "--attach", containerID)
 	output := &liveJobLog{full: logFile}
+	// os/exec prioritizes a nonzero process exit over a stdout copier error.
+	// Preserve a full-log failure independently so it can suppress recompute.
+	defer func() { resultErr = errors.Join(resultErr, output.Err()) }()
 	cmd.Stdout = output
 	cmd.Stderr = output
 	if err := a.requireLiveSession(parent); err != nil {
@@ -1049,14 +1017,22 @@ type liveJobLog struct {
 	mu     sync.Mutex
 	output []byte
 	full   io.Writer
+	err    error
 }
 
 func (w *liveJobLog) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.full != nil {
-		if _, err := w.full.Write(p); err != nil {
-			return 0, err
+		n, err := w.full.Write(p)
+		if err == nil && n != len(p) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			if w.err == nil {
+				w.err = errors.Join(errResultCapture, err)
+			}
+			return n, w.err
 		}
 	}
 	w.output = append(w.output, p...)
@@ -1064,6 +1040,12 @@ func (w *liveJobLog) Write(p []byte) (int, error) {
 		w.output = append([]byte(nil), w.output[len(w.output)-(64<<10):]...)
 	}
 	return len(p), nil
+}
+
+func (w *liveJobLog) Err() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
 }
 
 func (w *liveJobLog) String() string {
@@ -1100,9 +1082,16 @@ func archiveArtifacts(dir string) (string, error) {
 	if err != nil || !hasFiles {
 		return "", err
 	}
-	bundle := filepath.Join(filepath.Dir(dir), "artifacts.tar.gz")
+	// Each execution owns an archive directory. A common parent may contain
+	// many concurrent tasks; never reuse its artifacts.tar.gz filename.
+	archiveDir, err := os.MkdirTemp(filepath.Dir(dir), "gpuflow-archive-")
+	if err != nil {
+		return "", err
+	}
+	bundle := filepath.Join(archiveDir, "artifacts.tar.gz")
 	file, err := os.Create(bundle)
 	if err != nil {
+		_ = os.Remove(archiveDir)
 		return "", err
 	}
 	gzipWriter := gzip.NewWriter(file)
@@ -1143,11 +1132,15 @@ func archiveArtifacts(dir string) (string, error) {
 	if closeErr := gzipWriter.Close(); err == nil {
 		err = closeErr
 	}
+	if syncErr := file.Sync(); err == nil {
+		err = syncErr
+	}
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		_ = os.Remove(bundle)
+		_ = os.Remove(archiveDir)
 		return "", err
 	}
 	return bundle, nil

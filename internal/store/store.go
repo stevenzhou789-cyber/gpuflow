@@ -762,6 +762,9 @@ func normalizeAcceleratorRequirements(requirements *model.Requirements) error {
 }
 
 func validateAndNormalizeJobCreate(in *model.JobCreate) error {
+	if err := in.Requirements.ValidateHostResources(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidResources, err)
+	}
 	if in.Requirements.GPUCount < 0 || in.Requirements.MinVRAMGB < 0 || in.Requirements.MaxHourly < 0 {
 		return fmt.Errorf("%w: job resource requirements cannot be negative", ErrInvalidResources)
 	}
@@ -1318,6 +1321,9 @@ func (s *Store) validateAcceleratorCapacityLocked(candidate model.Node, existing
 }
 
 func validateNodeResources(node model.Node, requireInventory bool) error {
+	if node.CPUCores > model.MaxCPUCores || node.MemoryMiB < 0 || node.MemoryMiB > model.MaxMemoryMiB {
+		return fmt.Errorf("%w: node host capacity is out of range", ErrInvalidResources)
+	}
 	if node.GPUCount < 0 || node.CPUCores < 0 || node.VRAMGB < 0 {
 		return fmt.Errorf("%w: node resource counts cannot be negative", ErrInvalidResources)
 	}
@@ -1453,7 +1459,14 @@ func (s *Store) updateNodeHealthLocked(node *model.Node, session string, update 
 	if update.GPUCount < 0 || update.VRAMGB < 0 {
 		return nil, fmt.Errorf("%w: node resource counts cannot be negative", ErrInvalidResources)
 	}
+	if (update.CPUCores != nil && (*update.CPUCores < 0 || *update.CPUCores > model.MaxCPUCores)) ||
+		(update.MemoryMiB != nil && (*update.MemoryMiB < 0 || *update.MemoryMiB > model.MaxMemoryMiB)) {
+		return nil, fmt.Errorf("%w: node host capacity is out of range", ErrInvalidResources)
+	}
 	inventoryChanged := status == "HEALTHY" && !sameInventory(node, update)
+	hostCapacityChanged := (update.CPUCores != nil && *update.CPUCores != node.CPUCores) ||
+		(update.MemoryMiB != nil && *update.MemoryMiB != node.MemoryMiB) ||
+		(update.HostResourceLimits != nil && *update.HostResourceLimits != node.HostResourceLimits)
 	var healthyLabels map[string]string
 	if status == "HEALTHY" {
 		candidate := *node
@@ -1475,13 +1488,22 @@ func (s *Store) updateNodeHealthLocked(node *model.Node, session string, update 
 	before := cloneSnapshot(s.state)
 	now := time.Now().UTC()
 	node.HealthStatus, node.HealthReason, node.LastHealthCheck = status, strings.TrimSpace(update.Reason), &now
+	if update.CPUCores != nil {
+		node.CPUCores = *update.CPUCores
+	}
+	if update.MemoryMiB != nil {
+		node.MemoryMiB = *update.MemoryMiB
+	}
+	if update.HostResourceLimits != nil {
+		node.HostResourceLimits = *update.HostResourceLimits
+	}
 	if status == "HEALTHY" {
 		node.Devices = append([]model.GPUDevice(nil), update.Devices...)
 		node.GPUModel, node.GPUCount, node.VRAMGB = update.GPUModel, update.GPUCount, update.VRAMGB
 		node.DriverVersion, node.DockerVersion = update.DriverVersion, update.DockerVersion
 		node.Labels = healthyLabels
 	}
-	if status == "DEGRADED" || inventoryChanged {
+	if status == "DEGRADED" || inventoryChanged || hostCapacityChanged {
 		s.requeueAssignedJobsLocked(node.ID, now)
 	}
 	s.refreshNodeUsageLocked(node.ID)
@@ -1750,6 +1772,7 @@ func (s *Store) refreshNodeUsageLocked(nodeID string) {
 	}
 	node.ActiveJobs = nil
 	node.AllocatedGPUs = 0
+	node.AllocatedCPUCores, node.AllocatedMemoryMiB = s.reservedHostResourcesLocked(nodeID)
 	for _, job := range s.state.Jobs {
 		if job.AssignedNode == nodeID && activeJob(job.Status) {
 			node.ActiveJobs = append(node.ActiveJobs, job.ID)
@@ -1797,6 +1820,12 @@ func (s *Store) eligibleLocked(j *model.Job, n *model.Node, now time.Time, offli
 
 func (s *Store) nodeSatisfiesJobRequirementsLocked(j *model.Job, n *model.Node) bool {
 	r := j.Requirements
+	if (r.CPUCores > 0 || r.MemoryMiB > 0) && !n.HostResourceLimits {
+		return false
+	}
+	if r.ValidateHostResources() != nil || r.CPUCores > float64(n.CPUCores) || r.MemoryMiB > n.MemoryMiB {
+		return false
+	}
 	if r.GPUCount > 0 {
 		if s.heterogeneousAccelerators && !acceleratorCompatible(r.Labels, n.Labels) {
 			return false
@@ -1897,11 +1926,14 @@ func betterNode(strategy string, a, b *model.Node) bool {
 }
 
 func (s *Store) nodeHasCapacityForJobLocked(job *model.Job, node *model.Node) bool {
+	if !s.nodeHasHostCapacityLocked(job, node) {
+		return false
+	}
 	if !s.gpuGranularScheduling {
 		return !node.Busy
 	}
 	if job.Requirements.GPUCount == 0 {
-		// CPU-only jobs remain whole-node exclusive until CPU accounting is implemented.
+		// Preserve whole-node exclusivity for CPU-only jobs.
 		return !node.Busy
 	}
 	if job.Requirements.GPUCount > node.GPUCount {
@@ -2241,7 +2273,7 @@ func (s *Store) updateJobLocked(job *model.Job, nodeID, session, attemptToken st
 		}
 		job.FinishedAt = &now
 		s.finalizeUsageAttemptLocked(job, model.JobFailed, now)
-		if job.Attempts <= job.MaxRetries {
+		if job.Attempts <= job.MaxRetries && (in.Retryable == nil || *in.Retryable) {
 			if err := s.ensureProjectQueueCapacityLocked(projectIDOf(job), 1); err != nil {
 				job.Status = model.JobFailed
 				job.AttemptToken, job.LeaseExpiresAt, job.AssignedSession = "", nil, ""

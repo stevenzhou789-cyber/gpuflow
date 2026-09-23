@@ -25,6 +25,8 @@ type Job = {
   requirements: {
     gpu_count: number;
     min_vram_gb: number;
+    cpu_cores?: number;
+    memory_mib?: number;
     pools?: string[];
     labels?: Record<string, string>;
   };
@@ -40,6 +42,9 @@ type Node = {
   gpu_model: string;
   gpu_count: number;
   cpu_cores: number;
+  memory_mib?: number;
+  allocated_cpu_cores?: number;
+  allocated_memory_mib?: number;
   vram_gb: number;
   hourly_price: number;
   busy: boolean;
@@ -851,6 +856,8 @@ function JobDetails({ job: initialJob, onClose }: { job: Job; onClose: () => voi
             <DetailItem label="资源池" value={job.requirements.pools?.join(", ") || "任意"} />
             <DetailItem label="GPU" value={`${job.requirements.gpu_count} 张`} />
             <DetailItem label="最低显存" value={`${job.requirements.min_vram_gb} GB`} />
+            <DetailItem label="CPU 预留 / 上限" value={job.requirements.cpu_cores ? `${job.requirements.cpu_cores} 核` : "未设置"} />
+            <DetailItem label="内存预留 / 上限" value={job.requirements.memory_mib ? `${job.requirements.memory_mib} MiB` : "未设置"} />
             <DetailItem label="尝试次数" value={`${job.attempts}/${job.max_retries + 1}`} />
             <DetailItem label="恢复次数" value={String(job.recoveries || 0)} />
             <DetailItem label="运行时长" value={duration === null ? "尚未开始" : `${duration.toFixed(2)} 秒`} />
@@ -1177,6 +1184,7 @@ function Nodes({
                   {node.gpu_count} × {node.gpu_model}
                 </strong>
                 <span>{node.vram_gb} GB VRAM · {node.cpu_cores} CPU</span>
+                <span>已预留 {node.allocated_cpu_cores || 0} CPU · {node.allocated_memory_mib || 0}/{node.memory_mib || "未知"} MiB 内存</span>
               </div>
               <div className="node-footer">
                 <span>
@@ -1709,6 +1717,8 @@ function SubmitJob({
           requirements: {
             gpu_count: Number(values.get("gpu_count")),
             min_vram_gb: Number(values.get("vram")),
+            cpu_cores: Number(values.get("cpu_cores")),
+            memory_mib: Number(values.get("memory_mib")),
             pools: pool ? [pool] : [],
             ...(heterogeneousAccelerators && Number(values.get("gpu_count")) > 0
               ? {
@@ -1841,6 +1851,15 @@ function SubmitJob({
               )}
             </select>
           </label>
+          <label>
+            CPU 预留 / 上限（核）
+            <input name="cpu_cores" type="number" min="0" max="65536" step="0.001" defaultValue="1" required />
+          </label>
+          <label>
+            内存预留 / 上限（MiB）
+            <input name="memory_mib" type="number" min="0" max="1073741824" step="1" defaultValue="2048" required />
+          </label>
+          <p className="wide">正值同时用于调度预留与运行限制；CPU 最小 0.01 核，内存最小 6 MiB。0 表示不预留、不限制。并发训练建议填写两项。</p>
           <div className="form-section-title wide">
             <span>03</span>
             <strong>调度设置</strong>

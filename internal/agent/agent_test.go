@@ -1100,11 +1100,18 @@ func TestTickKeepsHeartbeatAliveWhileExecuting(t *testing.T) {
 		if r.URL.Path == "/v1/nodes/"+node.ID+"/heartbeat" {
 			heartbeats.Add(1)
 		}
+		// This test isolates heartbeat liveness. The low-level in-memory API
+		// has no S3 store; acknowledge the required mock executor log here.
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/artifacts") {
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
 		apiHandler.ServeHTTP(w, r)
 	}))
 	defer server.Close()
 
-	agent := New(Config{Server: server.URL, ID: node.ID, Executor: "mock", HeartbeatInterval: 20 * time.Millisecond})
+	agent := New(Config{Server: server.URL, ID: node.ID, Executor: "mock", ArtifactDir: t.TempDir(), HeartbeatInterval: 20 * time.Millisecond})
 	agent.session = node.SessionEpoch
 	ctx, cancel := context.WithCancel(context.Background())
 	heartbeatDone := make(chan struct{})

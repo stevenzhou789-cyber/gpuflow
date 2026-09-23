@@ -82,7 +82,7 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("unexpected core migration count: got %d want %d", appliedCoreMigrations, len(coreMigrations))
 	}
 
-	nodeInput := model.Node{ID: "mysql-node", Name: "mysql node", Provider: "local", Pool: "default", GPUModel: "RTX 4090", GPUCount: 1, CPUCores: 16, VRAMGB: 24, Labels: map[string]string{"zone": "lab"}}
+	nodeInput := model.Node{ID: "mysql-node", Name: "mysql node", Provider: "local", Pool: "default", GPUModel: "RTX 4090", GPUCount: 1, CPUCores: 16, MemoryMiB: 32768, HostResourceLimits: true, VRAMGB: 24, Labels: map[string]string{"zone": "lab"}}
 	node, err := s.RegisterNode(nodeInput)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	if _, err := s.CreateProject(model.ProjectCreate{ID: projectID, Name: "MySQL project", MaxQueuedJobs: 2, MaxConcurrentJobs: 1, MaxGPUs: 1, Weight: 3}); err != nil {
 		t.Fatal(err)
 	}
-	job, err := s.CreateJobForProject(projectID, model.JobCreate{Name: "mysql job", Image: "alpine", Priority: 73, Command: []string{"echo", "mysql"}, Environment: map[string]string{"MODE": "test"}, Requirements: model.Requirements{GPUCount: 1, Labels: map[string]string{"zone": "lab"}}, MaxRetries: 2})
+	job, err := s.CreateJobForProject(projectID, model.JobCreate{Name: "mysql job", Image: "alpine", Priority: 73, Command: []string{"echo", "mysql"}, Environment: map[string]string{"MODE": "test"}, Requirements: model.Requirements{GPUCount: 1, CPUCores: 2, MemoryMiB: 4096, Labels: map[string]string{"zone": "lab"}}, MaxRetries: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,18 @@ func TestMySQLCoreStatePersistsAcrossReopen(t *testing.T) {
 	if err := s.PublishJobArtifact(job.ID, node.ID, node.SessionEpoch, artifactDispatch.AttemptToken, "training.log", artifactReference); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RegisterNode(nodeInput); err != nil {
+	node, err = s.RegisterNode(nodeInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A replacement session must acknowledge cleanup of the interrupted
+	// execution before retry can become an assignment. Exercise the current
+	// fencing contract instead of assuming registration itself releases it.
+	cleanup, err := s.NextJobSession(node.ID, node.SessionEpoch)
+	if err != nil || cleanup == nil || cleanup.Status != model.JobCanceling {
+		t.Fatalf("interrupted execution did not require cleanup: %+v %v", cleanup, err)
+	}
+	if _, err := s.UpdateJobLease(job.ID, node.ID, node.SessionEpoch, cleanup.AttemptToken, model.JobUpdate{Status: model.JobCanceled}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.UpdateNodeHealth(node.ID, model.NodeHealthUpdate{Status: "HEALTHY", GPUModel: "RTX 4090", GPUCount: 1, VRAMGB: 24, DriverVersion: "550.54", DockerVersion: "27.1", Devices: []model.GPUDevice{{Index: 0, UUID: "GPU-persisted", Model: "RTX 4090", VRAMGB: 24}}}); err != nil {
@@ -177,6 +188,9 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	if persistedJob.ArtifactRefs["training.log"] != artifactReference {
 		t.Fatalf("published artifact reference did not survive reopen: %+v", persistedJob.ArtifactRefs)
 	}
+	if persistedJob.Requirements.CPUCores != 2 || persistedJob.Requirements.MemoryMiB != 4096 {
+		t.Fatalf("host resource requirements did not survive reopen: %+v", persistedJob.Requirements)
+	}
 	project, err := reopened.GetProject(projectID)
 	if err != nil || project.MaxQueuedJobs != 2 || project.MaxConcurrentJobs != 1 || project.MaxGPUs != 1 || project.Weight != 3 || project.SchedulerVRuntime != 987654321 {
 		t.Fatalf("unexpected persisted project: %+v err=%v", project, err)
@@ -184,6 +198,9 @@ VALUES ('external-node', 'external', 'local', 'default', '', 0, 0, 0, '{}', fals
 	nodes := reopened.ListNodes()
 	if len(nodes) != 1 || nodes[0].CurrentJob != job.ID || !nodes[0].Busy || nodes[0].CPUCores != 16 || nodes[0].Labels["zone"] != "lab" || nodes[0].HealthStatus != "HEALTHY" || len(nodes[0].Devices) != 1 || nodes[0].Devices[0].UUID != "GPU-persisted" || nodes[0].SessionEpoch == "" {
 		t.Fatalf("unexpected persisted nodes: %+v", nodes)
+	}
+	if !nodes[0].HostResourceLimits || nodes[0].MemoryMiB != 32768 || nodes[0].AllocatedCPUCores != 2 || nodes[0].AllocatedMemoryMiB != 4096 {
+		t.Fatalf("host capacity or reservation did not survive reopen: %+v", nodes[0])
 	}
 	if !nodes[0].Maintenance || nodes[0].MaintenanceState != model.NodeMaintenanceDraining || nodes[0].MaintenanceUpdatedAt == nil || !nodes[0].MaintenanceUpdatedAt.Equal(*maintenanceNode.MaintenanceUpdatedAt) {
 		t.Fatalf("maintenance did not survive reopen: %+v", nodes[0])
